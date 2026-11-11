@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache</groupId>
+    <artifactId>apache</artifactId>
+    <version>39</version>
+  </parent>
+
+  <groupId>org.apache.arrow.adbc</groupId>
+  <artifactId>arrow-adbc-java-root</artifactId>
+  <version>0.24.0</version>
+  <packaging>pom</packaging>
+
+  <name>Apache Arrow ADBC Java Root POM</name>
+  <description>Apache Arrow is open source, in-memory columnar data structures and low-overhead messaging</description>
+  <url>https://arrow.apache.org/</url>
+
+  <mailingLists>
+    <mailingList>
+      <name>Developer List</name>
+      <subscribe>dev-subscribe@arrow.apache.org</subscribe>
+      <unsubscribe>dev-unsubscribe@arrow.apache.org</unsubscribe>
+      <post>dev@arrow.apache.org</post>
+      <archive>https://mail-archives.apache.org/mod_mbox/arrow-dev/</archive>
+    </mailingList>
+    <mailingList>
+      <name>Commits List</name>
+      <subscribe>commits-subscribe@arrow.apache.org</subscribe>
+      <unsubscribe>commits-unsubscribe@arrow.apache.org</unsubscribe>
+      <post>commits@arrow.apache.org</post>
+      <archive>https://mail-archives.apache.org/mod_mbox/arrow-commits/</archive>
+    </mailingList>
+    <mailingList>
+      <name>Issues List</name>
+      <subscribe>issues-subscribe@arrow.apache.org</subscribe>
+      <unsubscribe>issues-unsubscribe@arrow.apache.org</unsubscribe>
+      <archive>https://mail-archives.apache.org/mod_mbox/arrow-issues/</archive>
+    </mailingList>
+  </mailingLists>
+
+  <modules>
+    <module>core</module>
+    <module>driver/flight-sql</module>
+    <module>driver/flight-sql-validation</module>
+    <module>driver/jdbc</module>
+    <module>driver/jdbc-validation-derby</module>
+    <module>driver/jdbc-validation-mssqlserver</module>
+    <module>driver/jdbc-validation-postgresql</module>
+    <module>driver/validation</module>
+    <module>driver-manager</module>
+    <module>sql</module>
+  </modules>
+
+  <scm>
+    <connection>scm:git:https://github.com/apache/arrow-adbc.git</connection>
+    <developerConnection>scm:git:https://github.com/apache/arrow-adbc.git</developerConnection>
+    <url>https://github.com/apache/arrow-adbc</url>
+  </scm>
+
+  <issueManagement>
+    <system>Jira</system>
+    <url>https://issues.apache.org/jira/browse/arrow</url>
+  </issueManagement>
+
+  <distributionManagement>
+    <repository>
+      <id>fury</id>
+      <name>Fury</name>
+      <url>https://maven.fury.io/arrow-adbc-nightlies/</url>
+    </repository>
+    <snapshotRepository>
+      <id>fury</id>
+      <name>Fury</name>
+      <url>https://maven.fury.io/arrow-adbc-nightlies/</url>
+    </snapshotRepository>
+  </distributionManagement>
+
+  <properties>
+    <dep.arrow.version>19.0.0</dep.arrow.version>
+    <dep.org.checkerframework.version>4.2.1</dep.org.checkerframework.version>
+    <!-- org.apache:apache overrides -->
+    <minimalJavaBuildVersion>11</minimalJavaBuildVersion>
+    <maven.compiler.release>11</maven.compiler.release>
+    <maven.compiler.target>11</maven.compiler.target>
+    <surefire.version>3.5.2</surefire.version>
+    <surefireArgLine></surefireArgLine>
+    <version.maven-javadoc-plugin>3.11.1</version.maven-javadoc-plugin>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- Arrow -->
+      <dependency>
+        <groupId>org.apache.arrow</groupId>
+        <artifactId>arrow-bom</artifactId>
+        <version>${dep.arrow.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <!-- ADBC -->
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-core</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-driver-flight-sql</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-driver-jdbc</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-driver-validation</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-driver-jni</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-driver-manager</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow.adbc</groupId>
+        <artifactId>adbc-sql</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+
+      <!-- Linting and static analysis -->
+      <dependency>
+        <groupId>org.checkerframework</groupId>
+        <artifactId>checker-qual</artifactId>
+        <version>${dep.org.checkerframework.version}</version>
+      </dependency>
+
+      <!-- Testing -->
+      <dependency>
+        <groupId>org.assertj</groupId>
+        <artifactId>assertj-core</artifactId>
+        <version>3.27.7</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>5.14.4</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>com.diffplug.spotless</groupId>
+          <artifactId>spotless-maven-plugin</artifactId>
+          <version>3.8.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.codehaus.mojo.natives</groupId>
+          <artifactId>maven-native-javah</artifactId>
+          <version>1.0.0</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <argLine>${surefireArgLine} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.rat</groupId>
+        <artifactId>apache-rat-plugin</artifactId>
+        <configuration>
+          <excludeSubProjects>false</excludeSubProjects>
+          <excludes>
+            <exclude>**/*.iml</exclude>
+            <exclude>**/*.log</exclude>
+            <exclude>**/target/**</exclude>
+            <exclude>.mvn/jvm.config</exclude>
+            <exclude>build/</exclude>
+          </excludes>
+        </configuration>
+        <executions>
+          <execution>
+            <id>rat-checks</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <phase>validate</phase>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>com.diffplug.spotless</groupId>
+        <artifactId>spotless-maven-plugin</artifactId>
+        <configuration>
+          <pom>
+            <licenseHeader>
+              <file>${maven.multiModuleProjectDirectory}/dev/license/asf-xml.license</file>
+              <delimiter>(&lt;configuration|&lt;project)</delimiter>
+            </licenseHeader>
+            <sortPom></sortPom>
+          </pom>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <reporting>
+    <plugins>
+      <plugin>
+        <!-- Will only work with JDK 17 (JDK 21 is broken) -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <configuration>
+          <!-- Ignore missing @return, @throws -->
+          <doclint>all,-missing</doclint>
+          <links>
+            <link>https://arrow.apache.org/java/main/reference/</link>
+          </links>
+          <!-- Stop it from trying to document the tests -->
+          <show>public</show>
+        </configuration>
+        <reportSets>
+          <reportSet>
+            <id>aggregate</id>
+            <reports>
+              <report>aggregate</report>
+            </reports>
+            <inherited>false</inherited>
+          </reportSet>
+          <reportSet>
+            <id>default</id>
+            <reports>
+              <report>javadoc</report>
+            </reports>
+          </reportSet>
+        </reportSets>
+      </plugin>
+    </plugins>
+  </reporting>
+
+  <profiles>
+    <profile>
+      <id>java-25+</id>
+      <activation>
+        <jdk>[25,)</jdk>
+      </activation>
+      <properties>
+        <surefireArgLine>--sun-misc-unsafe-memory-access=allow</surefireArgLine>
+      </properties>
+    </profile>
+    <profile>
+      <id>errorprone</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <configuration>
+              <compilerArgs combine.children="append">
+                <arg>-XDcompilePolicy=simple</arg>
+                <arg>-XDaddTypeAnnotationsToSymbol=true</arg>
+                <arg>-Xplugin:ErrorProne -Xep:NullAway:ERROR -XepOpt:NullAway:AnnotatedPackages=com.uber</arg>
+                <arg>--should-stop=ifError=FLOW</arg>
+                <!-- javac only reports the first 100 errors or warnings -->
+                <arg>-Xmaxerrs</arg>
+                <arg>10000</arg>
+                <arg>-Xmaxwarns</arg>
+                <arg>10000</arg>
+                <!-- Skip analysis for Testing classes -->
+                <arg>-AskipDefs=.*Test</arg>
+                <!-- not cache results -->
+                <arg>-AatfDoNotCache</arg>
+                <arg>-AprintVerboseGenerics</arg>
+                <arg>-AprintAllQualifiers</arg>
+                <arg>-Astubs=.checker-framework/:stubs</arg>
+              </compilerArgs>
+              <annotationProcessorPaths combine.children="append">
+                <path>
+                  <groupId>com.google.errorprone</groupId>
+                  <artifactId>error_prone_core</artifactId>
+                  <version>2.50.0</version>
+                </path>
+                <path>
+                  <groupId>com.uber.nullaway</groupId>
+                  <artifactId>nullaway</artifactId>
+                  <version>0.13.7</version>
+                </path>
+                <path>
+                  <groupId>org.checkerframework</groupId>
+                  <artifactId>checker</artifactId>
+                  <version>${dep.org.checkerframework.version}</version>
+                </path>
+              </annotationProcessorPaths>
+              <annotationProcessors>
+                <annotationProcessor>org.checkerframework.checker.nullness.NullnessChecker</annotationProcessor>
+              </annotationProcessors>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <profile>
+      <id>jni</id>
+      <modules>
+        <module>driver/jni</module>
+        <module>driver/jni-validation</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>

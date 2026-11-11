@@ -1,0 +1,48 @@
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+[CmdletBinding(PositionalBinding=$false)]
+param (
+    [string]$destination=$null,
+    [string]$versionSuffix=$null,
+    [switch]$noBuild
+)
+
+$csharpFolder = [IO.Path]::Combine($PSScriptRoot, "..", "..", "csharp") | Resolve-Path
+Write-Host "Setting Path: $csharpFolder"
+Push-Location $csharpFolder
+
+Write-Host "Running dotnet pack -c Release"
+$packArgs = @{
+    "c" = "Release"
+}
+if ($destination) {
+    Write-Host " * Destination: $destination"
+    $packArgs["o"] = $destination
+}
+if ($versionSuffix) {
+    Write-Host " * Version Suffix: $versionSuffix"
+    $packArgs["-version-suffix"] = $versionSuffix
+}
+if ($noBuild) {
+    Write-Host " * Pack without building"
+    # this argument is a flag and has no value, so we set it to an empty string,
+    # not $true or $false, which would be converted to "True" or "False"
+    $packArgs["-no-build"] = ""
+}
+
+dotnet pack @packArgs
+
+Pop-Location

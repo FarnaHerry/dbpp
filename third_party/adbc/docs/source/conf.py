@@ -1,0 +1,212 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import datetime
+import os
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+sys.path.append(str(Path("./ext/sphinx_recipe").resolve()))
+sys.path.append(str(Path("./ext").resolve()))
+
+# -- Project information -----------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
+
+project = "ADBC"
+copyright = f"""2022–{datetime.date.today().year} The Apache Software Foundation.
+Apache Arrow, Arrow, Apache, the Apache logo, and the Apache Arrow project logo are
+either registered trademarks or trademarks of The Apache Software Foundation in the
+United States and other countries."""
+author = "the Apache Arrow Developers"
+release = "24"
+# Needed to generate version switcher
+version = release
+# Override Sphinx's default title to capitalize "Documentation"
+html_title = f"{project} {release} Documentation"
+# For linking to latest downloads
+latest_release = "24"
+
+# -- General configuration ---------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
+
+exclude_patterns = []
+extensions = [
+    # misc directives
+    "adbc_misc",
+    # recipe directive
+    "sphinx_recipe",
+    # generic directives to enable intersphinx for java
+    "adbc_java_domain",
+    # generic directives to enable intersphinx for javascript
+    "adbc_js_domain",
+    "numpydoc",
+    "sphinx.ext.autodoc",
+    "sphinx.ext.doctest",
+    "sphinx.ext.intersphinx",
+    "sphinx_copybutton",
+    "sphinx_design",
+    "sphinxext.opengraph",
+    "sphinx_reredirects",
+]
+templates_path = ["_templates"]
+
+
+def on_missing_reference(app, env, node, contnode):
+    if str(contnode) in {
+        # Polars does something odd with Sphinx such that polars.DataFrame
+        # isn't xrefable; suppress the warning.
+        "polars.DataFrame",
+        # CapsuleType is only in 3.13+
+        "CapsuleType",
+        # Internal API
+        "DbapiBackend",
+    }:
+        return contnode
+
+    return None
+
+
+def setup(app):
+    app.connect("missing-reference", on_missing_reference)
+
+
+# -- Global substitutions -----------------------------------------------------
+# Note: uses quote because Sphinx will break if `release` has any spaces in it
+rst_prolog = (
+    f".. |source_download| replace:: `apache-arrow-adbc-{quote(latest_release)}.tar.gz <https://www.apache.org/dyn/closer.lua/arrow/apache-arrow-adbc-{quote(latest_release)}/apache-arrow-adbc-{quote(latest_release)}.tar.gz>`__\n"  # noqa: E501
+    f".. |source_checksum| replace:: `checksum <https://downloads.apache.org/arrow/apache-arrow-adbc-{quote(latest_release)}/apache-arrow-adbc-{quote(latest_release)}.tar.gz.sha512>`__\n"  # noqa: E501
+    f".. |source_signature| replace:: `signature <https://downloads.apache.org/arrow/apache-arrow-adbc-{quote(latest_release)}/apache-arrow-adbc-{quote(latest_release)}.tar.gz.asc>`__\n"  # noqa: E501
+)
+
+
+# -- Options for autodoc ----------------------------------------------------
+
+try:
+    import adbc_driver_manager
+    import adbc_driver_manager.dbapi  # noqa: F401
+except ImportError:
+    autodoc_mock_imports = ["adbc_driver_manager"]
+
+try:
+    import adbc_driver_postgresql
+    import adbc_driver_postgresql.dbapi  # noqa: F401
+except ImportError:
+    autodoc_mock_imports = ["adbc_driver_postgresql"]
+
+try:
+    import adbc_driver_sqlite
+    import adbc_driver_sqlite.dbapi  # noqa: F401
+except ImportError:
+    autodoc_mock_imports = ["adbc_driver_sqlite"]
+
+autodoc_default_options = {
+    "show-inheritance": True,
+}
+
+# https://stackoverflow.com/questions/11417221/sphinx-autodoc-gives-warning-pyclass-reference-target-not-found-type-warning
+nitpick_ignore = [
+    ("py:class", "abc.ABC"),
+    ("py:class", "datetime.date"),
+    ("py:class", "datetime.datetime"),
+    ("py:class", "datetime.time"),
+    ("py:class", "enum.Enum"),
+    ("py:class", "enum.IntEnum"),
+]
+
+# -- Options for doctest -----------------------------------------------------
+
+doctest_global_setup = """
+try:
+    import adbc_driver_manager
+    import adbc_driver_manager.dbapi  # noqa: F401
+except ImportError:
+    adbc_driver_manager = None
+"""
+
+# -- Options for HTML output -------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
+
+html_css_files = [
+    "css/custom.css",
+    "fontawesome/css/all.min.css",
+]
+html_static_path = ["_static"]
+html_theme = "furo"
+html_theme_options = {
+    "dark_logo": "logo-dark.png",
+    "light_logo": "logo-light.png",
+    "source_repository": "https://github.com/apache/arrow-adbc/",
+    "source_branch": "main",
+    "source_directory": "docs/source/",
+}
+html_favicon = "_static/favicon.ico"
+
+# -- Options for sphinx-recipe -----------------------------------------------
+
+recipe_repo_url_template = (
+    "https://github.com/apache/arrow-adbc/blob/main/docs/source/{rel_filename}"
+)
+
+# -- Options for Intersphinx -------------------------------------------------
+
+intersphinx_mapping = {
+    "arrow": ("https://arrow.apache.org/docs/", None),
+    "arrowjava": ("https://arrow.apache.org/java/current/", None),
+    "pandas": ("https://pandas.pydata.org/docs/", None),
+    "polars": ("https://docs.pola.rs/api/python/stable/", None),
+    "python": ("https://docs.python.org/3", None),
+}
+
+# Add env vars like ADBC_INTERSPHINX_MAPPING_adbc_java = url;path
+# to inject more mappings
+
+
+def _find_intersphinx_mappings():
+    prefix = "ADBC_INTERSPHINX_MAPPING_"
+    for key, val in os.environ.items():
+        if key.startswith(prefix):
+            name = key[len(prefix) :]
+            url, _, path = val.partition(";")
+            print("[ADBC] Found Intersphinx mapping", name)
+            intersphinx_mapping[name] = (url, path)
+
+
+_find_intersphinx_mappings()
+
+
+# -- Options for numpydoc ----------------------------------------------------
+
+numpydoc_class_members_toctree = False
+
+# -- Options for sphinxext.opengraph -----------------------------------------
+
+if "dev" in release:
+    ogp_site_url = "https://arrow.apache.org/adbc/main/"
+else:
+    ogp_site_url = f"https://arrow.apache.org/adbc/{release}/"
+ogp_image = "_static/banner.png"
+
+# -- Options for sphinx_reredirects ------------------------------------------
+
+redirects = {
+    "driver/status": "./index.html",
+    "driver/snowflake": "./index.html",
+    "driver/installation": "../installation.html",
+    "python/api/adbc_driver_snowflake": "../../driver/index.html",
+    "python/api/adbc_driver_bigquery": "../../driver/index.html",
+}

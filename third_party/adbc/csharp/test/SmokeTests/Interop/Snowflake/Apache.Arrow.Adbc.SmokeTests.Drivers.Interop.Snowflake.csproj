@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Project="..\..\Build.props" />
+  <PropertyGroup>
+    <TargetFrameworks Condition="'$(IsWindows)'=='true'">net8.0;net472</TargetFrameworks>
+    <TargetFrameworks Condition="'$(TargetFrameworks)'==''">net8.0</TargetFrameworks>
+  </PropertyGroup>
+    <ItemGroup>
+     <PackageReference Include="Microsoft.NET.Test.Sdk" />
+     <PackageReference Include="xunit" />
+     <PackageReference Include="xunit.runner.visualstudio">
+       <PrivateAssets>all</PrivateAssets>
+       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+     </PackageReference>
+     <PackageReference Include="Xunit.SkippableFact" />
+   </ItemGroup>
+    <ItemGroup>
+      <Folder Include="Resources\" />
+    </ItemGroup>
+    <ItemGroup>
+      <ProjectReference Include="..\..\Apache.Arrow.Adbc.SmokeTests\Apache.Arrow.Adbc.SmokeTests.csproj" />
+    </ItemGroup>
+ </Project>

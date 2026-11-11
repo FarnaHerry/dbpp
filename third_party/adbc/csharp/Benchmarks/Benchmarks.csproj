@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks Condition="'$(IsWindows)'=='true'">net8.0;net472</TargetFrameworks>
+    <TargetFrameworks Condition="'$(TargetFrameworks)'==''">net8.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ProcessArchitecture>$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())</ProcessArchitecture>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+    <PackageReference Include="DuckDB.NET.Bindings.Full" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="K4os.Compression.LZ4" />
+    <PackageReference Include="K4os.Compression.LZ4.Streams" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\Apache.Arrow.Adbc\Apache.Arrow.Adbc.csproj" />
+    <ProjectReference Include="..\src\Client\Apache.Arrow.Adbc.Client.csproj" />
+    <ProjectReference Include="..\test\Apache.Arrow.Adbc.Tests\Apache.Arrow.Adbc.Testing.csproj" />
+  </ItemGroup>
+
+  <Target Name="CopyDuckDb" AfterTargets="Build" Condition="'$(PkgDuckDB_NET_Bindings_Full)' != ''">
+    <Copy Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'" SourceFiles="$(PkgDuckDB_NET_Bindings_Full)\runtimes\win-$(ProcessArchitecture)\native\duckdb.dll" DestinationFolder="$(OutputPath)" />
+    <Copy Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))' == 'true'" SourceFiles="$(PkgDuckDB_NET_Bindings_Full)\runtimes\linux-$(ProcessArchitecture)\native\libduckdb.so" DestinationFolder="$(OutputPath)" />
+    <Copy Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'" SourceFiles="$(PkgDuckDB_NET_Bindings_Full)\runtimes\osx\native\libduckdb.dylib" DestinationFolder="$(OutputPath)" />
+  </Target>
+
+</Project>

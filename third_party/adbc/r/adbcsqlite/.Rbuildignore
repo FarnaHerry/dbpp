@@ -1,0 +1,14 @@
+^adbcsqlite\.Rproj$
+^\.Rproj\.user$
+^LICENSE\.md$
+^bootstrap\.R$
+^README\.Rmd$
+^src/Makevars$
+^\.vscode$
+^_pkgdown\.yml$
+^docs$
+^pkgdown$
+^cran-comments\.md$
+^compile_commands\.json$
+^\.cache$
+^CRAN-SUBMISSION$

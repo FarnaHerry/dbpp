@@ -1,0 +1,12 @@
+{
+    "environment": "Impala",
+    "hostName": "<hostName>",
+    "port": "<port>",
+    "query": "<query>",
+    "expectedResults": 0,
+    "metadata": {
+        "schema": "<schema>",
+        "table": "<anyTableName>",
+        "expectedColumnCount": 0
+    }
+}

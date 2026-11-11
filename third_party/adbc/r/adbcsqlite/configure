@@ -1,0 +1,79 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Run bootstrap.R. This will have already run if we are installing a source
+# package built with pkgbuild::build() with pkgbuild >1.4.0; however, we
+# run it again in case this is R CMD INSTALL on a directory or
+# devtools::load_all(). This will vendor files from elsewhere in the
+# ADBC repo into this package. If the file doesn't exist, we're installing
+# from a pre-built tarball.
+if [ -f bootstrap.R ]; then
+  echo "Running bootstrap.R..."
+  "$R_HOME/bin/Rscript" bootstrap.R --vanilla
+fi
+
+# Include and library flags
+PKG_LIBS="$PKG_LIBS"
+OBJECTS=""
+
+echo "Checking for --configure-vars INCLUDE_DIR or LIB_DIR"
+if [ "$INCLUDE_DIR" ] || [ "$LIB_DIR" ]; then
+  echo "Found --configure-vars INCLUDE_DIR and/or LIB_DIR"
+  PKG_CPPFLAGS="-I$INCLUDE_DIR $PKG_CPPFLAGS"
+  PKG_LIBS="-L$LIB_DIR $PKG_LIBS"
+fi
+
+echo "Testing R CMD SHLIB with $PKG_CPPFLAGS $PKG_LIBS -lsqlite3"
+PKG_CPPFLAGS="$PKG_CPPFLAGS" PKG_LIBS="$PKG_LIBS -lsqlite3" \
+  $R_HOME/bin/R CMD SHLIB tools/test.c -o sqlite_test >sqlite_test.log 2>&1
+
+if [ $? -ne 0 ] || [ ! -z "$FORCE_VENDORED_SQLITE3" ]; then
+  echo "Forcing vendored sqlite3 or #include <sqlite3.h>/-lsqlite3 failed:"
+  cat sqlite_test.log
+
+  echo "Falling back to vendored SQLite at src/c/vendor/sqlite3/sqlite3.h"
+  PKG_CPPFLAGS="-I../src/c/vendor/sqlite3 $PKG_CPPFLAGS"
+  OBJECTS="c/vendor/sqlite3/sqlite3.o"
+else
+  echo "Success!"
+  PKG_LIBS="$PKG_LIBS -lsqlite3"
+
+  # Apple -lsqlite3 does not contain sqlite3_load_extension()
+  echo "Testing SQLite for sqlite3_load_extension()"
+  PKG_CPPFLAGS="$PKG_CPPFLAGS" PKG_LIBS="$PKG_LIBS" \
+    $R_HOME/bin/R CMD SHLIB tools/test_extension.c -o sqlite_test >sqlite_test.log 2>&1
+
+  if [ $? -ne 0 ]; then
+    echo "Compile of sqlite3_load_extension() test failed"
+    PKG_CPPFLAGS="$PKG_CPPFLAGS -DADBC_SQLITE_WITH_NO_LOAD_EXTENSION"
+  else
+    echo "Success!"
+  fi
+fi
+
+# Add mingw printf flag if on Windows
+if [ ! -z "$R_ADBC_SQLITE_ON_WINDOWS" ]; then
+  PKG_CPPFLAGS="$PKG_CPPFLAGS -D__USE_MINGW_ANSI_STDIO"
+fi
+
+rm -f tools/test.o tools/test_extension.o sqlite_test || true
+
+sed \
+  -e "s|@cppflags@|$PKG_CPPFLAGS|" \
+  -e "s|@libs@|$PKG_LIBS|" \
+  -e "s|@objects@|$OBJECTS|" \
+  src/Makevars.in > src/Makevars

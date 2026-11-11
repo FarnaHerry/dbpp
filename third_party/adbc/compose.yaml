@@ -1,0 +1,399 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+  # These reuse Arrow's images for simplicity. You won't be able to
+  # build the image from here.
+
+  ############################### C#/.NET ######################################
+
+  csharp-dist:
+    image: mcr.microsoft.com/dotnet/sdk:10.0
+    volumes:
+      - .:/adbc:delegated
+    command: |
+      /adbc/ci/scripts/csharp_pack.sh /adbc
+
+  ################################ C/C++ #######################################
+
+  # Build/test with latest Clang
+  cpp-clang-latest:
+    image: ${REPO}:${ARCH}-cpp-clang-latest-adbc
+    build:
+      context: .
+      dockerfile: ci/docker/cpp-clang-latest.dockerfile
+      args:
+        GO: ${GO}
+    volumes:
+      - .:/adbc:delegated
+    environment:
+      ADBC_CMAKE_ARGS: "-DADBC_CXXFLAGS=-Wdocumentation -DADBC_BUILD_WARNING_LEVEL=CHECKIN"
+    command: "bash -c 'git config --global --add safe.directory /adbc && /adbc/ci/scripts/cpp_build.sh /adbc /adbc/build/clang-latest && env BUILD_ALL=0 BUILD_DRIVER_MANAGER=1 BUILD_DRIVER_SQLITE=1 /adbc/ci/scripts/cpp_test.sh /adbc/build/clang-latest'"
+
+  cpp-gcc-latest:
+    image: ${REPO}:${ARCH}-cpp-gcc-latest-adbc
+    build:
+      context: .
+      dockerfile: ci/docker/cpp-gcc-latest.dockerfile
+      args:
+        GCC: 15
+        GO: ${GO}
+    volumes:
+      - .:/adbc:delegated
+    environment:
+      ADBC_CMAKE_ARGS: "-DADBC_BUILD_WARNING_LEVEL=CHECKIN"
+    command: "bash -c 'git config --global --add safe.directory /adbc && /adbc/ci/scripts/cpp_build.sh /adbc /adbc/build/gcc-latest && env BUILD_ALL=0 BUILD_DRIVER_MANAGER=1 BUILD_DRIVER_SQLITE=1 /adbc/ci/scripts/cpp_test.sh /adbc/build/gcc-latest'"
+
+  # Build and dynamically load shared drivers missing the common entrypoints
+  cpp-shared-no-common-entrypoints-test:
+    image: ${REPO}:${ARCH}-cpp-clang-latest-adbc
+    volumes:
+      - .:/adbc:delegated
+    command: "bash -c 'git config --global --add safe.directory /adbc && /adbc/ci/scripts/cpp_shared_no_common_entrypoints_test.sh /adbc /adbc/build/shared-test/build /adbc/build/shared-test/local'"
+
+  # Test building and installing the static libraries, then try linking to them.
+  cpp-static-test:
+    image: ${REPO}:${ARCH}-cpp-clang-latest-adbc
+    volumes:
+      - .:/adbc:delegated
+    command: "bash -c 'git config --global --add safe.directory /adbc && /adbc/ci/scripts/cpp_static_test.sh /adbc /adbc/build/static-test/build /adbc/build/static-test/local'"
+
+
+  ############################### C/C++: musl (Alpine) ##########################
+
+  cpp-musl:
+    image: ${REPO}:${ARCH}-cpp-musl-adbc
+    build:
+      context: .
+      dockerfile: ci/docker/cpp-musl.alpine.dockerfile
+    volumes:
+      - .:/adbc:delegated
+    environment:
+      ADBC_CMAKE_ARGS: "-DADBC_BUILD_WARNING_LEVEL=CHECKIN -DSIZEOF_TIME_T=8"
+      ADBC_USE_ASAN: "0"
+      ADBC_USE_UBSAN: "0"
+    command: "bash -c 'git config --global --add safe.directory /adbc && \
+      env ADBC_USE_ASAN=0 ADBC_USE_UBSAN=0 BUILD_ALL=0 BUILD_DRIVER_MANAGER=1 BUILD_DRIVER_POSTGRESQL=0 BUILD_DRIVER_SQLITE=1 BUILD_DRIVER_FLIGHTSQL=0 /adbc/ci/scripts/cpp_build.sh /adbc /adbc/build/musl && \
+      env ADBC_USE_ASAN=0 ADBC_USE_UBSAN=0 BUILD_ALL=0 BUILD_DRIVER_MANAGER=0 BUILD_DRIVER_POSTGRESQL=0 BUILD_DRIVER_SQLITE=1 BUILD_DRIVER_FLIGHTSQL=0 /adbc/ci/scripts/cpp_test.sh /adbc/build/musl'"
+
+  ############################ Documentation ###################################
+
+  docs:
+    image: condaforge/miniforge3:latest
+    volumes:
+      - .:/adbc:delegated
+    environment:
+      ADBC_USE_ASAN: "0"
+      ADBC_USE_UBSAN: "0"
+      CGO_ENABLED: "1"
+    command: |
+      /bin/bash -c 'git config --global --add safe.directory /adbc && source /opt/conda/etc/profile.d/conda.sh && mamba create -y -n adbc -c conda-forge go --file /adbc/ci/conda_env_cpp.txt --file /adbc/ci/conda_env_docs.txt --file /adbc/ci/conda_env_java.txt --file /adbc/ci/conda_env_python.txt && conda activate adbc && /adbc/ci/scripts/cpp_build.sh /adbc /adbc/build && /adbc/ci/scripts/go_build.sh /adbc /adbc/build && /adbc/ci/scripts/python_build.sh /adbc /adbc/build && /adbc/ci/scripts/r_build.sh /adbc && /adbc/ci/scripts/make_manifests.sh /adbc/build/local && /adbc/ci/scripts/docs_build.sh /adbc'
+
+  ################################### Java ###################################
+
+  java-dist:
+    image: ${ARCH}/maven:${MAVEN}-eclipse-temurin-${JDK}
+    volumes:
+      - .:/adbc:delegated
+    # N.B. never run JNI tests as we won't have the drivers built
+    command: "/bin/bash -c '/adbc/ci/scripts/java_build.sh /adbc /adbc/dist && env BUILD_JNI=OFF /adbc/ci/scripts/java_test.sh /adbc'"
+
+  # Build the JNI and driver libraries
+  java-jni:
+    image: ${REPO}:${ARCH}-python-${PYTHON}-wheel-manylinux-${MANYLINUX}-vcpkg-${VCPKG}-adbc
+    volumes:
+      - .:/adbc:delegated
+    command: "/bin/bash -c 'env CMAKE_BUILD_TYPE=Release /adbc/ci/scripts/java_jni_build.sh /adbc /adbc/dist /adbc/local'"
+
+  ############################### Python #####################################
+
+  python-venv:
+    image: ${ARCH}/python:${PYTHON}
+    volumes:
+      - .:/adbc:delegated
+    command: "/bin/bash -c 'apt update && apt install -y libsqlite3-dev build-essential cmake git && git config --global --add safe.directory /adbc && env BUILD_ALL=0 BUILD_DRIVER_SQLITE=1 ADBC_BUILD_TESTS=OFF ADBC_USE_ASAN=OFF ADBC_USE_UBSAN=OFF /adbc/ci/scripts/cpp_build.sh /adbc /adbc/build/venv && /adbc/ci/scripts/python_venv_test.sh /adbc /adbc/build/venv-test /adbc/build/venv/driver/sqlite/libadbc_driver_sqlite.so'"
+
+  ############################ Python conda ##################################
+
+  # Must be run as docker compose run -e HOST_USER_ID=$(id -u) python-conda
+  python-conda:
+    image: condaforge/linux-anvil-cos7-x86_64
+    volumes:
+      - .:/adbc:delegated
+    command: "/bin/bash -c 'conda config --remove channels defaults && /adbc/ci/scripts/python_conda_build.sh /adbc ${ARCH_CONDA_FORGE}.yaml /adbc/build'"
+
+  python-conda-test:
+    image: condaforge/mambaforge
+    volumes:
+      - .:/adbc:delegated
+    command: "/bin/bash -c '/adbc/ci/scripts/python_conda_test.sh /adbc /adbc/build'"
+
+  python-debug:
+    image: ${REPO}:${ARCH}-python-debug-adbc
+    build:
+      context: .
+      cache_from:
+        - ${REPO}:${ARCH}-python-debug-adbc
+      dockerfile: ci/docker/python-debug.dockerfile
+      args:
+        ARCH: ${ARCH}
+        GO: ${GO}
+    volumes:
+      - .:/adbc:delegated
+    command: /adbc/ci/docker/python-debug.sh
+
+  ############################ Python sdist ##################################
+
+  python-sdist:
+    image: ${ARCH}/python:${PYTHON}
+    volumes:
+      - .:/adbc:delegated
+    command: "/bin/bash -c 'git config --global --add safe.directory /adbc && source /adbc/ci/scripts/python_sdist_build.sh /adbc'"
+
+  python-sdist-test:
+    image: ${REPO}:${ARCH}-python-${PYTHON}-wheel-manylinux-${MANYLINUX}-vcpkg-${VCPKG}-adbc
+    build:
+      context: .
+      cache_from:
+        - ${REPO}:${ARCH}-python-${PYTHON}-wheel-manylinux-${MANYLINUX}-vcpkg-${VCPKG}-adbc
+      dockerfile: ci/docker/python-wheel-manylinux.dockerfile
+      args:
+        ARCH: ${ARCH}
+        GO: ${GO}
+        MANYLINUX: ${MANYLINUX}
+        PYTHON: ${PYTHON}
+        REPO: ${REPO}
+        VCPKG: ${VCPKG}
+    volumes:
+      - .:/adbc:delegated
+    command: "'git config --global --add safe.directory /adbc && source /adbc/ci/scripts/python_sdist_test.sh ${ARCH} /adbc'"
+
+  ############################ Python wheels ##################################
+
+  # We build on a different image to use an older base image/glibc, then
+  # relocate on a separate image so that we can use a newer docker for cibuildwheel
+
+  python-wheel-manylinux-build:
+    image: ghcr.io/apache/arrow-adbc:manylinux${MANYLINUX}-go${GO}-python${PYTHON}-vcpkg${VCPKG}
+    build:
+      context: .
+      dockerfile: ci/docker/python-wheel-manylinux.dockerfile
+      args:
+        GO: ${GO}
+        MANYLINUX: ${MANYLINUX}
+        PYTHON: ${PYTHON}
+        VCPKG: ${VCPKG}
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    volumes:
+      - .:/adbc
+    # Must set safe.directory so go/miniver won't error when calling git
+    command: "'git config --global --add safe.directory /adbc && /adbc/ci/scripts/python_wheel_unix_build.sh ${ARCH} /adbc /adbc/build'"
+
+  python-wheel-manylinux-relocate:
+    image: ghcr.io/apache/arrow-adbc:python${PYTHON}
+    build:
+      context: .
+      dockerfile: ci/docker/python-wheel-manylinux-relocate.dockerfile
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/adbc
+    # Must set safe.directory so go/miniver won't error when calling git
+    command: "bash -c 'git config --global --add safe.directory /adbc && python -m venv /venv && source /venv/bin/activate && /adbc/ci/scripts/python_wheel_unix_relocate.sh ${ARCH} /adbc /adbc/build'"
+
+  python-wheel-manylinux-test:
+    image: ${ARCH}/python:${PYTHON}-slim
+    platform: ${PLATFORM}
+    volumes:
+      - .:/adbc:delegated
+    command: /adbc/ci/scripts/python_wheel_unix_test.sh /adbc
+
+  python-wheel-manylinux-freethreaded-test:
+    image: ghcr.io/astral-sh/uv:trixie-slim
+    platform: ${PLATFORM}
+    volumes:
+      - .:/adbc:delegated
+    command: bash -c 'uv venv --python ${PYTHON} && source ./.venv/bin/activate && python -m ensurepip && PYTHON_GIL=0 /adbc/ci/scripts/python_wheel_unix_test.sh /adbc'
+
+  ###################### Test database environments ############################
+
+  dremio:
+    container_name: adbc-dremio
+    image: dremio/dremio-oss:latest
+    environment:
+      DREMIO_JAVA_EXTRA_OPTS: "-Ddebug.addDefaultUser=true -Ddremio.eula.disabled=true"
+    healthcheck:
+      test: [ "CMD", "curl", "--fail", "http://localhost:9047" ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    ports:
+      - "9047:9047"
+      - "32010:32010"
+      - "31010:31010"
+      - "45678:45678"
+
+  dremio-init:
+    container_name: adbc-dremio-init
+    image: ${REPO}:adbc-dremio-init
+    build:
+      context: .
+      cache_from:
+        - ${REPO}:adbc-dremio-init
+      dockerfile: ci/docker/dremio-init.dockerfile
+    environment:
+      dremio_url: http://dremio:9047
+    depends_on:
+      dremio:
+        condition: service_healthy
+    entrypoint: "/init/bootstrap.sh"
+    volumes:
+      - "./ci/scripts/integration/dremio:/init"
+
+  flightsql-test:
+    image: ${REPO}:adbc-flightsql-test
+    build:
+      context: .
+      cache_from:
+        - ${REPO}:adbc-flightsql-test
+      dockerfile: ci/docker/flightsql-test.dockerfile
+      args:
+        GO: ${GO}
+    healthcheck:
+      test: ["CMD", "curl", "-k", "--http2", "-XPOST", "-H", "content-type: application/grpc", "https://localhost:41414"]
+      interval: 5s
+      timeout: 30s
+      retries: 3
+      start_period: 5m
+    ports:
+      - "41414:41414"
+    volumes:
+      - .:/adbc:delegated
+    depends_on:
+      oauth-server:
+        condition: service_healthy
+    command: >-
+      /bin/bash -c "cd /adbc/go/adbc && go run ./driver/flightsql/cmd/testserver -host 0.0.0.0 -port 41414 -token-prefix oauth- -tls"
+
+  # OAuth test server for FlightSQL OAuth authentication testing
+  oauth-server:
+    container_name: adbc-oauth-server
+    image: ${REPO}:adbc-oauth-server
+    build:
+      context: .
+      cache_from:
+        - ${REPO}:adbc-oauth-server
+      dockerfile: ci/docker/oauth-server.dockerfile
+      args:
+        GO: ${GO}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8181/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    ports:
+      - "8181:8181"
+    volumes:
+      - .:/adbc:delegated
+    command: >-
+      /bin/bash -c "cd /adbc/go/adbc && go run ./driver/flightsql/cmd/oauthserver -host 0.0.0.0 -port 8181 -client-id test-client -client-secret test-secret"
+
+  flightsql-sqlite-test:
+    image: ${REPO}:golang-${GO}-sqlite-flightsql
+    build:
+      context: .
+      cache_from:
+        - ${REPO}:golang-${GO}-sqlite-flightsql
+      dockerfile: ci/docker/golang-flightsql-sqlite.dockerfile
+      args:
+        GO: ${GO}
+        ARROW_MAJOR_VERSION: ${ARROW_MAJOR_VERSION}
+    ports:
+      - 8080:8080
+
+  mssql-test:
+    container_name: adbc_mssql_test
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Password1!"
+    ports:
+      - "1433:1433"
+
+  postgres-test:
+    container_name: adbc_postgres_test
+    image: postgres:${POSTGRES_VERSION:-latest}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  spiceai-test:
+    container_name: adbc-spiceai
+    build:
+      context: .
+      dockerfile: ci/docker/spiceai-init.dockerfile
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8090/v1/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "50051:50051"
+      - "8090:8090"
+
+  gizmosql-test:
+    container_name: adbc_gizmosql_test
+    image: gizmodata/gizmosql:latest-slim
+    init: true
+    tty: true
+    environment:
+      GIZMOSQL_USERNAME: ${ADBC_GIZMOSQL_USER:-adbc_test_user}
+      GIZMOSQL_PASSWORD: ${ADBC_GIZMOSQL_PASSWORD:-adbc_test_password}
+      TLS_ENABLED: "0"
+      PRINT_QUERIES: "1"
+      DATABASE_FILENAME: "adbc_test.db"
+      GIZMOSQL_LOG_LEVEL: "DEBUG"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/31337'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    ports:
+      - "31337:31337"
+
+  ################################ Verification ################################
+
+  verify-all-ubuntu:
+    image: ubuntu:${UBUNTU}
+    volumes:
+      - .:/adbc:delegated
+    command: |
+      /adbc/ci/scripts/verify_ubuntu.sh /adbc

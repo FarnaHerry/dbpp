@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[project]
+name = "adbc-driver-manager"
+description = "A generic entrypoint for ADBC drivers."
+authors = [{name = "Apache Arrow Developers", email = "dev@arrow.apache.org"}]
+license = "Apache-2.0"
+license-files = ["LICENSE.txt", "NOTICE.txt"]
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = ["typing-extensions"]
+
+[project.optional-dependencies]
+dbapi = ["pandas", "pyarrow>=14.0.1"]
+test = ["duckdb", "pandas", "polars", "pyarrow>=14.0.1", "pytest>=9"]
+
+[project.urls]
+homepage = "https://arrow.apache.org/adbc/"
+repository = "https://github.com/apache/arrow-adbc"
+
+[build-system]
+requires = ["Cython >= 3.1.0", "setuptools >= 77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+filterwarnings = ["error"]
+markers = [
+    "duckdb: tests that require DuckDB",
+    "panicdummy: tests that require the testing-only panicdummy driver",
+    "pyarrowless: tests of functionality when PyArrow is NOT installed",
+    "sqlite: tests that require the SQLite driver",
+    "system: tests that touch user data directories",
+]
+xfail_strict = true
+
+[tool.setuptools]
+packages = ["adbc_driver_manager"]
+py-modules = ["adbc_driver_manager"]

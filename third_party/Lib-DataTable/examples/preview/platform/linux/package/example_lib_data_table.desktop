@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Lib-DataTable Preview
+Exec=example_lib_data_table
+Icon=example_lib_data_table
+Categories=Utility;
+Terminal=false
