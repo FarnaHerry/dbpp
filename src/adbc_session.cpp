@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -820,5 +821,169 @@ bool IsSqlReadStatement(std::string_view sql) {
 namespace {
 
 } // namespace
+
+namespace {
+
+std::string DriverDisplayName(const std::filesystem::path& path) {
+  std::string filename = path.filename().string();
+  std::string base = filename;
+  for (const std::string_view suffix : {".so", ".dylib", ".dll"}) {
+    const auto position = base.find(suffix);
+    if (position != std::string::npos) {
+      base.resize(position);
+      break;
+    }
+  }
+  if (base.starts_with("lib")) {
+    base.erase(0, 3);
+  }
+  if (base.starts_with("adbc_driver_")) {
+    base.erase(0, 12);
+  }
+  const std::string lower = LowerAscii(base);
+  if (lower == "sqlite") return "SQLite";
+  if (lower == "postgresql" || lower == "postgres") return "PostgreSQL";
+  if (lower == "mysql" || lower == "mariadb") return "MySQL";
+  if (lower == "duckdb") return "DuckDB";
+  if (lower == "flightsql") return "Flight SQL";
+  if (lower == "snowflake") return "Snowflake";
+  if (lower == "bigquery") return "BigQuery";
+  std::string display = base;
+  std::ranges::replace(display, '_', ' ');
+  std::ranges::replace(display, '-', ' ');
+  return display.empty() ? filename : display;
+}
+
+bool IsDriverFileName(std::string_view filename) {
+  const std::string lower = LowerAscii(filename);
+  if (lower.find("adbc_driver") == std::string::npos) {
+    return false;
+  }
+  return lower.ends_with(".so") || lower.ends_with(".dylib") ||
+         lower.ends_with(".dll") || lower.find(".so.") != std::string::npos;
+}
+
+std::string DriverBaseKey(std::string_view filename) {
+  std::string base = LowerAscii(filename);
+  const auto position = base.find(".so");
+  if (position != std::string::npos) {
+    base.resize(position);
+  } else {
+    for (const std::string_view suffix : {".dylib", ".dll"}) {
+      const auto extension = base.rfind(suffix);
+      if (extension != std::string::npos) {
+        base.resize(extension);
+        break;
+      }
+    }
+  }
+  return base;
+}
+
+std::vector<std::string> SplitSearchPath(std::string_view value) {
+#if defined(_WIN32)
+  constexpr char kPathSeparator = ';';
+#else
+  constexpr char kPathSeparator = ':';
+#endif
+  std::vector<std::string> entries;
+  std::size_t start = 0;
+  for (std::size_t index = 0; index <= value.size(); ++index) {
+    if (index == value.size() || value[index] == kPathSeparator) {
+      if (index > start) {
+        entries.emplace_back(value.substr(start, index - start));
+      }
+      start = index + 1;
+    }
+  }
+  return entries;
+}
+
+} // namespace
+
+std::vector<AdbcDriverInfo> DiscoverAdbcDrivers() {
+  std::map<std::string, AdbcDriverInfo> by_base;
+
+  const auto add_file = [&](const std::filesystem::path& path) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+      return;
+    }
+    const std::string filename = path.filename().string();
+    if (!IsDriverFileName(filename)) {
+      return;
+    }
+    const std::string key = DriverBaseKey(filename);
+    std::error_code absolute_error;
+    std::filesystem::path absolute = std::filesystem::absolute(path, absolute_error);
+    if (absolute_error) {
+      absolute = path;
+    }
+    const auto existing = by_base.find(key);
+    if (existing != by_base.end() &&
+        std::filesystem::path(existing->second.path).filename().string().size() <=
+            filename.size()) {
+      return;
+    }
+    by_base[key] = AdbcDriverInfo{
+        .name = DriverDisplayName(path),
+        .path = absolute.string(),
+    };
+  };
+
+  const auto add_entry = [&](std::string entry) {
+    if (entry.empty()) {
+      return;
+    }
+    std::filesystem::path path(entry);
+    std::error_code error;
+    if (std::filesystem::is_directory(path, error)) {
+      for (std::filesystem::directory_iterator it(path, error), end; it != end;
+           it.increment(error)) {
+        if (error) {
+          break;
+        }
+        add_file(it->path());
+      }
+    } else {
+      add_file(path);
+    }
+  };
+
+  for (const char* variable : {"DBPP_ADBC_DRIVERS", "ADBC_DRIVER_PATH"}) {
+    if (const char* value = std::getenv(variable); value != nullptr) {
+      for (const std::string& entry : SplitSearchPath(value)) {
+        add_entry(entry);
+      }
+    }
+  }
+
+  add_file(DefaultSqliteDriverPath());
+  const std::filesystem::path default_driver(DefaultSqliteDriverPath());
+  if (default_driver.has_parent_path()) {
+    add_entry(default_driver.parent_path().string());
+  }
+
+  for (const char* directory :
+       {"/usr/lib64", "/usr/lib", "/usr/local/lib64", "/usr/local/lib",
+        "/opt/homebrew/lib"}) {
+    add_entry(directory);
+  }
+
+  std::vector<AdbcDriverInfo> drivers;
+  drivers.reserve(by_base.size());
+  for (auto& [key, driver] : by_base) {
+    (void)key;
+    drivers.push_back(std::move(driver));
+  }
+  std::ranges::sort(drivers, [](const AdbcDriverInfo& left, const AdbcDriverInfo& right) {
+    if (left.name != right.name) {
+      return left.name < right.name;
+    }
+    return left.path < right.path;
+  });
+  return drivers;
+}
+
 
 } // namespace dbpp

@@ -8,6 +8,7 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 ## 功能
 
 - 打开/连接数据库：SQLite 文件、任意 ADBC driver（PostgreSQL / MySQL / DuckDB …）
+- ADBC 管理器：保存连接配置（不含密码）、发现本机驱动、从列表中选择驱动/连接并删除配置
 - 表与视图列表、虚拟化数据表格（Lib-DataTable）、分页、排序、`WHERE` 筛选
 - SQLite 使用 `rowid`，其它数据库使用主键约束做行标识；支持行内编辑、添加行、删除行
 - SQL 控制台：结果表格、影响行数、执行后自动刷新对象列表
@@ -27,6 +28,15 @@ cmake --build build --parallel
 
 `DBPP_HUXERUI_DIR` 默认指向 `../HuxerUI-fork`，`DBPP_ADBC_DIR` 指向
 `third_party/adbc`，`DBPP_DATATABLE_DIR` 指向 `third_party/Lib-DataTable`。
+
+## ADBC 管理器
+
+侧栏“ADBC 管理器…”用于管理连接和驱动：
+
+- 连接配置保存在应用数据目录的 `connections.tsv`（表格格式，密码不落盘）。
+- 驱动列表来自 `DBPP_ADBC_DRIVERS`、`ADBC_DRIVER_PATH`、构建目录以及系统库目录中的
+  `libadbc_driver_*`；点击驱动填入路径，点击已保存连接回填表单。
+- 头部按钮：关闭 / 删除 / 保存 / 连接。连接会先保存当前配置，再打开 ADBC 会话。
 
 ## ADBC 多数据库
 

@@ -106,6 +106,16 @@ bool IsBlobColumn(const ColumnMeta& column) {
   return type.find("blob") != std::string::npos;
 }
 
+std::string UriDisplayName(std::string_view uri) {
+  const auto slash = uri.find_last_of("/\\");
+  std::string name = slash == std::string_view::npos ? std::string(uri)
+                                                     : std::string(uri.substr(slash + 1));
+  if (name.empty()) {
+    name = std::string(uri);
+  }
+  return name.empty() ? std::string("ADBC 连接") : name;
+}
+
 std::string TrimmedSql(std::string_view text) {
   const auto first = text.find_first_not_of(" \t\r\n");
   if (first == std::string_view::npos) {
@@ -181,7 +191,8 @@ View TableEmptyState(const std::string& text) {
              State<std::optional<DataTableCellId>> selected,
              State<TextEditingValue> filter_input, State<std::size_t> page,
              TaskScope tasks, std::shared_ptr<FilePicker> picker, NotifyFn notify,
-             std::function<void()> open_picker, std::function<void()> open_new) {
+             std::function<void()> open_picker, std::function<void()> open_new,
+             std::function<void()> open_manager) {
   const ThemeSpec& spec = UseTheme();
   const AppModel& model = app.Get();
   const DbSession* active = model.ActiveSession();
@@ -288,6 +299,8 @@ View TableEmptyState(const std::string& text) {
               .With(Grow(1.0F), Enabled{picker->CanOpenFiles()}),
           ActionButton(Button("连接…").OnClick(std::move(open_new))).With(Grow(1.0F)),
       }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+      ActionButton(Button("ADBC 管理器…").OnClick(std::move(open_manager)))
+          .With(Frame{.width = 236.0F}),
       std::move(session_list),
       Divider(),
       Row{
@@ -408,6 +421,204 @@ View TableEmptyState(const std::string& text) {
       Text("选中的行会立即从数据库中删除，此操作不可撤销。"),
   }.With(Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch})
                     .With(Frame{.width = 520.0F}));
+}
+
+[[huxerui::composable]] View AdbcManagerDialog(DialogContext dialog,
+                                                   AdbcManagerContext context) {
+  auto profiles = context.profiles;
+  auto drivers = UseState(std::vector<AdbcDriverInfo>{});
+  Lifecycle([drivers] {
+    drivers = DiscoverAdbcDrivers();
+    return [] {};
+  });
+  auto selected = UseState<int>(-1);
+  auto driver = UseState(TextEditingValue::FromText(context.default_driver));
+  auto uri = UseState(TextEditingValue::FromText(context.default_uri));
+  auto username = UseState(TextEditingValue::FromText({}));
+  auto password = UseState(TextEditingValue::FromText({}));
+  auto name = UseState(TextEditingValue::FromText({}));
+  auto status = UseState(std::string{});
+  auto error = UseState(std::string{});
+
+  const auto save_profile = [context, profiles, selected, driver, uri, username, name, status,
+                             error]() -> bool {
+    const std::string driver_path = driver.Get().text;
+    const std::string uri_text = uri.Get().text;
+    if (driver_path.empty() || uri_text.empty()) {
+      error = "ADBC driver 路径和 URI 都不能为空";
+      return false;
+    }
+    ConnectionProfile profile{
+        .name = name.Get().text.empty() ? UriDisplayName(uri_text) : name.Get().text,
+        .driver_path = driver_path,
+        .uri = uri_text,
+        .username = username.Get().text,
+    };
+    std::vector<ConnectionProfile> list = profiles.Get();
+    int index = selected.Get();
+    if (index >= 0 && static_cast<std::size_t>(index) < list.size()) {
+      list[static_cast<std::size_t>(index)] = profile;
+    } else {
+      list.push_back(profile);
+      index = static_cast<int>(list.size()) - 1;
+    }
+    if (!SaveConnectionProfiles(context.profiles_path, list)) {
+      error = "保存连接配置失败: " + context.profiles_path;
+      return false;
+    }
+    profiles = std::move(list);
+    selected = index;
+    name = TextEditingValue::FromText(profile.name);
+    error = {};
+    status = "已保存 " + profile.name;
+    return true;
+  };
+
+  const auto delete_profile = [context, profiles, selected, name, status, error] {
+    const int index = selected.Get();
+    std::vector<ConnectionProfile> list = profiles.Get();
+    if (index < 0 || static_cast<std::size_t>(index) >= list.size()) {
+      return;
+    }
+    const auto position = list.begin() + index;
+    const std::string removed = position->name.empty() ? position->uri : position->name;
+    list.erase(position);
+    if (!SaveConnectionProfiles(context.profiles_path, list)) {
+      error = "删除后保存失败: " + context.profiles_path;
+      return;
+    }
+    profiles = std::move(list);
+    selected = -1;
+    name = TextEditingValue::FromText({});
+    error = {};
+    status = "已删除 " + removed;
+  };
+
+  const auto connect = [context, dialog, save_profile, driver, uri, username, password, name] {
+    if (!save_profile()) {
+      return;
+    }
+    ConnectionRequest request{
+        .driver_path = driver.Get().text,
+        .uri = uri.Get().text,
+        .username = username.Get().text,
+        .password = password.Get().text,
+        .title = name.Get().text.empty() ? UriDisplayName(uri.Get().text) : name.Get().text,
+    };
+    OpenConnection(context.app, context.table, context.selected, context.filter_input,
+                   context.tasks, std::move(request), context.notify);
+    dialog.Dismiss();
+  };
+
+  Views profile_rows;
+  const auto& profile_list = profiles.Get();
+  profile_rows.Reserve(profile_list.size());
+  for (std::size_t index = 0; index < profile_list.size(); ++index) {
+    const ConnectionProfile profile = profile_list[index];
+    profile_rows.Add(
+        NavItem(profile.name.empty() ? UriDisplayName(profile.uri) : profile.name,
+                profile.uri, selected.Get() == static_cast<int>(index),
+                [profiles, selected, driver, uri, username, password, name, error,
+                 index] {
+                  const auto& list = profiles.Get();
+                  if (index >= list.size()) {
+                    return;
+                  }
+                  const ConnectionProfile& value = list[index];
+                  driver = TextEditingValue::FromText(value.driver_path);
+                  uri = TextEditingValue::FromText(value.uri);
+                  username = TextEditingValue::FromText(value.username);
+                  password = TextEditingValue::FromText({});
+                  name = TextEditingValue::FromText(value.name);
+                  selected = static_cast<int>(index);
+                  error = {};
+                })
+            .Key("profile-" + std::to_string(index) + "-" + profile.uri));
+  }
+
+  Views driver_rows;
+  const auto& driver_list = drivers.Get();
+  driver_rows.Reserve(driver_list.size());
+  for (const AdbcDriverInfo& info : driver_list) {
+    driver_rows.Add(
+        NavItem(info.name, info.path, driver.Get().text == info.path,
+                [driver, info] { driver = TextEditingValue::FromText(info.path); })
+            .Key("driver-" + info.path));
+  }
+
+  View saved_panel = Column{
+      Caption("已保存的连接"),
+      profile_rows.Size() == 0
+          ? View(MutedText("暂无保存的连接"))
+          : View(ScrollView(Column{std::move(profile_rows)}.With(Spacing{2.0F}))
+                     .With(Grow(1.0F))),
+  }.With(Frame{.width = 220.0F}, Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+
+  View form_panel = Column{
+      Row{
+          Caption("ADBC 驱动"),
+          Spacer(),
+          ActionButton(Button("刷新").OnClick([drivers, status] {
+            drivers = DiscoverAdbcDrivers();
+            status = "发现 " + std::to_string(drivers.Get().size()) + " 个驱动";
+          })),
+      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{6.0F}),
+      driver_rows.Size() == 0
+          ? View(MutedText("未发现 ADBC 驱动"))
+          : View(ScrollView(Column{std::move(driver_rows)}.With(Spacing{2.0F}))
+                     .With(Frame{.height = 140.0F})),
+      TextField(driver)
+          .Label("ADBC Driver 路径")
+          .Placeholder("/path/to/libadbc_driver_postgresql.so")
+          .Variant(TextFieldVariant::Outlined)
+          .OnChanged([driver](const TextEditingValue& value) { driver = value; }),
+      TextField(uri)
+          .Label("URI")
+          .Placeholder("/path/to/app.sqlite  ·  postgresql://host/db")
+          .Variant(TextFieldVariant::Outlined)
+          .OnChanged([uri](const TextEditingValue& value) { uri = value; }),
+      Row{
+          TextField(username)
+              .Label("用户名（可选）")
+              .Variant(TextFieldVariant::Outlined)
+              .OnChanged([username](const TextEditingValue& value) { username = value; })
+              .With(Grow(1.0F)),
+          TextField(password)
+              .Label("密码（不保存）")
+              .Variant(TextFieldVariant::Outlined)
+              .Secure(true)
+              .OnChanged([password](const TextEditingValue& value) { password = value; })
+              .With(Grow(1.0F)),
+      }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+      TextField(name)
+          .Label("显示名称（可选）")
+          .Placeholder("留空则使用 URI 文件名")
+          .Variant(TextFieldVariant::Outlined)
+          .OnChanged([name](const TextEditingValue& value) { name = value; }),
+      error.Get().empty() ? View{} : ErrorText(error.Get()),
+      MutedText(status.Get()),
+  }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
+
+  View body = Column{
+      Row{
+          Text("ADBC 管理器", TextRole::Title),
+          Spacer(),
+          ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button("删除").OnClick(delete_profile))
+              .With(Enabled{selected.Get() >= 0}),
+          ActionButton(Button("保存").OnClick([save_profile] { (void)save_profile(); })),
+          ActionButton(Button("连接").OnClick(connect), true),
+      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
+      MutedText("保存的连接不含密码；驱动列表来自 DBPP_ADBC_DRIVERS、ADBC_DRIVER_PATH 和系统库目录。"),
+      Row{
+          std::move(saved_panel),
+          Divider(Axis::Vertical),
+          std::move(form_panel),
+      }.With(Grow(1.0F), Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch},
+         Frame{.width = 820.0F, .height = 600.0F});
+
+  return DialogCard(std::move(body));
 }
 
 [[huxerui::composable]] View ConnectDialog(DialogContext dialog, ConnectContext context) {
@@ -882,9 +1093,18 @@ View TableEmptyState(const std::string& text) {
   auto page = UseState<std::size_t>(0);
   auto theme_mode = UseState<int>(0);
   auto toast = UseToast();
+  auto dialogs = UseDialog();
   auto tasks = UseTaskScope();
   auto picker = UseService<FilePicker>();
   auto application = UseApplication();
+  const File profile_dir = application.Directories().data_directory;
+  const std::string profiles_path = profile_dir.Child("connections.tsv").Path();
+  const File default_file = application.Directories().data_directory.Child("untitled.sqlite");
+  auto profiles = UseState(std::vector<ConnectionProfile>{});
+  Lifecycle([profiles, profiles_path] {
+    profiles = LoadConnectionProfiles(profiles_path);
+    return [] {};
+  });
 
   const bool system_dark = UseSystemThemeBrightness() == ThemeBrightness::Dark;
   const bool dark =
@@ -943,10 +1163,8 @@ View TableEmptyState(const std::string& text) {
     });
   };
 
-  const auto open_new = [dialogs = UseDialog(), app, table, sql, selected, filter_input, tasks,
-                         notify, application, dark] {
-    const File default_file =
-        application.Directories().data_directory.Child("untitled.sqlite");
+  const auto open_new = [dialogs, app, table, sql, selected, filter_input, tasks,
+                         notify, default_file, dark] {
     ConnectContext context{
         .app = app,
         .table = table,
@@ -962,6 +1180,27 @@ View TableEmptyState(const std::string& text) {
     dialogs.Show([context](DialogContext dialog) {
       const ThemeSpec dialog_spec = context.dark ? DarkThemeSpec() : LightThemeSpec();
       return Theme(AppThemeDefinition(dialog_spec), ConnectDialog(dialog, context));
+    });
+  };
+
+  const auto open_manager = [dialogs, app, table, selected, filter_input, profiles, tasks,
+                             profiles_path, default_file, notify, dark] {
+    AdbcManagerContext context{
+        .app = app,
+        .table = table,
+        .selected = selected,
+        .filter_input = filter_input,
+        .profiles = profiles,
+        .tasks = tasks,
+        .profiles_path = profiles_path,
+        .default_driver = DefaultSqliteDriverPath(),
+        .default_uri = default_file.Path(),
+        .dark = dark,
+        .notify = notify,
+    };
+    dialogs.Show([context](DialogContext dialog) {
+      const ThemeSpec dialog_spec = context.dark ? DarkThemeSpec() : LightThemeSpec();
+      return Theme(AppThemeDefinition(dialog_spec), AdbcManagerDialog(dialog, context));
     });
   };
 
@@ -1015,7 +1254,7 @@ View TableEmptyState(const std::string& text) {
       std::move(title_bar),
       Row{
           Sidebar(app, table, selected, filter_input, page, tasks, picker, notify,
-                  open_picker, open_new),
+                  open_picker, open_new, open_manager),
           std::move(main_content).With(Grow(1.0F)),
       }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch}),
   }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch},

@@ -9,6 +9,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -381,7 +383,7 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<TableModel>& tab
   bool duplicated = false;
   app.Update([&](AppModel& model) {
     for (const auto& existing : model.sessions) {
-      if (existing.uri == session->uri && existing.driver_path == session->driver_path) {
+      if (existing.uri == session->uri && existing.dialect == session->dialect) {
         model.active_session = existing.id;
         model.active_object =
             existing.objects.empty() ? std::string{} : existing.objects.front().name;
@@ -733,5 +735,107 @@ void CloseSession(const State<AppModel>& app, const State<TableModel>& table,
                      std::move(notify));
   }
 }
+
+namespace {
+
+std::string EncodeProfileField(std::string_view text) {
+  std::string result;
+  result.reserve(text.size());
+  for (const char c : text) {
+    switch (c) {
+      case '%': result += "%25"; break;
+      case '\t': result += "%09"; break;
+      case '\n': result += "%0A"; break;
+      case '\r': result += "%0D"; break;
+      default: result.push_back(c); break;
+    }
+  }
+  return result;
+}
+
+std::string DecodeProfileField(std::string_view text) {
+  const auto hex_value = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string result;
+  result.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '%' && i + 2 < text.size()) {
+      const int high = hex_value(text[i + 1]);
+      const int low = hex_value(text[i + 2]);
+      if (high >= 0 && low >= 0) {
+        result.push_back(static_cast<char>((high << 4) | low));
+        i += 2;
+        continue;
+      }
+    }
+    result.push_back(text[i]);
+  }
+  return result;
+}
+
+} // namespace
+
+std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
+  std::vector<ConnectionProfile> profiles;
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return profiles;
+  }
+  std::string line;
+  while (std::getline(input, line)) {
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    std::vector<std::string_view> fields;
+    std::size_t start = 0;
+    while (start <= line.size() && fields.size() < 4) {
+      const std::size_t tab = line.find('\t', start);
+      if (tab == std::string::npos) {
+        fields.emplace_back(line.data() + start, line.size() - start);
+        break;
+      }
+      fields.emplace_back(line.data() + start, tab - start);
+      start = tab + 1;
+    }
+    if (fields.size() != 4) {
+      continue;
+    }
+    ConnectionProfile profile;
+    profile.name = DecodeProfileField(fields[0]);
+    profile.driver_path = DecodeProfileField(fields[1]);
+    profile.uri = DecodeProfileField(fields[2]);
+    profile.username = DecodeProfileField(fields[3]);
+    if (!profile.driver_path.empty() && !profile.uri.empty()) {
+      profiles.push_back(std::move(profile));
+    }
+  }
+  return profiles;
+}
+
+bool SaveConnectionProfiles(const std::string& path,
+                            const std::vector<ConnectionProfile>& profiles) {
+  const std::filesystem::path file_path(path);
+  if (file_path.has_parent_path()) {
+    std::error_code error;
+    std::filesystem::create_directories(file_path.parent_path(), error);
+  }
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    return false;
+  }
+  output << "# db++ adbc connections v1\n";
+  for (const ConnectionProfile& profile : profiles) {
+    output << EncodeProfileField(profile.name) << '\t'
+           << EncodeProfileField(profile.driver_path) << '\t'
+           << EncodeProfileField(profile.uri) << '\t'
+           << EncodeProfileField(profile.username) << '\n';
+  }
+  return static_cast<bool>(output);
+}
+
 
 } // namespace dbpp

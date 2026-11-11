@@ -57,6 +57,23 @@ struct ConnectionRequest {
   std::string title;
 };
 
+/// User-saved ADBC connection. Passwords are intentionally not persisted.
+struct ConnectionProfile {
+  std::string name;
+  std::string driver_path;
+  std::string uri;
+  std::string username;
+
+  bool operator==(const ConnectionProfile&) const = default;
+};
+
+struct AdbcDriverInfo {
+  std::string name;
+  std::string path;
+
+  bool operator==(const AdbcDriverInfo&) const = default;
+};
+
 struct DbSession {
   std::uint64_t id = 0;
   std::string name;
@@ -167,12 +184,30 @@ struct ConnectContext {
   NotifyFn notify;
 };
 
+struct AdbcManagerContext {
+  huxerui::State<AppModel> app;
+  huxerui::State<TableModel> table;
+  huxerui::State<std::optional<huxerui::DataTableCellId>> selected;
+  huxerui::State<huxerui::TextEditingValue> filter_input;
+  huxerui::State<std::vector<ConnectionProfile>> profiles;
+  huxerui::TaskScope tasks;
+  std::string profiles_path;
+  std::string default_driver;
+  std::string default_uri;
+  bool dark = false;
+  NotifyFn notify;
+};
+
 // ---- value and identifier helpers -----------------------------------------
 [[nodiscard]] std::string QuoteIdentifier(Dialect dialect, std::string_view identifier);
 [[nodiscard]] std::string SqlLiteral(Dialect dialect, std::string_view text,
                                      std::string_view declared_type, bool is_null);
 [[nodiscard]] std::string QualifiedName(Dialect dialect, const DbObject& object);
 [[nodiscard]] bool IsSqlReadStatement(std::string_view sql);
+[[nodiscard]] std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path);
+bool SaveConnectionProfiles(const std::string& path,
+                            const std::vector<ConnectionProfile>& profiles);
+[[nodiscard]] std::vector<AdbcDriverInfo> DiscoverAdbcDrivers();
 
 // ---- ADBC operations (implemented in adbc_session.cpp) --------------------
 struct AdbcOpenResult {
