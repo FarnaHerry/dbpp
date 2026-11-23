@@ -1,6 +1,10 @@
 #include "model.h"
 #include "theme.h"
 #include "adbc_session.h"
+#include "root.h"
+#include "settings.h"
+#include "tray.h"
+#include "app_resources.h"
 
 #include <huxerui/datatable.h>
 #include <huxerui/huxerui.h>
@@ -1079,6 +1083,83 @@ View TableEmptyState(const std::string& text) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings page
+// ---------------------------------------------------------------------------
+
+[[huxerui::composable]] View SettingsPage(State<int> theme_mode, NotifyFn notify) {
+  const auto settings = UseService<SettingsModel>();
+  const ThemeSpec& spec = UseTheme();
+  auto tasks = UseTaskScope();
+  auto transition = UseSceneTransition();
+  // 动画互斥旗标放 shared_ptr 里改：不经过 State 更新，防抖期间不触发重组。
+  struct ThemeAnimationFlag {
+    bool animating = false;
+  };
+  auto animating = UseState(std::make_shared<ThemeAnimationFlag>());
+  // 主题模式：0=跟随系统，1=深色，2=浅色。明暗真正变化时用圆形扩散过渡
+  // （参考 Clash-Flux）：冻结旧场景 → 切主题 → 新主题从点击位置扩散；
+  // 深色切出时反转动画（旧深色收缩进点击点）。
+  const bool system_dark = UseSystemThemeBrightness() == ThemeBrightness::Dark;
+  const auto apply_theme = [theme_mode, transition, tasks, animating, system_dark,
+                            motion = spec.motion](int mode) {
+    if (animating.Get()->animating) {
+      return;
+    }
+    const bool current_dark =
+        theme_mode.Get() == 1 || (theme_mode.Get() == 0 && system_dark);
+    const bool target_dark = mode == 1 || (mode == 0 && system_dark);
+    const auto mutation = [theme_mode, mode] { theme_mode = mode; };
+    if (current_dark == target_dark || motion.reduced_motion) {
+      mutation();
+      return;
+    }
+    animating.Get()->animating = true;
+    tasks.Launch([animating, duration = motion.slow + motion.fast]() -> Task<void> {
+      co_await Delay(std::chrono::duration<double>{duration});
+      animating.Get()->animating = false;
+    });
+    const TransitionSpec reveal{CircularRevealTransition{}, TweenSpec{motion.slow}};
+    transition.RunFromCurrentInteraction(current_dark ? reveal.Reversed() : reveal,
+                                         std::move(mutation));
+  };
+
+  View body = Column{
+      Text("设置", TextRole::Title),
+      Caption("外观"),
+      SegmentedButton({"跟随系统", "深色", "浅色"},
+                      static_cast<std::size_t>(theme_mode.Get()))
+          .OnChanged([apply_theme](std::size_t index) {
+            apply_theme(static_cast<int>(index));
+          }),
+      Divider(),
+      Caption("托盘"),
+      Switch("启用托盘图标", settings->tray_enabled)
+          .OnChanged([settings, notify](bool value) {
+            if (!settings->SetTrayEnabled(value)) {
+              notify("托盘设置保存失败");
+            }
+          }),
+      Switch("轻量级模式", settings->lightweight)
+          .OnChanged([settings, notify](bool value) {
+            if (!settings->SetLightweight(value)) {
+              notify("托盘设置保存失败");
+            }
+          })
+          .With(Enabled{settings->tray_enabled.Get()}),
+      MutedText("轻量级模式在关闭窗口时销毁界面（会断开数据库连接），从托盘唤出时重建。"),
+      Spacer(),
+      MutedText("db++ · ADBC 数据管理器"),
+  }.With(Frame{.width = 560.0F}, Spacing{10.0F},
+         CrossAlign{CrossAxisAlignment::Stretch});
+
+  return Column{
+      std::move(body),
+  }.With(Grow(1.0F), Padding{EdgeInsets::Symmetric(16.0F, 12.0F)},
+         MainAlign{MainAxisAlignment::Center},
+         CrossAlign{CrossAxisAlignment::Center});
+}
+
+// ---------------------------------------------------------------------------
 // Application shell
 // ---------------------------------------------------------------------------
 
@@ -1092,6 +1173,7 @@ View TableEmptyState(const std::string& text) {
   auto filter_input = UseState(TextEditingValue::FromText({}));
   auto page = UseState<std::size_t>(0);
   auto theme_mode = UseState<int>(0);
+  auto show_settings = UseState(false);
   auto toast = UseToast();
   auto dialogs = UseDialog();
   auto tasks = UseTaskScope();
@@ -1111,6 +1193,56 @@ View TableEmptyState(const std::string& text) {
       theme_mode.Get() == 1 || (theme_mode.Get() == 0 && system_dark);
   const ThemeSpec spec = dark ? DarkThemeSpec() : LightThemeSpec();
   const NotifyFn notify = MakeNotify(toast, app);
+
+  // 关闭策略：托盘可用时关闭=隐藏（轻量模式=销毁窗口省内存）；托盘不可用时
+  // 弹确认对话框退出，避免窗口一关应用就消失且没有入口唤回。
+  const WindowHandle window = UseWindow();
+  const auto tray_runtime = UseService<TrayRuntime>();
+  const auto settings_model = UseService<SettingsModel>();
+  auto close_dialog_open = UseState(false);
+  window.OnCloseRequest(
+      [tray_runtime, settings_model, dialogs, close_dialog_open]() -> bool {
+        if (tray_runtime->exit_requested) {
+          return true;
+        }
+        if (settings_model->tray_enabled.Get() && tray_runtime->tray.IsAvailable() &&
+            !tray_runtime->tray_refresh_failed) {
+          if (settings_model->lightweight.Get()) {
+            // 轻量级模式走正常关闭路径销毁原生窗口与 UI；Runtime 由
+            // quit_on_last_window_closed = false 保活，托盘负责下次唤出重建。
+            tray_runtime->retired = true;
+            return false;
+          }
+          tray_runtime->HideWindow();
+          return true;
+        }
+        if (close_dialog_open.Get()) {
+          return true;
+        }
+        close_dialog_open = true;
+        dialogs.Show([tray_runtime, close_dialog_open](DialogContext dialog) {
+          return DialogCard(Column{
+              Row{
+                  Text("关闭 db++？", TextRole::Title),
+                  Spacer(),
+                  ActionButton(Button("取消").OnClick([dialog, close_dialog_open] {
+                    close_dialog_open = false;
+                    dialog.Dismiss();
+                  })),
+                  ActionButton(Button("退出").OnClick(
+                                     [dialog, tray_runtime, close_dialog_open] {
+                                       close_dialog_open = false;
+                                       dialog.Dismiss();
+                                       tray_runtime->RequestExit();
+                                     }),
+                               true),
+              }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
+              MutedText("托盘不可用；退出会关闭全部数据库连接。"),
+          }.With(Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch})
+                    .With(Frame{.width = 480.0F}));
+        });
+        return true;
+      });
 
   // Optional startup connection: `DBPP_OPEN=/path/to.db dbpp` or
   // `DBPP_DRIVER=/path/to/libadbc_driver_x.so DBPP_OPEN=uri dbpp`.
@@ -1207,15 +1339,31 @@ View TableEmptyState(const std::string& text) {
   const AppModel& model = app.Get();
   const DbSession* active = model.ActiveSession();
 
+  // 标题栏右上角的齿轮是设置页唯一入口；打开时给图标一个激活底色，
+  // 让「齿轮 = 开关」的语义可见。SVG 固有 16px，Padding 只扩点击热区。
+  View gear_button = Image(app::images::settings)
+                         .Fit(ImageFit::Contain)
+                         .Tint(spec.colors.on_surface)
+                         .With(Padding{EdgeInsets::Symmetric(6.0F, 6.0F)},
+                               CornerRadius{4.0F})
+                         .OnClick([show_settings] {
+                           show_settings = !show_settings.Get();
+                         });
+  if (show_settings.Get()) {
+    gear_button =
+        std::move(gear_button).With(Background{VisualFill{spec.colors.surface}});
+  }
+
   View title_bar = WindowTitleBar{
+      Image(app::images::dbpp_logo)
+          .Fit(ImageFit::Contain)
+          .With(Frame{.width = 18.0F, .height = 18.0F}),
       Text("db++").Style(TextStyle{
           Font::System(13.0F).WithWeight(FontWeight::Bold), spec.colors.on_surface}),
       MutedText("ADBC"),
       Spacer(),
       MutedText(active ? active->name : "未打开数据库"),
-      ActionButton(Button(dark ? "浅色" : "深色").OnClick([theme_mode, dark] {
-        theme_mode = dark ? 2 : 1;
-      })),
+      std::move(gear_button),
   }.With(Padding{EdgeInsets::Symmetric(16.0F, 0.0F)}, Spacing{10.0F});
 
   View main_content;
@@ -1250,13 +1398,21 @@ View TableEmptyState(const std::string& text) {
            CrossAlign{CrossAxisAlignment::Stretch});
   }
 
+  // 设置页覆盖整个窗口（含侧栏），标题栏齿轮是唯一开关入口。
+  View page_content;
+  if (show_settings.Get()) {
+    page_content = SettingsPage(theme_mode, notify);
+  } else {
+    page_content = Row{
+        Sidebar(app, table, selected, filter_input, page, tasks, picker, notify,
+                open_picker, open_new, open_manager),
+        std::move(main_content).With(Grow(1.0F)),
+    }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch});
+  }
+
   View shell = Column{
       std::move(title_bar),
-      Row{
-          Sidebar(app, table, selected, filter_input, page, tasks, picker, notify,
-                  open_picker, open_new, open_manager),
-          std::move(main_content).With(Grow(1.0F)),
-      }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch}),
+      std::move(page_content),
   }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch},
          Background{VisualFill{spec.colors.background}});
 
@@ -1272,14 +1428,13 @@ huxerui::View AppRoot() {
 const huxerui::Application application{
     AppRoot,
     {
-        .window =
-            {
-                .title = "db++",
-                .initial_size = {1240.0F, 800.0F},
-                .minimum_size = huxerui::Size{900.0F, 600.0F},
-                .chrome_mode = huxerui::WindowChromeMode::Custom,
-                .title_bar_height = 32.0F,
-            },
+        .window = dbpp::MainWindowOptions(),
+        // The tray owns application lifetime: startup opens the window from a
+        // hook task, and lightweight mode may destroy the window while the
+        // tray keeps the runtime alive for a later OpenWindow rebuild.
+        .create_initial_window = false,
         .show_debug_overlay = false,
+        .quit_on_last_window_closed = false,
+        .application_hooks = {dbpp::InstallTrayRuntime},
     },
 };

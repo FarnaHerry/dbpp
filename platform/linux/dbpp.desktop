@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=db++
+GenericName=Database Manager
+Comment=ADBC 数据管理器
+Exec=dbpp %f
+Icon=dbpp
+StartupWMClass=dbpp
+Terminal=false
+Categories=Development;Database;

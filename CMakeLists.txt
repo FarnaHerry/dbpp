@@ -58,6 +58,14 @@ set(ADBC_DEFINE_COMMON_ENTRYPOINTS ON CACHE BOOL "" FORCE)
 set(ADBC_USE_CCACHE OFF CACHE BOOL "" FORCE)
 add_subdirectory("${DBPP_ADBC_DIR}/c" "${CMAKE_BINARY_DIR}/adbc" EXCLUDE_FROM_ALL)
 
+# ADBC 25 generates driver/sqlite/config.h under ${CMAKE_BINARY_DIR}/adbc but
+# adds top-level ${CMAKE_BINARY_DIR} to sqlite target include paths.
+foreach (_adbc_sqlite_target IN ITEMS adbc_driver_sqlite_objlib adbc_driver_sqlite_shared adbc_driver_sqlite_static)
+    if (TARGET "${_adbc_sqlite_target}")
+        target_include_directories("${_adbc_sqlite_target}" PRIVATE "${CMAKE_BINARY_DIR}/adbc")
+    endif ()
+endforeach ()
+
 file(GLOB_RECURSE DBPP_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
@@ -75,11 +83,40 @@ endif ()
 huxerui_add_app(dbpp
         SOURCES
             ${DBPP_SOURCES}
+        RESOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/resources"
+        RESOURCE_NAMESPACE
+            app
         BUNDLE_NAME
             "db++"
         BUNDLE_IDENTIFIER
             "dev.farna.dbpp"
 )
+
+# Windows executable icon (see assets/icon.ico; consumed through app.rc).
+if (WIN32)
+    set(DBPP_ICON_ICO "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.ico")
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/app.rc.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
+    target_sources(dbpp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+endif ()
+
+# macOS bundle icon.
+if (APPLE)
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/AppIcon.icns"
+            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(dbpp PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/AppIcon.icns")
+endif ()
+
+# Linux desktop integration (optional install; icon matches Icon=dbpp).
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png"
+            RENAME dbpp.png
+            DESTINATION share/icons/hicolor/256x256/apps)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/dbpp.desktop"
+            DESTINATION share/applications)
+endif ()
 
 huxerui_use_library(dbpp
         TARGET HuxerUI::DataTable
