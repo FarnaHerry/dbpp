@@ -70,6 +70,9 @@ struct ConnectionProfile {
 struct AdbcDriverInfo {
   std::string name;
   std::string path;
+  std::string detail;
+  std::string version;
+  bool is_manifest = false;
 
   bool operator==(const AdbcDriverInfo&) const = default;
 };
@@ -207,6 +210,7 @@ struct AdbcManagerContext {
 [[nodiscard]] std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path);
 bool SaveConnectionProfiles(const std::string& path,
                             const std::vector<ConnectionProfile>& profiles);
+[[nodiscard]] std::string UserAdbcDriversDir();
 [[nodiscard]] std::vector<AdbcDriverInfo> DiscoverAdbcDrivers();
 
 // ---- ADBC operations (implemented in adbc_session.cpp) --------------------

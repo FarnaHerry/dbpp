@@ -449,7 +449,7 @@ View TableEmptyState(const std::string& text) {
     const std::string driver_path = driver.Get().text;
     const std::string uri_text = uri.Get().text;
     if (driver_path.empty() || uri_text.empty()) {
-      error = "ADBC driver 路径和 URI 都不能为空";
+      error = "ADBC driver 名称/路径和 URI 都不能为空";
       return false;
     }
     ConnectionProfile profile{
@@ -544,10 +544,11 @@ View TableEmptyState(const std::string& text) {
   const auto& driver_list = drivers.Get();
   driver_rows.Reserve(driver_list.size());
   for (const AdbcDriverInfo& info : driver_list) {
+    const std::string& detail = info.detail.empty() ? info.path : info.detail;
     driver_rows.Add(
-        NavItem(info.name, info.path, driver.Get().text == info.path,
+        NavItem(info.name, detail, driver.Get().text == info.path,
                 [driver, info] { driver = TextEditingValue::FromText(info.path); })
-            .Key("driver-" + info.path));
+            .Key("driver-" + info.path + "-" + detail));
   }
 
   View saved_panel = Column{
@@ -572,8 +573,8 @@ View TableEmptyState(const std::string& text) {
           : View(ScrollView(Column{std::move(driver_rows)}.With(Spacing{2.0F}))
                      .With(Frame{.height = 140.0F})),
       TextField(driver)
-          .Label("ADBC Driver 路径")
-          .Placeholder("/path/to/libadbc_driver_postgresql.so")
+          .Label("ADBC Driver（名称或路径）")
+          .Placeholder("postgresql  ·  /path/to/libadbc_driver_postgresql.so")
           .Variant(TextFieldVariant::Outlined)
           .OnChanged([driver](const TextEditingValue& value) { driver = value; }),
       TextField(uri)
@@ -613,7 +614,8 @@ View TableEmptyState(const std::string& text) {
           ActionButton(Button("保存").OnClick([save_profile] { (void)save_profile(); })),
           ActionButton(Button("连接").OnClick(connect), true),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText("保存的连接不含密码；驱动列表来自 DBPP_ADBC_DRIVERS、ADBC_DRIVER_PATH 和系统库目录。"),
+      MutedText("保存的连接不含密码；自动发现标准 ADBC manifest 目录、ADBC_DRIVER_PATH、"
+                "DBPP_ADBC_DRIVERS 与系统库目录，支持短名、.toml 与动态库路径。"),
       Row{
           std::move(saved_panel),
           Divider(Axis::Vertical),
@@ -641,7 +643,7 @@ View TableEmptyState(const std::string& text) {
     request.password = password.Get().text;
     request.title = title.Get().text;
     if (request.driver_path.empty() || request.uri.empty()) {
-      error = "ADBC driver 路径和 URI 都不能为空";
+      error = "ADBC driver 名称/路径和 URI 都不能为空";
       return;
     }
     OpenConnection(context.app, context.table, context.selected, context.filter_input,
@@ -656,11 +658,11 @@ View TableEmptyState(const std::string& text) {
           ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
           ActionButton(Button("连接").OnClick(connect), true),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText("SQLite 填写文件路径即可；PostgreSQL / MySQL / DuckDB 等填写对应 "
-                "ADBC driver 的 .so 路径与连接 URI。"),
+      MutedText("SQLite 填写文件路径即可；PostgreSQL / MySQL / DuckDB 等填写驱动短名（如 "
+                "postgresql）、.toml manifest 或共享库（.so/.dylib/.dll）路径与连接 URI。"),
       TextField(driver)
-          .Label("ADBC Driver 路径")
-          .Placeholder("/path/to/libadbc_driver_postgresql.so")
+          .Label("ADBC Driver（名称或路径）")
+          .Placeholder("postgresql  ·  /path/to/libadbc_driver_postgresql.so")
           .Variant(TextFieldVariant::Outlined)
           .OnChanged([driver](const TextEditingValue& value) { driver = value; }),
       TextField(uri)

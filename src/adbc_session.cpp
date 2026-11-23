@@ -1,7 +1,9 @@
 #include "adbc_session.h"
 
 #include <arrow-adbc/adbc.h>
+#include <arrow-adbc/adbc_driver_manager.h>
 #include <nanoarrow/nanoarrow.h>
+#include <toml++/toml.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +17,8 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -56,8 +60,229 @@ bool ContainsLower(std::string_view haystack, std::string_view needle) {
   return LowerAscii(haystack).find(LowerAscii(needle)) != std::string::npos;
 }
 
-Dialect DetectDialect(std::string_view driver_path, std::string_view uri) {
-  const std::string key = LowerAscii(std::string(driver_path) + " " + std::string(uri));
+#if defined(_WIN32)
+constexpr char kSearchPathSeparator = ';';
+#else
+constexpr char kSearchPathSeparator = ':';
+#endif
+
+std::vector<std::string> SplitSearchPath(std::string_view value) {
+  std::vector<std::string> entries;
+  std::size_t start = 0;
+  for (std::size_t index = 0; index <= value.size(); ++index) {
+    if (index == value.size() || value[index] == kSearchPathSeparator) {
+      if (index > start) {
+        entries.emplace_back(value.substr(start, index - start));
+      }
+      start = index + 1;
+    }
+  }
+  return entries;
+}
+
+std::string SystemAdbcDriversDir() {
+#if defined(_WIN32)
+  return {};
+#elif defined(__APPLE__)
+  return "/Library/Application Support/ADBC/Drivers";
+#else
+  return "/etc/adbc/drivers";
+#endif
+}
+
+std::filesystem::path EnvAdbcDriversDir(const char* env_var) {
+  const char* value = std::getenv(env_var);
+  if (value == nullptr || *value == '\0') {
+    return {};
+  }
+  return std::filesystem::path(value) / "etc" / "adbc" / "drivers";
+}
+
+bool HasTomlExtension(const std::filesystem::path& path) {
+  return LowerAscii(path.extension().string()) == ".toml";
+}
+
+bool IsProfileManifest(const std::filesystem::path& path) {
+  return LowerAscii(path.filename().string()) == "profile.toml";
+}
+
+std::string BuildAdditionalSearchPathList() {
+  std::vector<std::string> dirs;
+  std::set<std::string> seen;
+
+  const auto add_dir = [&](const std::filesystem::path& dir) {
+    if (dir.empty()) {
+      return;
+    }
+    std::error_code error;
+    if (!std::filesystem::is_directory(dir, error)) {
+      return;
+    }
+    const std::string normalized = dir.lexically_normal().string();
+    if (seen.insert(normalized).second) {
+      dirs.push_back(dir.string());
+    }
+  };
+
+  if (const char* dbpp_drivers = std::getenv("DBPP_ADBC_DRIVERS"); dbpp_drivers != nullptr) {
+    for (const std::string& entry : SplitSearchPath(dbpp_drivers)) {
+      const std::filesystem::path path(entry);
+      std::error_code error;
+      if (std::filesystem::is_directory(path, error)) {
+        add_dir(path);
+      } else if (std::filesystem::is_regular_file(path, error) && path.has_parent_path()) {
+        add_dir(path.parent_path());
+      }
+    }
+  }
+
+  for (const char* env_var : {"VIRTUAL_ENV", "CONDA_PREFIX"}) {
+    add_dir(EnvAdbcDriversDir(env_var));
+  }
+
+  std::string joined;
+  for (std::size_t index = 0; index < dirs.size(); ++index) {
+    if (index > 0) {
+      joined.push_back(kSearchPathSeparator);
+    }
+    joined += dirs[index];
+  }
+  return joined;
+}
+
+struct ParsedDriverManifest {
+  std::string name;
+  std::string version;
+  std::string shared_hint;
+};
+
+std::optional<ParsedDriverManifest> ParseDriverManifest(const std::filesystem::path& path) {
+  if (!HasTomlExtension(path) || IsProfileManifest(path)) {
+    return std::nullopt;
+  }
+
+  toml::table config;
+  try {
+    config = toml::parse_file(path.native());
+  } catch (...) {
+    return std::nullopt;
+  }
+
+  if (const toml::node* mv = config.get("manifest_version"); mv != nullptr) {
+    if (!mv->is_integer() || mv->as_integer()->get() != 1) {
+      return std::nullopt;
+    }
+  }
+
+  const auto shared_node = config.at_path("Driver.shared");
+  std::string shared_hint;
+  if (const auto* single = shared_node.as_string()) {
+    if (single->get().empty()) {
+      return std::nullopt;
+    }
+    shared_hint = single->get();
+  } else if (const auto* platforms = shared_node.as_table()) {
+    for (const auto& [key, value] : *platforms) {
+      (void)key;
+      if (const auto* str = value.as_string(); str != nullptr && !str->get().empty()) {
+        if (!shared_hint.empty()) {
+          shared_hint.push_back(' ');
+        }
+        shared_hint += str->get();
+      }
+    }
+    if (shared_hint.empty()) {
+      return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+
+  ParsedDriverManifest parsed;
+  parsed.shared_hint = std::move(shared_hint);
+  if (const auto* name = config["name"].as_string()) {
+    parsed.name = name->get();
+  }
+  if (const auto* version = config["version"].as_string()) {
+    parsed.version = version->get();
+  }
+  return parsed;
+}
+
+std::optional<std::filesystem::path> ResolveManifestPath(std::string_view driver_spec) {
+  if (driver_spec.empty()) {
+    return std::nullopt;
+  }
+
+  const std::filesystem::path spec_path(driver_spec);
+  if (HasTomlExtension(spec_path)) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(spec_path, error)) {
+      return spec_path;
+    }
+    return std::nullopt;
+  }
+
+  if (driver_spec.find('/') != std::string_view::npos ||
+      driver_spec.find('\\') != std::string_view::npos || spec_path.has_extension()) {
+    return std::nullopt;
+  }
+
+  const std::string filename = std::string(driver_spec) + ".toml";
+  const auto check_dir = [&](const std::filesystem::path& dir)
+      -> std::optional<std::filesystem::path> {
+    if (dir.empty()) {
+      return std::nullopt;
+    }
+    std::error_code error;
+    const std::filesystem::path candidate = dir / filename;
+    if (std::filesystem::is_regular_file(candidate, error)) {
+      return candidate;
+    }
+    return std::nullopt;
+  };
+
+  if (const char* env = std::getenv("ADBC_DRIVER_PATH"); env != nullptr) {
+    for (const std::string& entry : SplitSearchPath(env)) {
+      if (auto found = check_dir(entry)) {
+        return found;
+      }
+    }
+  }
+
+  if (const char* dbpp_drivers = std::getenv("DBPP_ADBC_DRIVERS"); dbpp_drivers != nullptr) {
+    for (const std::string& entry : SplitSearchPath(dbpp_drivers)) {
+      const std::filesystem::path path(entry);
+      std::error_code error;
+      if (std::filesystem::is_directory(path, error)) {
+        if (auto found = check_dir(path)) {
+          return found;
+        }
+      } else if (std::filesystem::is_regular_file(path, error) && path.has_parent_path()) {
+        if (auto found = check_dir(path.parent_path())) {
+          return found;
+        }
+      }
+    }
+  }
+
+  for (const char* env_var : {"VIRTUAL_ENV", "CONDA_PREFIX"}) {
+    if (auto found = check_dir(EnvAdbcDriversDir(env_var))) {
+      return found;
+    }
+  }
+
+  if (auto found = check_dir(UserAdbcDriversDir())) {
+    return found;
+  }
+  if (auto found = check_dir(SystemAdbcDriversDir())) {
+    return found;
+  }
+  return std::nullopt;
+}
+
+Dialect DetectDialectFromText(std::string_view text) {
+  const std::string key = LowerAscii(text);
   if (key.find("sqlite") != std::string::npos) {
     return Dialect::Sqlite;
   }
@@ -69,6 +294,20 @@ Dialect DetectDialect(std::string_view driver_path, std::string_view uri) {
   }
   if (key.find("duckdb") != std::string::npos) {
     return Dialect::Duckdb;
+  }
+  return Dialect::Generic;
+}
+
+Dialect DetectDialect(std::string_view driver_path, std::string_view uri) {
+  const Dialect direct =
+      DetectDialectFromText(std::string(driver_path) + " " + std::string(uri));
+  if (direct != Dialect::Generic) {
+    return direct;
+  }
+  if (const auto manifest_path = ResolveManifestPath(driver_path)) {
+    if (const auto parsed = ParseDriverManifest(*manifest_path)) {
+      return DetectDialectFromText(parsed->name + " " + parsed->shared_hint);
+    }
   }
   return Dialect::Generic;
 }
@@ -344,6 +583,17 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
   }
   session->database_created = true;
 
+  if (AdbcDriverManagerDatabaseSetLoadFlags(&session->database, ADBC_LOAD_FLAG_DEFAULT,
+                                            &error) != ADBC_STATUS_OK) {
+    return fail("设置 ADBC 加载标志");
+  }
+  const std::string extra_paths = BuildAdditionalSearchPathList();
+  if (!extra_paths.empty() &&
+      AdbcDriverManagerDatabaseSetAdditionalSearchPathList(
+          &session->database, extra_paths.c_str(), &error) != ADBC_STATUS_OK) {
+    return fail("设置 ADBC 搜索路径");
+  }
+
   if (AdbcDatabaseSetOption(&session->database, "driver",
                             request.driver_path.c_str(), &error) != ADBC_STATUS_OK) {
     return fail("设置 ADBC driver");
@@ -356,6 +606,7 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
 
   const Dialect dialect = DetectDialect(request.driver_path, request.uri);
   if (dialect == Dialect::Sqlite && !request.uri.empty() &&
+      request.uri != ":memory:" &&
       request.uri.rfind("file:", 0) != 0 && request.uri.find("://") == std::string::npos) {
     std::error_code filesystem_error;
     const std::filesystem::path database_path(request.uri);
@@ -827,11 +1078,15 @@ namespace {
 std::string DriverDisplayName(const std::filesystem::path& path) {
   std::string filename = path.filename().string();
   std::string base = filename;
-  for (const std::string_view suffix : {".so", ".dylib", ".dll"}) {
-    const auto position = base.find(suffix);
-    if (position != std::string::npos) {
-      base.resize(position);
-      break;
+  if (LowerAscii(base).ends_with(".toml")) {
+    base.resize(base.size() - 5);
+  } else {
+    for (const std::string_view suffix : {".so", ".dylib", ".dll"}) {
+      const auto position = LowerAscii(base).find(suffix);
+      if (position != std::string::npos) {
+        base.resize(position);
+        break;
+      }
     }
   }
   if (base.starts_with("lib")) {
@@ -848,6 +1103,18 @@ std::string DriverDisplayName(const std::filesystem::path& path) {
   if (lower == "flightsql") return "Flight SQL";
   if (lower == "snowflake") return "Snowflake";
   if (lower == "bigquery") return "BigQuery";
+  if (lower == "clickhouse") return "ClickHouse";
+  if (lower == "mssql") return "SQL Server";
+  if (lower == "databricks") return "Databricks";
+  if (lower == "redshift") return "Redshift";
+  if (lower == "trino") return "Trino";
+  if (lower == "presto") return "Presto";
+  if (lower == "cassandra") return "Cassandra";
+  if (lower == "datafusion") return "DataFusion";
+  if (lower == "druid") return "Druid";
+  if (lower == "exasol") return "Exasol";
+  if (lower == "firebolt") return "Firebolt";
+  if (lower == "quack") return "DuckDB Quack";
   std::string display = base;
   std::ranges::replace(display, '_', ' ');
   std::ranges::replace(display, '-', ' ');
@@ -880,31 +1147,129 @@ std::string DriverBaseKey(std::string_view filename) {
   return base;
 }
 
-std::vector<std::string> SplitSearchPath(std::string_view value) {
-#if defined(_WIN32)
-  constexpr char kPathSeparator = ';';
-#else
-  constexpr char kPathSeparator = ':';
-#endif
-  std::vector<std::string> entries;
-  std::size_t start = 0;
-  for (std::size_t index = 0; index <= value.size(); ++index) {
-    if (index == value.size() || value[index] == kPathSeparator) {
-      if (index > start) {
-        entries.emplace_back(value.substr(start, index - start));
-      }
-      start = index + 1;
-    }
-  }
-  return entries;
-}
-
 } // namespace
 
-std::vector<AdbcDriverInfo> DiscoverAdbcDrivers() {
-  std::map<std::string, AdbcDriverInfo> by_base;
+std::string UserAdbcDriversDir() {
+#if defined(_WIN32)
+  if (const char* local_app_data = std::getenv("LOCALAPPDATA");
+      local_app_data != nullptr && *local_app_data != '\0') {
+    return (std::filesystem::path(local_app_data) / "ADBC" / "Drivers").string();
+  }
+  return {};
+#elif defined(__APPLE__)
+  if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+    return (std::filesystem::path(home) / "Library" / "Application Support" / "ADBC" / "Drivers")
+        .string();
+  }
+  return {};
+#else
+  std::filesystem::path config_dir;
+  if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg != nullptr && *xdg != '\0') {
+    config_dir = std::filesystem::path(xdg);
+  } else if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+    config_dir = std::filesystem::path(home) / ".config";
+  }
+  if (config_dir.empty()) {
+    return {};
+  }
+  return (config_dir / "adbc" / "drivers").string();
+#endif
+}
 
-  const auto add_file = [&](const std::filesystem::path& path) {
+std::vector<AdbcDriverInfo> DiscoverAdbcDrivers() {
+  std::map<std::string, AdbcDriverInfo> by_key;
+
+  const auto add_manifest_file = [&](const std::filesystem::path& path, bool use_slug) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+      return;
+    }
+    if (!HasTomlExtension(path) || IsProfileManifest(path)) {
+      return;
+    }
+    const std::string slug = path.stem().string();
+    if (slug.empty()) {
+      return;
+    }
+    const std::string key = "manifest:" + LowerAscii(slug);
+    if (by_key.contains(key)) {
+      return;
+    }
+    const auto parsed = ParseDriverManifest(path);
+    if (!parsed) {
+      return;
+    }
+    std::error_code absolute_error;
+    std::filesystem::path absolute = std::filesystem::absolute(path, absolute_error);
+    if (absolute_error) {
+      absolute = path;
+    }
+    const std::string display_name =
+        parsed->name.empty() ? DriverDisplayName(path) : parsed->name;
+    const std::string driver_value = use_slug ? slug : absolute.string();
+    const std::string detail =
+        (parsed->version.empty() ? "manifest · " : "manifest · v" + parsed->version + " · ") +
+        absolute.string();
+    by_key[key] = AdbcDriverInfo{
+        .name = display_name,
+        .path = driver_value,
+        .detail = detail,
+        .version = parsed->version,
+        .is_manifest = true,
+    };
+  };
+
+  const auto add_manifest_dir = [&](const std::filesystem::path& dir) {
+    if (dir.empty()) {
+      return;
+    }
+    std::error_code error;
+    if (!std::filesystem::is_directory(dir, error)) {
+      return;
+    }
+    std::vector<std::filesystem::path> files;
+    for (std::filesystem::directory_iterator it(dir, error), end; it != end;
+         it.increment(error)) {
+      if (error) {
+        break;
+      }
+      files.push_back(it->path());
+    }
+    std::ranges::sort(files, [](const auto& left, const auto& right) {
+      return left.filename().string() < right.filename().string();
+    });
+    for (const auto& file : files) {
+      add_manifest_file(file, true);
+    }
+  };
+
+  const auto add_manifest_env_entries = [&](const char* variable) {
+    if (const char* value = std::getenv(variable); value != nullptr) {
+      for (const std::string& entry : SplitSearchPath(value)) {
+        if (entry.empty()) {
+          continue;
+        }
+        const std::filesystem::path path(entry);
+        std::error_code error;
+        if (std::filesystem::is_directory(path, error)) {
+          add_manifest_dir(path);
+        } else {
+          add_manifest_file(path, false);
+        }
+      }
+    }
+  };
+
+  // Scan manifests in ADBC search priority order (first-wins per slug).
+  add_manifest_env_entries("ADBC_DRIVER_PATH");
+  add_manifest_env_entries("DBPP_ADBC_DRIVERS");
+  for (const char* env_var : {"VIRTUAL_ENV", "CONDA_PREFIX"}) {
+    add_manifest_dir(EnvAdbcDriversDir(env_var));
+  }
+  add_manifest_dir(UserAdbcDriversDir());
+  add_manifest_dir(SystemAdbcDriversDir());
+
+  const auto add_library_file = [&](const std::filesystem::path& path) {
     std::error_code error;
     if (!std::filesystem::is_regular_file(path, error)) {
       return;
@@ -913,25 +1278,28 @@ std::vector<AdbcDriverInfo> DiscoverAdbcDrivers() {
     if (!IsDriverFileName(filename)) {
       return;
     }
-    const std::string key = DriverBaseKey(filename);
+    const std::string key = "lib:" + DriverBaseKey(filename);
     std::error_code absolute_error;
     std::filesystem::path absolute = std::filesystem::absolute(path, absolute_error);
     if (absolute_error) {
       absolute = path;
     }
-    const auto existing = by_base.find(key);
-    if (existing != by_base.end() &&
+    const auto existing = by_key.find(key);
+    if (existing != by_key.end() &&
         std::filesystem::path(existing->second.path).filename().string().size() <=
             filename.size()) {
       return;
     }
-    by_base[key] = AdbcDriverInfo{
+    by_key[key] = AdbcDriverInfo{
         .name = DriverDisplayName(path),
         .path = absolute.string(),
+        .detail = absolute.string(),
+        .version = {},
+        .is_manifest = false,
     };
   };
 
-  const auto add_entry = [&](std::string entry) {
+  const auto add_library_entry = [&](std::string entry) {
     if (entry.empty()) {
       return;
     }
@@ -943,42 +1311,45 @@ std::vector<AdbcDriverInfo> DiscoverAdbcDrivers() {
         if (error) {
           break;
         }
-        add_file(it->path());
+        add_library_file(it->path());
       }
     } else {
-      add_file(path);
+      add_library_file(path);
     }
   };
 
   for (const char* variable : {"DBPP_ADBC_DRIVERS", "ADBC_DRIVER_PATH"}) {
     if (const char* value = std::getenv(variable); value != nullptr) {
       for (const std::string& entry : SplitSearchPath(value)) {
-        add_entry(entry);
+        add_library_entry(entry);
       }
     }
   }
 
-  add_file(DefaultSqliteDriverPath());
+  add_library_file(DefaultSqliteDriverPath());
   const std::filesystem::path default_driver(DefaultSqliteDriverPath());
   if (default_driver.has_parent_path()) {
-    add_entry(default_driver.parent_path().string());
+    add_library_entry(default_driver.parent_path().string());
   }
 
   for (const char* directory :
        {"/usr/lib64", "/usr/lib", "/usr/local/lib64", "/usr/local/lib",
         "/opt/homebrew/lib"}) {
-    add_entry(directory);
+    add_library_entry(directory);
   }
 
   std::vector<AdbcDriverInfo> drivers;
-  drivers.reserve(by_base.size());
-  for (auto& [key, driver] : by_base) {
+  drivers.reserve(by_key.size());
+  for (auto& [key, driver] : by_key) {
     (void)key;
     drivers.push_back(std::move(driver));
   }
   std::ranges::sort(drivers, [](const AdbcDriverInfo& left, const AdbcDriverInfo& right) {
     if (left.name != right.name) {
       return left.name < right.name;
+    }
+    if (left.is_manifest != right.is_manifest) {
+      return left.is_manifest > right.is_manifest;
     }
     return left.path < right.path;
   });

@@ -125,6 +125,8 @@ huxerui_use_library(dbpp
 
 target_include_directories(dbpp PRIVATE
         "${DBPP_ADBC_DIR}/c/include"
+)
+target_include_directories(dbpp SYSTEM PRIVATE
         "${DBPP_ADBC_DIR}/c/vendor"
 )
 target_link_libraries(dbpp PRIVATE

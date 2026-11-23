@@ -39,8 +39,14 @@ cmake --build build --parallel
 侧栏“ADBC 管理器…”用于管理连接和驱动：
 
 - 连接配置保存在应用数据目录的 `connections.tsv`（表格格式，密码不落盘）。
-- 驱动列表来自 `DBPP_ADBC_DRIVERS`、`ADBC_DRIVER_PATH`、构建目录以及系统库目录中的
-  `libadbc_driver_*`；点击驱动填入路径，点击已保存连接回填表单。
+- 驱动列表同时发现两类来源：
+  1. 标准 ADBC driver manifest（`.toml`）：按 `ADBC_DRIVER_PATH`、`DBPP_ADBC_DRIVERS`、
+     `$VIRTUAL_ENV/etc/adbc/drivers`、`$CONDA_PREFIX/etc/adbc/drivers`、用户配置目录
+     （Linux `~/.config/adbc/drivers`、macOS `~/Library/Application Support/ADBC/Drivers`、
+     Windows `%LOCALAPPDATA%\ADBC\Drivers`，兼容 `dbc install <slug>`）和系统目录
+     （`/etc/adbc/drivers`）顺序扫描，点击即填入短名或 `.toml` 路径。
+  2. 共享库（`libadbc_driver_*`）：扫描 `DBPP_ADBC_DRIVERS`、`ADBC_DRIVER_PATH`、
+     构建目录以及系统库目录，点击填入绝对路径。
 - 头部按钮：关闭 / 删除 / 保存 / 连接。连接会先保存当前配置，再打开 ADBC 会话。
 
 ## 托盘与轻量级模式
@@ -63,16 +69,16 @@ SQLite 驱动由构建一起产出，并通过编译期 `DBPP_SQLITE_DRIVER_PATH
 DBPP_SQLITE_DRIVER=/path/to/libadbc_driver_sqlite.so ./build/dbpp
 ```
 
-“连接…”对话框接受任意 ADBC driver 的完整路径和 URI（可选用户名/密码），例如：
+“连接…”对话框接受任意 ADBC driver（短名如 `postgresql`、`.toml` manifest 路径或动态库完整路径）和 URI（可选用户名/密码），例如：
 
-| 数据库 | driver | URI 示例 |
+| 数据库 | driver 示例 | URI 示例 |
 | --- | --- | --- |
 | SQLite | `libadbc_driver_sqlite.so` | `/tmp/app.sqlite` |
-| PostgreSQL | `libadbc_driver_postgresql.so` | `postgresql://host/db` |
-| MySQL | `libadbc_driver_mysql.so` | `mysql://user@host/db` |
-| DuckDB | `libadbc_driver_duckdb.so` | `/tmp/app.duckdb` |
+| PostgreSQL | `postgresql` / `libadbc_driver_postgresql.so` | `postgresql://host/db` |
+| MySQL | `mysql` / `libadbc_driver_mysql.so` | `mysql://user@host/db` |
+| DuckDB | `duckdb` / `libadbc_driver_duckdb.so` | `/tmp/app.duckdb` |
 
-默认只从绝对路径加载 driver；需要把对应 ADBC 驱动编译/安装到本机。
+ADBC 驱动管理器启用标准搜索标志（`ADBC_LOAD_FLAG_DEFAULT`），可通过 `dbc install <slug>`、系统包或自定义路径安装对应驱动后直接使用。
 分页使用 `LIMIT … OFFSET …`，标识符按方言引用（MySQL 使用反引号，其余双引号）。
 
 ## 目录
