@@ -4,3 +4,9 @@
 /.cache/
 compile_commands.json
 *.log
+/third_party/huxerui/
+/.huxerui/
+/dist/
+/dist-src/
+/dist-packages/
+/release/

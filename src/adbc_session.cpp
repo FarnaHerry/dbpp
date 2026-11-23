@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -24,6 +25,20 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace dbpp {
 
@@ -541,6 +556,129 @@ int64_t ListStart(const ArrowArrayView* list, int64_t index) {
 }
 
 
+std::filesystem::path ExecutableDirectory() {
+#if defined(_WIN32)
+  std::wstring buffer(512, L'\0');
+  for (;;) {
+    const DWORD len = GetModuleFileNameW(nullptr, buffer.data(),
+                                         static_cast<DWORD>(buffer.size()));
+    if (len == 0) {
+      return {};
+    }
+    if (len < buffer.size()) {
+      buffer.resize(len);
+      return std::filesystem::path(buffer).parent_path();
+    }
+    if (buffer.size() >= 32768) {
+      return {};
+    }
+    buffer.resize(buffer.size() * 2, L'\0');
+  }
+#elif defined(__APPLE__)
+  std::uint32_t size = 0;
+  (void)_NSGetExecutablePath(nullptr, &size);
+  if (size == 0) {
+    return {};
+  }
+  std::string buffer(size, '\0');
+  if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+    return {};
+  }
+  const std::filesystem::path raw(buffer.c_str());
+  std::error_code error;
+  const std::filesystem::path resolved = std::filesystem::weakly_canonical(raw, error);
+  return (error ? raw : resolved).parent_path();
+#else
+  std::string buffer(512, '\0');
+  for (;;) {
+    const ssize_t len = readlink("/proc/self/exe", buffer.data(), buffer.size());
+    if (len < 0) {
+      return {};
+    }
+    if (static_cast<std::size_t>(len) < buffer.size()) {
+      buffer.resize(static_cast<std::size_t>(len));
+      return std::filesystem::path(buffer).parent_path();
+    }
+    if (buffer.size() >= 32768) {
+      return {};
+    }
+    buffer.resize(buffer.size() * 2, '\0');
+  }
+#endif
+}
+
+std::optional<std::filesystem::path> FindBundledSqliteDriverInDir(
+    const std::filesystem::path& dir) {
+  if (dir.empty()) {
+    return std::nullopt;
+  }
+  std::error_code error;
+  if (!std::filesystem::is_directory(dir, error)) {
+    return std::nullopt;
+  }
+
+#if defined(_WIN32)
+  constexpr std::string_view kExactName = "adbc_driver_sqlite.dll";
+#elif defined(__APPLE__)
+  constexpr std::string_view kExactName = "libadbc_driver_sqlite.dylib";
+#else
+  constexpr std::string_view kExactName = "libadbc_driver_sqlite.so";
+#endif
+
+  const std::filesystem::path exact = dir / kExactName;
+  if (std::filesystem::is_regular_file(exact, error)) {
+    return exact;
+  }
+
+  std::vector<std::filesystem::path> matches;
+  for (std::filesystem::directory_iterator it(dir, error), end; it != end;
+       it.increment(error)) {
+    if (error) {
+      break;
+    }
+    std::error_code file_error;
+    if (!std::filesystem::is_regular_file(it->path(), file_error)) {
+      continue;
+    }
+    const std::string lower = LowerAscii(it->path().filename().string());
+#if defined(_WIN32)
+    if (lower == kExactName) {
+      matches.push_back(it->path());
+    }
+#elif defined(__APPLE__)
+    if (lower.starts_with("libadbc_driver_sqlite.") && lower.ends_with(".dylib")) {
+      matches.push_back(it->path());
+    }
+#else
+    if (lower.starts_with("libadbc_driver_sqlite.so.")) {
+      matches.push_back(it->path());
+    }
+#endif
+  }
+
+  if (matches.empty()) {
+    return std::nullopt;
+  }
+  std::ranges::sort(matches, [](const auto& left, const auto& right) {
+    return left.filename().string() < right.filename().string();
+  });
+  return matches.front();
+}
+
+std::filesystem::path BundledDriverDirectory() {
+  const std::filesystem::path exe_dir = ExecutableDirectory();
+  if (exe_dir.empty()) {
+    return {};
+  }
+#if defined(_WIN32)
+  return exe_dir;
+#elif defined(__APPLE__)
+  return (exe_dir / ".." / "Frameworks").lexically_normal();
+#else
+  return exe_dir / "lib";
+#endif
+}
+
 } // namespace
 
 std::string DefaultSqliteDriverPath() {
@@ -548,11 +686,46 @@ std::string DefaultSqliteDriverPath() {
                                                                     *environment != '\0') {
     return environment;
   }
-#ifdef DBPP_SQLITE_DRIVER_PATH
-  return DBPP_SQLITE_DRIVER_PATH;
+
+  const std::filesystem::path exe_dir = ExecutableDirectory();
+  if (!exe_dir.empty()) {
+#if defined(_WIN32)
+    const std::filesystem::path candidates[] = {
+        exe_dir,
+        exe_dir / "drivers",
+        exe_dir / "adbc" / "driver" / "sqlite",
+    };
+#elif defined(__APPLE__)
+    const std::filesystem::path candidates[] = {
+        (exe_dir / ".." / "Frameworks").lexically_normal(),
+        exe_dir,
+        exe_dir / "drivers",
+        exe_dir / "adbc" / "driver" / "sqlite",
+    };
 #else
-  return "adbc_driver_sqlite";
+    const std::filesystem::path candidates[] = {
+        exe_dir / "lib",
+        exe_dir / "drivers",
+        exe_dir,
+        exe_dir / "adbc" / "driver" / "sqlite",
+    };
 #endif
+    for (const auto& dir : candidates) {
+      if (const auto found = FindBundledSqliteDriverInDir(dir)) {
+        return found->string();
+      }
+    }
+  }
+
+#ifdef DBPP_SQLITE_DRIVER_PATH
+  {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(DBPP_SQLITE_DRIVER_PATH, error)) {
+      return DBPP_SQLITE_DRIVER_PATH;
+    }
+  }
+#endif
+  return "adbc_driver_sqlite";
 }
 
 AdbcSession::~AdbcSession() {
@@ -997,9 +1170,15 @@ bool IsValidNumber(std::string_view text) {
   if (text.empty()) {
     return false;
   }
-  double value = 0;
-  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-  return error == std::errc{} && end == text.data() + text.size() && std::isfinite(value);
+  if (std::isspace(static_cast<unsigned char>(text.front())) ||
+      std::isspace(static_cast<unsigned char>(text.back()))) {
+    return false;
+  }
+  const std::string copy(text);
+  errno = 0;
+  char* end = nullptr;
+  const double value = std::strtod(copy.c_str(), &end);
+  return errno != ERANGE && end == copy.c_str() + copy.size() && std::isfinite(value);
 }
 
 } // namespace
@@ -1075,6 +1254,26 @@ namespace {
 
 namespace {
 
+void StripVersionSuffixes(std::string& base) {
+  for (;;) {
+    const auto dot = base.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= base.size()) {
+      break;
+    }
+    bool all_digits = true;
+    for (std::size_t i = dot + 1; i < base.size(); ++i) {
+      if (!std::isdigit(static_cast<unsigned char>(base[i]))) {
+        all_digits = false;
+        break;
+      }
+    }
+    if (!all_digits) {
+      break;
+    }
+    base.resize(dot);
+  }
+}
+
 std::string DriverDisplayName(const std::filesystem::path& path) {
   std::string filename = path.filename().string();
   std::string base = filename;
@@ -1085,6 +1284,9 @@ std::string DriverDisplayName(const std::filesystem::path& path) {
       const auto position = LowerAscii(base).find(suffix);
       if (position != std::string::npos) {
         base.resize(position);
+        if (suffix == ".dylib") {
+          StripVersionSuffixes(base);
+        }
         break;
       }
     }
@@ -1140,6 +1342,9 @@ std::string DriverBaseKey(std::string_view filename) {
       const auto extension = base.rfind(suffix);
       if (extension != std::string::npos) {
         base.resize(extension);
+        if (suffix == ".dylib") {
+          StripVersionSuffixes(base);
+        }
         break;
       }
     }
@@ -1326,17 +1531,20 @@ std::vector<AdbcDriverInfo> DiscoverAdbcDrivers() {
     }
   }
 
+  add_library_entry(BundledDriverDirectory().string());
   add_library_file(DefaultSqliteDriverPath());
   const std::filesystem::path default_driver(DefaultSqliteDriverPath());
   if (default_driver.has_parent_path()) {
     add_library_entry(default_driver.parent_path().string());
   }
 
+#if !defined(_WIN32)
   for (const char* directory :
        {"/usr/lib64", "/usr/lib", "/usr/local/lib64", "/usr/local/lib",
         "/opt/homebrew/lib"}) {
     add_library_entry(directory);
   }
+#endif
 
   std::vector<AdbcDriverInfo> drivers;
   drivers.reserve(by_key.size());

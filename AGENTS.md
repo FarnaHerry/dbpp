@@ -16,6 +16,7 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 | 托盘、关闭策略、轻量级模式、settings.tsv | src/tray.h 注释、src/tray.cpp、src/settings.cpp |
 | 主题/配色 | src/theme.*：只有单色黑白，禁止引入新色相 |
 | 图标与打包 | resources/（运行时资源包，app::images::*）、assets/（平台二进制图标）、platform/ 与 CMakeLists.txt |
+| CI、安装器与发版 | .github/workflows/build.yml、cmake/FindSQLite3.cmake、platform/{windows,macos}/ 与 tests/ |
 
 ## 全局底线
 
@@ -33,6 +34,7 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 
 ```bash
 cmake --build build --target dbpp
+ctest --test-dir build --output-on-failure --no-tests=error
 git diff --check
 ```
 

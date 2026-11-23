@@ -21,19 +21,22 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
   Linux hicolor 图标 + desktop 文件）
 - 启动参数：`dbpp /path/to/file.sqlite`，或 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
 
-## 构建
+## 构建与测试
 
-依赖：CMake ≥ 3.30、Ninja、GCC/Clang（C++20）、GTK4 ≥ 4.14、libepoxy、libsoup3、
-SQLite3 开发包。ADBC 以源码形式 vendored 在 `third_party/adbc`，内置 fmt/nanoarrow。
+依赖：CMake ≥ 3.30、Ninja、GCC/Clang/MSVC（C++20）；Linux 需要 GTK4 ≥ 4.14、
+libepoxy、libsoup3 开发包。ADBC 与 SQLite3（`DBPP_USE_VENDORED_SQLITE3=ON`）以源码形式
+vendored 在 `third_party/adbc`，开箱即编。
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ./build/dbpp
 ```
 
-`DBPP_HUXERUI_DIR` 默认指向 `../HuxerUI-fork`，`DBPP_ADBC_DIR` 指向
-`third_party/adbc`，`DBPP_DATATABLE_DIR` 指向 `third_party/Lib-DataTable`。
+`DBPP_HUXERUI_DIR` 自动优先检测 `third_party/huxerui`，否则回落到
+`../HuxerUI-fork`；`DBPP_ADBC_DIR` 指向 `third_party/adbc`，`DBPP_DATATABLE_DIR`
+指向 `third_party/Lib-DataTable`。
 
 ## ADBC 管理器
 
@@ -67,8 +70,7 @@ cmake --build build --parallel
 
 ## ADBC 多数据库
 
-SQLite 驱动由构建一起产出，并通过编译期 `DBPP_SQLITE_DRIVER_PATH` 指向。
-运行时可覆盖：
+SQLite 驱动随构建一起产出并打包到可执行文件同级或 `lib/` / `Frameworks/` 目录，运行时按可执行文件相对路径自动定位，最后回落到编译期 `DBPP_SQLITE_DRIVER_PATH`；也可通过环境变量覆盖：
 
 ```sh
 DBPP_SQLITE_DRIVER=/path/to/libadbc_driver_sqlite.so ./build/dbpp
@@ -98,6 +100,10 @@ src/tray.*             托盘运行时：图标/菜单、关闭策略、轻量�
 src/settings.*         settings.tsv 读写与应用级 SettingsModel
 resources/             运行时资源包（应用内 logo、托盘图标）
 assets/                平台二进制图标（Linux icon.png、Windows icon.ico）
+cmake/                 构建模块（如 vendored SQLite3 探测 FindSQLite3.cmake）
 third_party/           ADBC、Lib-DataTable 与 vendor 依赖
-platform/              平台入口与打包文件（desktop、app.rc、icns）
+platform/              平台入口与打包/安装器配置（desktop、WiX、plist、icns）
+tests/                 无窗口核心单元测试（CTest）
+.github/workflows/     多平台桌面 CI 与 Release 构建流水线（Linux/Windows/macOS）
+docs/releases/         各版本 Release 说明
 ```

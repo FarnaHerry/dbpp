@@ -1,0 +1,18 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Bundle Name="db++" Manufacturer="dev.farna.dbpp" Version="@HUXERUI_WINDOWS_PROJECT_VERSION@"
+          UpgradeCode="@HUXERUI_WINDOWS_BUNDLE_UPGRADE_CODE@"
+          IconSourceFile="@HUXERUI_WINDOWS_ICON_FILE@">
+    <BootstrapperApplication SourceFile="!(bindpath.Installer)\dbpp-Installer.exe">
+      <PayloadGroupRef Id="HuxerUIInstallerPayloads" />
+    </BootstrapperApplication>
+    <Variable Name="InstallFolder" Type="formatted" Value="[ProgramFiles64Folder]db++" />
+    <Variable Name="CreateDesktopShortcut" Type="numeric" Value="0" />
+    <Variable Name="HuxerUIAutoCloseApplications" Type="numeric" Value="1" />
+    <Chain>
+      <MsiPackage SourceFile="!(bindpath.Package)\dbpp.msi">
+        <MsiProperty Name="INSTALLFOLDER" Value="[InstallFolder]" />
+        <MsiProperty Name="CREATE_DESKTOP_SHORTCUT" Value="[CreateDesktopShortcut]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

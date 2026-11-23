@@ -2,10 +2,19 @@ cmake_minimum_required(VERSION 3.30)
 
 project(dbpp VERSION 0.1.0 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
-# Local HuxerUI checkout (farna/main branch) and extension libraries.
-set(DBPP_HUXERUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../HuxerUI-fork" CACHE PATH "HuxerUI source directory")
+# HuxerUI 源码目录：优先使用 CI/本地检出的 third_party/huxerui，回落到同级 ../HuxerUI-fork。
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/huxerui/CMakeLists.txt")
+    set(_dbpp_default_huxerui_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/huxerui")
+else ()
+    set(_dbpp_default_huxerui_dir "${CMAKE_CURRENT_SOURCE_DIR}/../HuxerUI-fork")
+endif ()
+set(DBPP_HUXERUI_DIR "${_dbpp_default_huxerui_dir}" CACHE PATH "HuxerUI source directory")
 set(DBPP_DATATABLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Lib-DataTable" CACHE PATH "Lib-DataTable source directory")
 set(DBPP_ADBC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/adbc" CACHE PATH "Apache Arrow ADBC source directory")
+
+option(DBPP_USE_VENDORED_SQLITE3 "Build SQLite3 from the vendored ADBC amalgamation" ON)
+option(DBPP_BUILD_TESTS "Build db++ headless unit tests" ON)
+option(HUXERUI_PACKAGE "Configure desktop packaging and installer targets" OFF)
 
 if (NOT EXISTS "${DBPP_HUXERUI_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "DBPP_HUXERUI_DIR does not contain a HuxerUI checkout: ${DBPP_HUXERUI_DIR}")
@@ -25,6 +34,9 @@ add_subdirectory("${DBPP_HUXERUI_DIR}" "${CMAKE_BINARY_DIR}/huxerui-sdk" EXCLUDE
 
 enable_language(C)
 enable_language(CXX)
+if (WIN32)
+    enable_language(RC)
+endif ()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -35,6 +47,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif ()
+
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # ---- Apache Arrow ADBC (driver manager + SQLite driver) -------------------
 # ADBC is the database abstraction: every connection goes through the driver
@@ -74,6 +88,7 @@ file(GLOB_RECURSE DBPP_SOURCES CONFIGURE_DEPENDS
 
 if (WIN32)
     list(APPEND DBPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/main.cpp")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/huxerui.cmake")
 elseif (APPLE)
     list(APPEND DBPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/main.cpp")
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -93,29 +108,25 @@ huxerui_add_app(dbpp
             "dev.farna.dbpp"
 )
 
-# Windows executable icon (see assets/icon.ico; consumed through app.rc).
 if (WIN32)
-    set(DBPP_ICON_ICO "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.ico")
-    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/app.rc.in"
-                   "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
-    target_sources(dbpp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+    if (HUXERUI_WINDOWS_MANIFEST)
+        target_sources(dbpp PRIVATE "${HUXERUI_WINDOWS_MANIFEST}")
+    endif ()
+    if (HUXERUI_WINDOWS_RESOURCE)
+        target_sources(dbpp PRIVATE "${HUXERUI_WINDOWS_RESOURCE}")
+    endif ()
+    target_compile_definitions(dbpp PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif ()
 
-# macOS bundle icon.
-if (APPLE)
+# macOS bundle icon and Info.plist.
+if (APPLE AND NOT IOS)
+    set_target_properties(dbpp PROPERTIES
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist.in"
+    )
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/AppIcon.icns"
             PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     target_sources(dbpp PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/AppIcon.icns")
-endif ()
-
-# Linux desktop integration (optional install; icon matches Icon=dbpp).
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png"
-            RENAME dbpp.png
-            DESTINATION share/icons/hicolor/256x256/apps)
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/dbpp.desktop"
-            DESTINATION share/applications)
 endif ()
 
 huxerui_use_library(dbpp
@@ -136,14 +147,153 @@ target_link_libraries(dbpp PRIVATE
 target_compile_definitions(dbpp PRIVATE
         DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
 )
-add_dependencies(dbpp adbc_driver_sqlite_shared)
+huxerui_add_runtime_dependencies(dbpp TARGETS adbc_driver_sqlite_shared)
+
+if (WIN32)
+    add_custom_command(TARGET dbpp POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "$<TARGET_FILE:HuxerUI::huxerui>"
+                    "$<TARGET_FILE_DIR:dbpp>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "$<TARGET_FILE:adbc_driver_manager_shared>"
+                    "$<TARGET_FILE_DIR:dbpp>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                    "$<TARGET_FILE_DIR:dbpp>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
+            COMMENT "Copying HuxerUI and ADBC runtime DLLs next to dbpp.exe"
+            VERBATIM
+    )
+endif ()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(dbpp PRIVATE -Wall -Wextra -Wpedantic)
 endif ()
 
-# The platform entry point lives in platform/linux/main.cpp; install a run script
-# next to the build output for convenience.
+# ---- 平台安装与打包 -------------------------------------------------------
+get_target_property(DBPP_APP_INSTALL_COMPONENT dbpp HUXERUI_APPLICATION_INSTALL_COMPONENT)
+if (WIN32 AND COMMAND huxerui_configure_windows_project_package)
+    if (DBPP_APP_INSTALL_COMPONENT AND NOT DBPP_APP_INSTALL_COMPONENT MATCHES "-NOTFOUND$")
+        huxerui_configure_windows_project_package(dbpp "${DBPP_APP_INSTALL_COMPONENT}")
+    endif ()
+elseif (APPLE AND NOT IOS AND COMMAND _huxerui_install_runtime_dependencies)
+    install(TARGETS dbpp
+            BUNDLE DESTINATION .
+            COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+    )
+    _huxerui_install_runtime_dependencies(dbpp "${DBPP_APP_INSTALL_COMPONENT}"
+            "$<TARGET_FILE_NAME:dbpp>.app/Contents" "MacOS/$<TARGET_FILE_NAME:dbpp>"
+    )
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND COMMAND _huxerui_install_runtime_dependencies)
+    get_target_property(DBPP_LINUX_RESOURCE_PACKAGE dbpp HUXERUI_RESOURCE_PACKAGE)
+    install(TARGETS dbpp
+            RUNTIME DESTINATION .
+            COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+    )
+    _huxerui_install_runtime_dependencies(dbpp "${DBPP_APP_INSTALL_COMPONENT}"
+            . "$<TARGET_FILE_NAME:dbpp>"
+    )
+    if (DBPP_LINUX_RESOURCE_PACKAGE AND NOT DBPP_LINUX_RESOURCE_PACKAGE MATCHES "-NOTFOUND$")
+        install(DIRECTORY "${DBPP_LINUX_RESOURCE_PACKAGE}/"
+                DESTINATION "dbpp.resources"
+                COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+        )
+    endif ()
+    install(CODE [[
+file(MAKE_DIRECTORY "$ENV{DESTDIR}/usr/bin")
+file(CREATE_LINK "/opt/dbpp/dbpp" "$ENV{DESTDIR}/usr/bin/dbpp" SYMBOLIC)
+]]
+            COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+    )
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/dbpp.desktop"
+            DESTINATION /usr/share/applications
+            COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+    )
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png"
+            DESTINATION /usr/share/icons/hicolor/256x256/apps
+            RENAME dbpp.png
+            COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+    )
+
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" DBPP_LINUX_PROCESSOR)
+    if (DBPP_LINUX_PROCESSOR MATCHES "^(x86_64|amd64|x64)$")
+        set(DBPP_LINUX_RPM_ARCH "x86_64")
+        set(DBPP_LINUX_DEB_ARCH "amd64")
+    elseif (DBPP_LINUX_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(DBPP_LINUX_RPM_ARCH "aarch64")
+        set(DBPP_LINUX_DEB_ARCH "arm64")
+    else ()
+        message(FATAL_ERROR "Linux packages are unsupported for CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}")
+    endif ()
+
+    set(CPACK_PACKAGE_NAME "dbpp")
+    set(CPACK_PACKAGE_VENDOR "FarnaHerry")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SQLite-first desktop database manager powered by Apache Arrow ADBC")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_CONTACT "FarnaHerry")
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/opt/dbpp")
+    set(CPACK_GENERATOR "DEB;RPM")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "FarnaHerry")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${DBPP_LINUX_DEB_ARCH}")
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
+    set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+    set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")
+    set(CPACK_RPM_PACKAGE_ARCHITECTURE "${DBPP_LINUX_RPM_ARCH}")
+    set(CPACK_COMPONENTS_ALL "${DBPP_APP_INSTALL_COMPONENT}")
+    set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
+    set(CPACK_INSTALL_CMAKE_PROJECTS "${CMAKE_BINARY_DIR};dbpp;${DBPP_APP_INSTALL_COMPONENT};/")
+    include(CPack)
+endif ()
+
+# ---- 无窗口核心单元测试 ---------------------------------------------------
+if (DBPP_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_adbc_core
+            tests/test_adbc_core.cpp
+            src/adbc_session.cpp
+            src/driver_installer.cpp
+    )
+    target_compile_features(test_adbc_core PRIVATE cxx_std_20)
+    target_include_directories(test_adbc_core PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${DBPP_ADBC_DIR}/c/include"
+    )
+    target_include_directories(test_adbc_core SYSTEM PRIVATE
+            "${DBPP_ADBC_DIR}/c/vendor"
+    )
+    target_link_libraries(test_adbc_core PRIVATE
+            HuxerUI::huxerui
+            HuxerUI::DataTable
+            adbc_driver_manager_shared
+            nanoarrow
+    )
+    target_compile_definitions(test_adbc_core PRIVATE
+            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+    )
+    add_dependencies(test_adbc_core adbc_driver_sqlite_shared)
+    if (MSVC)
+        target_compile_options(test_adbc_core PRIVATE /utf-8)
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_adbc_core PRIVATE -Wall -Wextra -Wpedantic)
+    endif ()
+    if (WIN32)
+        target_compile_definitions(test_adbc_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+        add_custom_command(TARGET test_adbc_core POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:HuxerUI::huxerui>"
+                        "$<TARGET_FILE_DIR:test_adbc_core>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_manager_shared>"
+                        "$<TARGET_FILE_DIR:test_adbc_core>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                        "$<TARGET_FILE_DIR:test_adbc_core>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
+                COMMENT "Copying runtime DLLs next to test_adbc_core.exe"
+                VERBATIM
+        )
+    endif ()
+    add_test(NAME adbc_core COMMAND test_adbc_core)
+endif ()
+
 add_custom_target(dbpp-run
         COMMAND "$<TARGET_FILE:dbpp>"
         DEPENDS dbpp
