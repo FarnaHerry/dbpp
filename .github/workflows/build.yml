@@ -57,7 +57,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates curl clang-18 g++ ninja-build pkg-config file binutils gzip \
+            git ca-certificates curl clang-18 clang-tools-18 g++ ninja-build pkg-config file binutils gzip \
             python3 python3-pip libgtk-4-dev libepoxy-dev libsoup-3.0-dev dpkg-dev rpm
           python3 -m pip install --break-system-packages -q cmake==4.4.2
           cmake --version | head -1
