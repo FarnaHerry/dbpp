@@ -1,6 +1,7 @@
 #pragma once
 
 #include <huxerui/datatable.h>
+#include <huxerui/http.h>
 #include <huxerui/huxerui.h>
 
 #include <cstdint>
@@ -194,6 +195,7 @@ struct AdbcManagerContext {
   huxerui::State<huxerui::TextEditingValue> filter_input;
   huxerui::State<std::vector<ConnectionProfile>> profiles;
   huxerui::TaskScope tasks;
+  std::shared_ptr<huxerui::HttpClient> http;
   std::string profiles_path;
   std::string default_driver;
   std::string default_uri;

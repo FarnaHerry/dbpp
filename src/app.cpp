@@ -1,6 +1,7 @@
 #include "model.h"
 #include "theme.h"
 #include "adbc_session.h"
+#include "driver_installer.h"
 #include "root.h"
 #include "settings.h"
 #include "tray.h"
@@ -10,6 +11,7 @@
 #include <huxerui/huxerui.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -108,6 +110,25 @@ bool IsBlobColumn(const ColumnMeta& column) {
   std::ranges::transform(type, type.begin(),
                          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return type.find("blob") != std::string::npos;
+}
+
+bool ContainsIgnoreCaseAscii(std::string_view haystack, std::string_view needle) {
+  if (needle.empty()) {
+    return true;
+  }
+  const auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                              [](char left, char right) {
+                                return std::tolower(static_cast<unsigned char>(left)) ==
+                                       std::tolower(static_cast<unsigned char>(right));
+                              });
+  return it != haystack.end();
+}
+
+std::string_view StripLeadingV(std::string_view text) {
+  if (!text.empty() && (text.front() == 'v' || text.front() == 'V')) {
+    text.remove_prefix(1);
+  }
+  return text;
 }
 
 std::string UriDisplayName(std::string_view uri) {
@@ -430,11 +451,18 @@ View TableEmptyState(const std::string& text) {
 [[huxerui::composable]] View AdbcManagerDialog(DialogContext dialog,
                                                    AdbcManagerContext context) {
   auto profiles = context.profiles;
+  auto dialog_tasks = UseTaskScope();
+  auto tab = UseState<std::size_t>(0);
   auto drivers = UseState(std::vector<AdbcDriverInfo>{});
-  Lifecycle([drivers] {
-    drivers = DiscoverAdbcDrivers();
-    return [] {};
-  });
+  auto user_installed = UseState(std::vector<std::string>{});
+  auto catalog = UseState(std::vector<RegistryDriverInfo>{});
+  auto catalog_loaded = UseState(false);
+  auto catalog_loading = UseState(false);
+  auto catalog_error = UseState(std::string{});
+  auto registry_filter = UseState(TextEditingValue::FromText({}));
+  auto installing_slug = UseState(std::string{});
+  auto install_status = UseState(std::string{});
+  auto install_error = UseState(std::string{});
   auto selected = UseState<int>(-1);
   auto driver = UseState(TextEditingValue::FromText(context.default_driver));
   auto uri = UseState(TextEditingValue::FromText(context.default_uri));
@@ -443,6 +471,121 @@ View TableEmptyState(const std::string& text) {
   auto name = UseState(TextEditingValue::FromText({}));
   auto status = UseState(std::string{});
   auto error = UseState(std::string{});
+
+  const auto refresh_drivers = [drivers, user_installed]() -> std::size_t {
+    std::vector<AdbcDriverInfo> list = DiscoverAdbcDrivers();
+    std::vector<std::string> user_slugs;
+    for (const AdbcDriverInfo& info : list) {
+      if (info.is_manifest && IsUserInstalledAdbcDriver(info.path)) {
+        user_slugs.push_back(info.path);
+      }
+    }
+    const std::size_t count = list.size();
+    drivers = std::move(list);
+    user_installed = std::move(user_slugs);
+    return count;
+  };
+
+  Lifecycle([refresh_drivers] {
+    (void)refresh_drivers();
+    return [] {};
+  });
+
+  const auto load_catalog = [context, dialog_tasks, catalog, catalog_loaded, catalog_loading,
+                             catalog_error]() {
+    if (catalog_loading.Get()) {
+      return;
+    }
+    if (!context.http) {
+      catalog_error = "HTTP 客户端不可用";
+      return;
+    }
+    catalog_loading = true;
+    catalog_error = {};
+    dialog_tasks.Launch([http = context.http, catalog, catalog_loaded, catalog_loading,
+                         catalog_error]() -> Task<void> {
+      RegistryCatalogResult res = co_await FetchRegistryCatalogAsync(http);
+      catalog_loading = false;
+      catalog_loaded = true;
+      if (!res.error.empty()) {
+        catalog_error = res.error;
+        co_return;
+      }
+      catalog = std::move(res.drivers);
+    });
+  };
+
+  const auto switch_tab = [tab, catalog_loaded, catalog_loading,
+                           load_catalog](std::size_t index) {
+    tab = index;
+    if (index == 1 && !catalog_loaded.Get() && !catalog_loading.Get()) {
+      load_catalog();
+    }
+  };
+
+  const auto start_install = [context, dialog_tasks, driver, status, installing_slug,
+                              install_status, install_error,
+                              refresh_drivers](RegistryDriverInfo item) {
+    if (!installing_slug.Get().empty()) {
+      return;
+    }
+    if (!context.http) {
+      install_error = "HTTP 客户端不可用";
+      return;
+    }
+    installing_slug = item.slug;
+    install_error = {};
+    install_status = "正在准备下载 " + item.slug + " ...";
+    dialog_tasks.Launch([context, item = std::move(item), driver, status, installing_slug,
+                         install_status, install_error, refresh_drivers]() -> Task<void> {
+      DriverInstallResult res = co_await InstallRegistryDriverAsync(
+          context.http, item,
+          [install_status](std::string msg) { install_status = std::move(msg); });
+      installing_slug = {};
+      if (!res.ok) {
+        install_error = res.message;
+        install_status = {};
+        co_return;
+      }
+      (void)refresh_drivers();
+      driver = TextEditingValue::FromText(res.slug);
+      status = res.message;
+      install_error = {};
+      install_status = res.message + "（已填入驱动名，切回「连接与驱动」即可使用）";
+      if (context.notify) {
+        context.notify(res.message);
+      }
+    });
+  };
+
+  const auto start_uninstall = [context, dialog_tasks, status, installing_slug,
+                                install_status, install_error,
+                                refresh_drivers](std::string slug) {
+    if (!installing_slug.Get().empty()) {
+      return;
+    }
+    installing_slug = slug;
+    install_error = {};
+    install_status = "正在卸载 " + slug + " ...";
+    dialog_tasks.Launch([context, slug = std::move(slug), status, installing_slug,
+                         install_status, install_error, refresh_drivers]() -> Task<void> {
+      DriverInstallResult res = co_await RunWorker(
+          [slug]() { return UninstallUserAdbcDriverBlocking(slug); });
+      installing_slug = {};
+      if (!res.ok) {
+        install_error = res.message;
+        install_status = {};
+        co_return;
+      }
+      (void)refresh_drivers();
+      status = res.message;
+      install_error = {};
+      install_status = res.message;
+      if (context.notify) {
+        context.notify(res.message);
+      }
+    });
+  };
 
   const auto save_profile = [context, profiles, selected, driver, uri, username, name, status,
                              error]() -> bool {
@@ -563,9 +706,12 @@ View TableEmptyState(const std::string& text) {
       Row{
           Caption("ADBC 驱动"),
           Spacer(),
-          ActionButton(Button("刷新").OnClick([drivers, status] {
-            drivers = DiscoverAdbcDrivers();
-            status = "发现 " + std::to_string(drivers.Get().size()) + " 个驱动";
+          ActionButton(Button("安装驱动…").OnClick([switch_tab]() mutable {
+            switch_tab(1);
+          })),
+          ActionButton(Button("刷新").OnClick([refresh_drivers, status] {
+            const std::size_t count = refresh_drivers();
+            status = "发现 " + std::to_string(count) + " 个驱动";
           })),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{6.0F}),
       driver_rows.Size() == 0
@@ -604,16 +750,7 @@ View TableEmptyState(const std::string& text) {
       MutedText(status.Get()),
   }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
 
-  View body = Column{
-      Row{
-          Text("ADBC 管理器", TextRole::Title),
-          Spacer(),
-          ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button("删除").OnClick(delete_profile))
-              .With(Enabled{selected.Get() >= 0}),
-          ActionButton(Button("保存").OnClick([save_profile] { (void)save_profile(); })),
-          ActionButton(Button("连接").OnClick(connect), true),
-      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
+  View manage_tab = Column{
       MutedText("保存的连接不含密码；自动发现标准 ADBC manifest 目录、ADBC_DRIVER_PATH、"
                 "DBPP_ADBC_DRIVERS 与系统库目录，支持短名、.toml 与动态库路径。"),
       Row{
@@ -621,8 +758,148 @@ View TableEmptyState(const std::string& text) {
           Divider(Axis::Vertical),
           std::move(form_panel),
       }.With(Grow(1.0F), Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
+
+  const auto& user_slugs = user_installed.Get();
+  const auto& catalog_list = catalog.Get();
+  const std::string filter_query = registry_filter.Get().text;
+  const std::string active_install = installing_slug.Get();
+  const bool busy = !active_install.empty();
+
+  Views registry_rows;
+  registry_rows.Reserve(catalog_list.size());
+  for (const RegistryDriverInfo& item : catalog_list) {
+    if (!filter_query.empty() &&
+        !ContainsIgnoreCaseAscii(item.slug, filter_query) &&
+        !ContainsIgnoreCaseAscii(item.name, filter_query) &&
+        !ContainsIgnoreCaseAscii(item.description, filter_query)) {
+      continue;
+    }
+
+    bool has_manifest = false;
+    std::string installed_version;
+    for (const AdbcDriverInfo& local : driver_list) {
+      if (local.is_manifest && local.path == item.slug) {
+        has_manifest = true;
+        installed_version = local.version;
+        break;
+      }
+    }
+    const bool user_is_installed =
+        std::ranges::find(user_slugs, item.slug) != user_slugs.end();
+    const bool same_version =
+        !installed_version.empty() &&
+        StripLeadingV(installed_version) == StripLeadingV(item.version);
+
+    std::string detail;
+    if (user_is_installed) {
+      detail = "已安装" +
+               (installed_version.empty() ? std::string{} : " " + installed_version) +
+               " · ";
+    } else if (has_manifest) {
+      detail = "已有外部配置" +
+               (installed_version.empty() ? std::string{} : " " + installed_version) +
+               " · ";
+    }
+    detail += "可用 " + item.version;
+    if (!item.license.empty()) {
+      detail += " · " + item.license;
+    }
+    if (!item.description.empty()) {
+      detail += " — " + item.description;
+    }
+
+    View trailing;
+    if (active_install == item.slug) {
+      trailing = MutedText("处理中…");
+    } else if (user_is_installed) {
+      trailing = Row{
+          ActionButton(Button("卸载").OnClick([start_uninstall, slug = item.slug]() mutable {
+            start_uninstall(slug);
+          })).With(Enabled{!busy}),
+          ActionButton(Button(same_version ? "重装" : "更新")
+                           .OnClick([start_install, item]() mutable {
+                             start_install(item);
+                           }))
+              .With(Enabled{!busy}),
+      }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center});
+    } else {
+      trailing = ActionButton(Button("安装").OnClick([start_install, item]() mutable {
+                                start_install(item);
+                              }),
+                              true)
+                     .With(Enabled{!busy});
+    }
+
+    registry_rows.Add(
+        NavItem(item.name + " (" + item.slug + ")", detail, false, {}, std::move(trailing))
+            .Key("registry-" + item.slug));
+  }
+
+  View install_list_content;
+  if (catalog_loading.Get() && catalog_list.empty()) {
+    install_list_content = Column{MutedText("正在获取在线驱动目录...")}.With(Grow(1.0F));
+  } else if (!catalog_error.Get().empty() && catalog_list.empty()) {
+    install_list_content = Column{ErrorText(catalog_error.Get())}.With(Grow(1.0F));
+  } else if (registry_rows.Size() == 0) {
+    install_list_content = Column{
+        MutedText(catalog_list.empty() ? "点击「刷新目录」加载可安装驱动"
+                                       : "没有匹配的驱动"),
+    }.With(Grow(1.0F));
+  } else {
+    install_list_content =
+        ScrollView(Column{std::move(registry_rows)}.With(Spacing{4.0F})).With(Grow(1.0F));
+  }
+
+  const std::string user_dir = UserAdbcDriversDir();
+  View install_tab = Column{
+      MutedText("目录源: " + AdbcRegistryBaseUrl() + " · 平台: " +
+                CurrentPlatformTuple() +
+                (user_dir.empty() ? std::string{} : " · 安装到: " + user_dir)),
+      TextField(registry_filter)
+          .Label("筛选驱动")
+          .Placeholder("postgresql / mysql / duckdb / clickhouse …")
+          .Variant(TextFieldVariant::Outlined)
+          .OnChanged([registry_filter](const TextEditingValue& value) {
+            registry_filter = value;
+          }),
+      std::move(install_list_content),
+      install_error.Get().empty() ? View{} : ErrorText(install_error.Get()),
+      install_status.Get().empty() ? View{} : MutedText(install_status.Get()),
+  }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
+
+  View header_actions;
+  if (tab.Get() == 0) {
+    header_actions = Row{
+        ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
+        ActionButton(Button("删除").OnClick(delete_profile))
+            .With(Enabled{selected.Get() >= 0}),
+        ActionButton(Button("保存").OnClick([save_profile] { (void)save_profile(); })),
+        ActionButton(Button("连接").OnClick(connect), true),
+    }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
+  } else {
+    header_actions = Row{
+        ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
+        ActionButton(Button("刷新目录").OnClick([load_catalog]() mutable {
+          load_catalog();
+        })).With(Enabled{!catalog_loading.Get()}),
+    }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
+  }
+
+  View body = Column{
+      Row{
+          Text("ADBC 管理器", TextRole::Title),
+          SegmentedButton({"连接与驱动", "安装驱动"}, tab.Get())
+              .OnChanged([switch_tab](std::size_t index) mutable {
+                switch_tab(index);
+              }),
+          Spacer(),
+          std::move(header_actions),
+      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{10.0F}),
+      IndexedPages({std::move(manage_tab), std::move(install_tab)}, tab.Get())
+          .With(Grow(1.0F)),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch},
-         Frame{.width = 820.0F, .height = 600.0F});
+         Frame{.width = 860.0F, .height = 620.0F});
 
   return DialogCard(std::move(body));
 }
@@ -1180,6 +1457,7 @@ View TableEmptyState(const std::string& text) {
   auto dialogs = UseDialog();
   auto tasks = UseTaskScope();
   auto picker = UseService<FilePicker>();
+  auto http = UseService<HttpClient>();
   auto application = UseApplication();
   const File profile_dir = application.Directories().data_directory;
   const std::string profiles_path = profile_dir.Child("connections.tsv").Path();
@@ -1318,7 +1596,7 @@ View TableEmptyState(const std::string& text) {
   };
 
   const auto open_manager = [dialogs, app, table, selected, filter_input, profiles, tasks,
-                             profiles_path, default_file, notify, dark] {
+                             http, profiles_path, default_file, notify, dark] {
     AdbcManagerContext context{
         .app = app,
         .table = table,
@@ -1326,6 +1604,7 @@ View TableEmptyState(const std::string& text) {
         .filter_input = filter_input,
         .profiles = profiles,
         .tasks = tasks,
+        .http = http,
         .profiles_path = profiles_path,
         .default_driver = DefaultSqliteDriverPath(),
         .default_uri = default_file.Path(),

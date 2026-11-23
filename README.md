@@ -8,7 +8,8 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 ## 功能
 
 - 打开/连接数据库：SQLite 文件、任意 ADBC driver（PostgreSQL / MySQL / DuckDB …）
-- ADBC 管理器：保存连接配置（不含密码）、发现本机驱动、从列表中选择驱动/连接并删除配置
+- ADBC 管理器：保存连接配置（不含密码）、发现本机驱动、在线安装/更新/卸载 ADBC 驱动、
+  从列表中选择驱动/连接并删除配置
 - 表与视图列表、虚拟化数据表格（Lib-DataTable）、分页、排序、`WHERE` 筛选
 - SQLite 使用 `rowid`，其它数据库使用主键约束做行标识；支持行内编辑、添加行、删除行
 - SQL 控制台：结果表格、影响行数、执行后自动刷新对象列表
@@ -47,7 +48,11 @@ cmake --build build --parallel
      （`/etc/adbc/drivers`）顺序扫描，点击即填入短名或 `.toml` 路径。
   2. 共享库（`libadbc_driver_*`）：扫描 `DBPP_ADBC_DRIVERS`、`ADBC_DRIVER_PATH`、
      构建目录以及系统库目录，点击填入绝对路径。
-- 头部按钮：关闭 / 删除 / 保存 / 连接。连接会先保存当前配置，再打开 ADBC 会话。
+- 头部按钮：关闭 / 删除 / 保存 / 连接；可切换至「安装驱动」页签或点击「安装驱动…」。
+- 内置「安装驱动」页签：直接浏览 ADBC Driver Registry（默认 `https://dbc-cdn.columnar.tech`，
+  可用 `DBPP_ADBC_REGISTRY_URL` 覆盖），支持按关键字筛选、`HttpClient` 流式下载进度、
+  SHA-256 校验、安全解压到用户驱动目录下的 `.packages/<slug>/<version>/`，并原子写入
+  标准 ADBC v1 `<slug>.toml` manifest 到用户配置目录，同时支持更新、重装与卸载。
 
 ## 托盘与轻量级模式
 
@@ -84,14 +89,15 @@ ADBC 驱动管理器启用标准搜索标志（`ADBC_LOAD_FLAG_DEFAULT`），可
 ## 目录
 
 ```
-src/adbc_session.*   ADBC 句柄、Arrow 流读取、对象/模式元数据
-src/db.cpp           表格分页、行编辑/删除/插入、SQL 异步封装
-src/app.cpp          HuxerUI 壳、侧栏、数据表、SQL 页、设置页、对话框
-src/theme.*          黑白主题与共享控件
-src/tray.*           托盘运行时：图标/菜单、关闭策略、轻量级模式
-src/settings.*       settings.tsv 读写与应用级 SettingsModel
-resources/           运行时资源包（应用内 logo、托盘图标）
-assets/              平台二进制图标（Linux icon.png、Windows icon.ico）
-third_party/         ADBC、Lib-DataTable 与 vendor 依赖
-platform/            平台入口与打包文件（desktop、app.rc、icns）
+src/adbc_session.*     ADBC 句柄、Arrow 流读取、对象/模式元数据、manifest 发现
+src/driver_installer.* ADBC Driver Registry 目录拉取、SHA-256 校验与安全安装/卸载
+src/db.cpp             表格分页、行编辑/删除/插入、SQL 异步封装
+src/app.cpp            HuxerUI 壳、侧栏、数据表、SQL 页、设置页、对话框
+src/theme.*            黑白主题与共享控件
+src/tray.*             托盘运行时：图标/菜单、关闭策略、轻量级模式
+src/settings.*         settings.tsv 读写与应用级 SettingsModel
+resources/             运行时资源包（应用内 logo、托盘图标）
+assets/                平台二进制图标（Linux icon.png、Windows icon.ico）
+third_party/           ADBC、Lib-DataTable 与 vendor 依赖
+platform/              平台入口与打包文件（desktop、app.rc、icns）
 ```

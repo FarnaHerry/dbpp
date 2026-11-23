@@ -12,7 +12,7 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 | 任何修改后的构建/验证 | 本文件「最低验证命令」与 run.sh |
 | 任何 UI 改动（壳、侧栏、对话框、表格、SQL 页） | src/app.cpp、src/theme.h（先用既有控件，不重复造） |
 | 数据库访问、分页、行编辑、SQL 执行 | src/model.h（跨文件声明的唯一头）、src/db.cpp、src/adbc_session.h |
-| ADBC 管理器、connections.tsv 格式 | src/db.cpp 的 Load/SaveConnectionProfiles 与 README「ADBC 管理器」 |
+| ADBC 管理器、connections.tsv 与在线安装 | src/db.cpp 的 Load/SaveConnectionProfiles、src/driver_installer.* 与 README「ADBC 管理器」 |
 | 托盘、关闭策略、轻量级模式、settings.tsv | src/tray.h 注释、src/tray.cpp、src/settings.cpp |
 | 主题/配色 | src/theme.*：只有单色黑白，禁止引入新色相 |
 | 图标与打包 | resources/（运行时资源包，app::images::*）、assets/（平台二进制图标）、platform/ 与 CMakeLists.txt |
