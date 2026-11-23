@@ -1341,12 +1341,12 @@ huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
   }
 
   const std::string base_url = AdbcRegistryBaseUrl();
-  const huxerui::HttpResult<huxerui::HttpResponse> response = co_await http->SendAsync(
-      huxerui::HttpRequest{
-          .url = base_url + "/index.yaml",
-          .headers = {{"Accept", "application/yaml"}},
-          .timeout = std::chrono::milliseconds{30000},
-      });
+  huxerui::HttpRequest request;
+  request.url = base_url + "/index.yaml";
+  request.headers.push_back(huxerui::HttpHeader{"Accept", "application/yaml"});
+  request.timeout = std::chrono::milliseconds{30000};
+  const huxerui::HttpResult<huxerui::HttpResponse> response =
+      co_await http->SendAsync(std::move(request));
   if (!response.Succeeded()) {
     result.error = "获取驱动目录失败: " + response.Error().message;
     co_return result;
@@ -1417,17 +1417,17 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
     on_progress("正在连接下载 " + driver.slug + " ...");
   }
 
-  auto stream_result = co_await http->SendStreamAsync(
-      huxerui::HttpRequest{
-          .url = driver.package_url,
-          .headers = {{"Accept", "application/octet-stream"}},
-          .timeout = std::chrono::milliseconds{300000},
-      },
-      [slug = driver.slug, on_progress](huxerui::HttpProgress progress) {
-        if (on_progress && progress.kind == huxerui::HttpProgressKind::Download) {
-          on_progress(FormatProgressText(slug, progress.transferred_bytes, progress.total_bytes));
-        }
-      });
+  huxerui::HttpRequest request;
+  request.url = driver.package_url;
+  request.headers.push_back(huxerui::HttpHeader{"Accept", "application/octet-stream"});
+  request.timeout = std::chrono::milliseconds{300000};
+  auto progress_cb = [slug = driver.slug, on_progress](huxerui::HttpProgress progress) {
+    if (on_progress && progress.kind == huxerui::HttpProgressKind::Download) {
+      on_progress(FormatProgressText(slug, progress.transferred_bytes, progress.total_bytes));
+    }
+  };
+  auto stream_result =
+      co_await http->SendStreamAsync(std::move(request), std::move(progress_cb));
   if (!stream_result.Succeeded()) {
     result.message = "下载失败: " + stream_result.Error().message;
     co_return result;

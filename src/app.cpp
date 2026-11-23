@@ -538,9 +538,9 @@ View TableEmptyState(const std::string& text) {
     install_status = "正在准备下载 " + item.slug + " ...";
     dialog_tasks.Launch([context, item = std::move(item), driver, status, installing_slug,
                          install_status, install_error, refresh_drivers]() -> Task<void> {
-      DriverInstallResult res = co_await InstallRegistryDriverAsync(
-          context.http, item,
-          [install_status](std::string msg) { install_status = std::move(msg); });
+      auto on_progress = [install_status](std::string msg) { install_status = std::move(msg); };
+      DriverInstallResult res =
+          co_await InstallRegistryDriverAsync(context.http, item, std::move(on_progress));
       installing_slug = {};
       if (!res.ok) {
         install_error = res.message;
@@ -569,8 +569,8 @@ View TableEmptyState(const std::string& text) {
     install_status = "正在卸载 " + slug + " ...";
     dialog_tasks.Launch([context, slug = std::move(slug), status, installing_slug,
                          install_status, install_error, refresh_drivers]() -> Task<void> {
-      DriverInstallResult res = co_await RunWorker(
-          [slug]() { return UninstallUserAdbcDriverBlocking(slug); });
+      auto uninstall_job = [slug]() { return UninstallUserAdbcDriverBlocking(slug); };
+      DriverInstallResult res = co_await RunWorker(std::move(uninstall_job));
       installing_slug = {};
       if (!res.ok) {
         install_error = res.message;
@@ -1550,11 +1550,10 @@ View TableEmptyState(const std::string& text) {
       return;
     }
     tasks.Launch([picker, app, table, selected, filter_input, tasks, notify]() -> Task<void> {
-      auto file_reference = co_await picker->OpenFileAsync(FilePickerFilter{
-          .name = "SQLite 数据库",
-          .extensions = {"sqlite", "sqlite3", "db", "db3", "s3db"},
-          .content_types = {},
-      });
+      FilePickerFilter filter;
+      filter.name = "SQLite 数据库";
+      filter.extensions = {"sqlite", "sqlite3", "db", "db3", "s3db"};
+      auto file_reference = co_await picker->OpenFileAsync(std::move(filter));
       if (!file_reference) {
         co_return;
       }
