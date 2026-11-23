@@ -70,6 +70,7 @@ set(ADBC_WITH_VENDORED_FMT ON CACHE BOOL "" FORCE)
 set(ADBC_WITH_VENDORED_NANOARROW ON CACHE BOOL "" FORCE)
 set(ADBC_DEFINE_COMMON_ENTRYPOINTS ON CACHE BOOL "" FORCE)
 set(ADBC_USE_CCACHE OFF CACHE BOOL "" FORCE)
+set(ADBC_INSTALL_NAME_RPATH ON CACHE BOOL "" FORCE)
 add_subdirectory("${DBPP_ADBC_DIR}/c" "${CMAKE_BINARY_DIR}/adbc" EXCLUDE_FROM_ALL)
 
 # ADBC 25 generates driver/sqlite/config.h under ${CMAKE_BINARY_DIR}/adbc but
@@ -79,6 +80,19 @@ foreach (_adbc_sqlite_target IN ITEMS adbc_driver_sqlite_objlib adbc_driver_sqli
         target_include_directories("${_adbc_sqlite_target}" PRIVATE "${CMAKE_BINARY_DIR}/adbc")
     endif ()
 endforeach ()
+
+if (APPLE)
+    foreach (_adbc_macos_lib IN ITEMS adbc_driver_manager_shared adbc_driver_sqlite_shared)
+        if (TARGET "${_adbc_macos_lib}")
+            set_target_properties("${_adbc_macos_lib}" PROPERTIES
+                    MACOSX_RPATH ON
+                    INSTALL_NAME_DIR "@rpath"
+                    VERSION ""
+                    SOVERSION ""
+            )
+        endif ()
+    endforeach ()
+endif ()
 
 file(GLOB_RECURSE DBPP_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"

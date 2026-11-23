@@ -42,8 +42,8 @@ jobs:
     container:
       image: ubuntu:24.04
     env:
-      CC: gcc-14
-      CXX: g++-14
+      CC: clang-18
+      CXX: clang++-18
     strategy:
       fail-fast: false
       matrix:
@@ -57,11 +57,11 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates curl gcc-14 g++-14 ninja-build pkg-config file binutils gzip \
+            git ca-certificates curl clang-18 g++ ninja-build pkg-config file binutils gzip \
             python3 python3-pip libgtk-4-dev libepoxy-dev libsoup-3.0-dev dpkg-dev rpm
           python3 -m pip install --break-system-packages -q cmake==4.4.2
           cmake --version | head -1
-          g++-14 --version | head -1
+          clang++-18 --version | head -1
 
       - name: Install safe patchelf for runtime deployment
         shell: bash
