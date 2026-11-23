@@ -41,6 +41,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:24.04
+    env:
+      CC: gcc-14
+      CXX: g++-14
     strategy:
       fail-fast: false
       matrix:
@@ -54,10 +57,11 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates curl g++ ninja-build pkg-config file binutils gzip \
+            git ca-certificates curl gcc-14 g++-14 ninja-build pkg-config file binutils gzip \
             python3 python3-pip libgtk-4-dev libepoxy-dev libsoup-3.0-dev dpkg-dev rpm
           python3 -m pip install --break-system-packages -q cmake==4.4.2
           cmake --version | head -1
+          g++-14 --version | head -1
 
       - name: Install safe patchelf for runtime deployment
         shell: bash
@@ -367,6 +371,20 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Select Xcode toolchain
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode_26.2.app/Contents/Developer ]; then
+            dev_dir="/Applications/Xcode_26.2.app/Contents/Developer"
+          else
+            latest_xcode="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n 1)"
+            test -n "$latest_xcode"
+            dev_dir="${latest_xcode}/Contents/Developer"
+          fi
+          echo "DEVELOPER_DIR=$dev_dir" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$dev_dir" xcodebuild -version
+          DEVELOPER_DIR="$dev_dir" xcrun clang++ --version
+
       - name: Fetch HuxerUI source (pinned)
         run: |
           set -euo pipefail
@@ -402,8 +420,8 @@ jobs:
           test -x dist-src/dbpp.app/Contents/MacOS/dbpp
           test -f dist-src/dbpp.app/Contents/Resources/HuxerUI/huxerui/resources.bin
           test -f dist-src/dbpp.app/Contents/Frameworks/libhuxerui.dylib
-          compgen -G 'dist-src/dbpp.app/Contents/Frameworks/libadbc_driver_manager*.dylib' >/dev/null
-          compgen -G 'dist-src/dbpp.app/Contents/Frameworks/libadbc_driver_sqlite*.dylib' >/dev/null
+          ls dist-src/dbpp.app/Contents/Frameworks/libadbc_driver_manager*.dylib >/dev/null
+          ls dist-src/dbpp.app/Contents/Frameworks/libadbc_driver_sqlite*.dylib >/dev/null
           codesign --verify --deep --strict dist-src/dbpp.app
           ls -la dist-src/dbpp.app/Contents dist-src/dbpp.app/Contents/Frameworks
 
@@ -412,7 +430,7 @@ jobs:
         with:
           name: build-macos-arm64
           path: dist-src
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
   # ---------------------------------------------------------------- Release

@@ -348,7 +348,29 @@ void TestDriverInstallDiscoverLoadUninstall(const fs::path& dir, const std::stri
       dbpp::InstallDriverArchiveBlocking(bad_hash_driver, valid_tgz, drivers_dir);
   Expect(!bad_hash_res.ok, "Mismatched SHA-256 archive must be rejected");
 
-  // 3) Install with matching SHA-256 -> discover -> open by slug & manifest path -> uninstall.
+  // 3) Install an unloaded slug and verify full uninstall removes both manifest and .packages.
+  dbpp::RegistryDriverInfo uninstall_driver;
+  uninstall_driver.slug = "sqlite_uninstall_test";
+  uninstall_driver.name = "SQLite Uninstall Test";
+  uninstall_driver.version = "0.1.0";
+  uninstall_driver.sha256 = valid_sha;
+  const dbpp::DriverInstallResult uninstall_prep =
+      dbpp::InstallDriverArchiveBlocking(uninstall_driver, valid_tgz, drivers_dir);
+  Expect(uninstall_prep.ok, "Uninstall fixture install failed: " + uninstall_prep.message);
+  Expect(dbpp::IsUserInstalledAdbcDriver("sqlite_uninstall_test", drivers_dir),
+         "sqlite_uninstall_test should be installed before uninstall");
+  Expect(fs::exists(drivers_dir / ".packages" / "sqlite_uninstall_test"),
+         ".packages/sqlite_uninstall_test should exist before uninstall");
+
+  const dbpp::DriverInstallResult full_uninstall =
+      dbpp::UninstallUserAdbcDriverBlocking("sqlite_uninstall_test", drivers_dir);
+  Expect(full_uninstall.ok, "Unloaded uninstall failed: " + full_uninstall.message);
+  Expect(!dbpp::IsUserInstalledAdbcDriver("sqlite_uninstall_test", drivers_dir),
+         "sqlite_uninstall_test manifest should be gone after uninstall");
+  Expect(!fs::exists(drivers_dir / ".packages" / "sqlite_uninstall_test"),
+         ".packages/sqlite_uninstall_test should be gone after uninstall");
+
+  // 4) Install with matching SHA-256 -> discover -> open by slug & manifest path -> uninstall.
   dbpp::RegistryDriverInfo valid_driver;
   valid_driver.slug = "sqlite_test";
   valid_driver.name = "SQLite Test";

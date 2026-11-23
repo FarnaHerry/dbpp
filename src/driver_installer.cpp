@@ -1311,6 +1311,15 @@ DriverInstallResult UninstallUserAdbcDriverBlocking(
   if (std::filesystem::exists(pkg_dir, pkg_ec)) {
     std::filesystem::remove_all(pkg_dir, pkg_ec);
     if (pkg_ec) {
+#if defined(_WIN32)
+      if (had_manifest) {
+        result.ok = true;
+        result.manifest_path = manifest.string();
+        result.message = "已卸载 " + std::string(slug) +
+                         "（驱动库当前被进程占用，重启后可清理残留文件）";
+        return result;
+      }
+#endif
       result.message = "删除驱动文件失败: " + pkg_ec.message();
       return result;
     }
@@ -1356,10 +1365,11 @@ huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
   }
 
   const std::string platform = CurrentPlatformTuple();
-  result.drivers = co_await huxerui::RunWorker(
-      [yaml_text = std::move(yaml_text), base_url, platform]() {
-        return ParseRegistryIndexYaml(yaml_text, base_url, platform);
-      });
+  auto parse_job = [yaml_text = std::move(yaml_text), base_url, platform]() {
+    return ParseRegistryIndexYaml(yaml_text, base_url, platform);
+  };
+  auto parsed = co_await huxerui::RunWorker(std::move(parse_job));
+  result.drivers = std::move(parsed);
   if (result.drivers.empty()) {
     result.error = "当前平台 (" + platform + ") 暂无可用的在线驱动";
   }
@@ -1453,10 +1463,11 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
     on_progress("正在校验并解压安装 " + driver.slug + " ...");
   }
 
-  result = co_await huxerui::RunWorker([driver = std::move(driver), tmp_archive]() {
+  auto install_job = [driver = std::move(driver), tmp_archive]() {
     return InstallDriverArchiveBlocking(driver, tmp_archive);
-  });
-  co_return result;
+  };
+  auto installed = co_await huxerui::RunWorker(std::move(install_job));
+  co_return installed;
 }
 
 } // namespace dbpp
