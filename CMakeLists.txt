@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.30)
 
-project(dbpp VERSION 0.1.0 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.2.0 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # HuxerUI 源码目录：优先使用 CI/本地检出的 third_party/huxerui，回落到同级 ../HuxerUI-fork。
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/huxerui/CMakeLists.txt")

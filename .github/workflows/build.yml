@@ -31,7 +31,7 @@ concurrency:
 
 env:
   HUXERUI_REPO: 'https://github.com/FarnaHerry/HuxerUI.git'
-  HUXERUI_COMMIT: 'c154e52c7ba322c0ebd97b0e45539a55d565df9c'
+  HUXERUI_COMMIT: 'b581978c9412baf49dedaded38b7e0d55757d579'
 
 jobs:
   # ------------------------------------------------------------------ Linux
