@@ -501,13 +501,23 @@ void TestDatabasePresetsAndUriComposer(const fs::path& dir) {
   const auto* mysql = find_preset("mysql");
   const auto* mariadb = find_preset("mariadb");
   const auto* duckdb = find_preset("duckdb");
+  const auto* redis = find_preset("redis");
   const auto* mssql = find_preset("mssql");
   const auto* clickhouse = find_preset("clickhouse");
   const auto* flightsql = find_preset("flightsql");
   const auto* custom = find_preset("custom");
-  Expect(sqlite && sqlite->builtin && pg && mysql && mariadb && duckdb && mssql && clickhouse &&
-             flightsql && custom,
+  Expect(sqlite && sqlite->builtin && pg && mysql && mariadb && duckdb && redis &&
+             redis->builtin && mssql && clickhouse && flightsql && custom,
          "Expected core supported presets in SupportedDatabasePresets");
+
+  if (redis != nullptr) {
+    Expect(dbpp::ComposePresetUri(*redis, "127.0.0.1", "6379", "2") ==
+               "redis://127.0.0.1:6379/2",
+           "ComposePresetUri Redis mismatch");
+    const auto matched_redis = dbpp::FindInstalledDriverForPreset(*redis, {});
+    Expect(matched_redis.has_value() && matched_redis->path == "redis",
+           "Builtin Redis preset must always resolve built-in redis driver");
+  }
 
   if (pg != nullptr) {
     Expect(dbpp::ComposePresetUri(*pg, "::1", "5432", "app db") ==

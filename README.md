@@ -8,7 +8,8 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 ## 功能
 
 - 顶部工具栏与统一连接树：左上角提供「新建连接 / 新建查询 / 驱动管理」快捷按钮，左侧栏以单一可滚动树统一展示已连接会话与已保存连接（点击原地连接并展开/收起其下「表 / 视图 / 物化视图 / 外部表」等对象分组、不改变连接排列顺序，支持拖拽连接行调整顺序并持久化到 `connections.tsv`，以及右键菜单刷新、新建查询、查看结构、复制名称/URI/SELECT、删除对象和断开/删除配置）
-- 打开/连接数据库：两步式「新建连接」向导先选择数据库类型（SQLite / PostgreSQL / MySQL / MariaDB / DuckDB / SQL Server / ClickHouse / Arrow Flight SQL / Snowflake / BigQuery / Trino / Databricks / Amazon Redshift / 自定义 ADBC 驱动），显示驱动就绪状态与一键安装，并按类型展示文件选择或主机/端口/库名表单（可切换原始 URI）
+- 打开/连接数据库：两步式「新建连接」向导先选择数据库类型（SQLite / PostgreSQL / MySQL / MariaDB / DuckDB / Redis / SQL Server / ClickHouse / Arrow Flight SQL / Snowflake / BigQuery / Trino / Databricks / Amazon Redshift / 自定义 ADBC 驱动），显示驱动就绪状态与一键安装，并按类型展示文件选择或主机/端口/库名表单（可切换原始 URI）
+- Redis 内置支持：零外部依赖 RESP2/RESP3 TCP 客户端，左侧按 `db0`..`db15` 展示逻辑库与键计数，右侧虚拟表格支持 `MATCH` 模式筛选、分页/排序、内联编辑（String 保留 TTL、Hash/List/Set/ZSet JSON 编辑、TTL `EXPIRE`/`PERSIST`、`RENAMENX` 改名、批量新建与删除键），并内置 Redis 命令控制台
 - ADBC 管理器：保存连接配置（不含密码）、发现本机驱动、在线安装/更新/卸载 ADBC 驱动、
   从列表中选择驱动/连接并删除配置
 - 单行紧凑表与视图列表、右侧多标签页工作区（同屏打开并独立保留多个表、视图与 SQL 查询页状态）
@@ -21,8 +22,7 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 - 无头 CLI：`dbpp <command> ...`，无需 GUI/显示服务即可直接查表、执行 SQL、管理 `connections.tsv` 与在线安装/卸载 ADBC 驱动，支持 `--json` 结构化输出供 AI Agent 调用
 - 轻量级模式：关闭窗口时销毁整个界面（断开全部 ADBC 会话），从托盘唤出时重建，
   空闲内存占用更低；设置页可开关，持久化在 `settings.tsv`
-- 单色黑白主题与应用图标（标题栏 logo / 托盘图标 / Windows .ico / macOS .icns /
-  Linux hicolor 图标 + desktop 文件）
+- 多预设主题与图标：默认采用「Gemini 星光」分层配色（蓝-紫-珊瑚星光渐变与四色语义高亮），支持切换翡翠青 / 暖沙琥珀 / 暮光紫 / 极简黑白及跟随系统/深/浅模式并持久化至 `settings.tsv`；附带应用图标（Windows .ico / macOS .icns / Linux hicolor + desktop 文件）与托盘图标
 - 启动参数：无参或 `dbpp /path/to/file.sqlite`（以及 `dbpp gui` / `dbpp open`）启动 GUI；`dbpp <command>` 走无头 CLI；也可用 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
 
 ## 构建与测试
@@ -126,6 +126,11 @@ SQL
 
 # 复用已保存的 PostgreSQL 配置（通过环境变量传密码，不暴露到进程命令行或磁盘）
 PGPASS=secret dbpp tables -p pg --password-env PGPASS --json
+
+# Redis 无头操作（--redis，支持 db0..db15、MATCH 筛选、命令执行与 --read-only）
+dbpp tables --redis redis://127.0.0.1:6379/0 --json
+dbpp rows   --redis redis://127.0.0.1:6379/0 db0 --where "user:*" --json
+dbpp query  --redis redis://127.0.0.1:6379/0 "INFO server" --read-only --json
 ```
 
 完整说明可执行 `dbpp --help` 或 `dbpp <command> --help`。
@@ -135,6 +140,7 @@ PGPASS=secret dbpp tables -p pg --password-env PGPASS --json
 ```
 src/cli.*              无头 CLI 解析、JSON/TSV/CSV/表格输出、Agent 子命令分发
 src/adbc_session.*     ADBC 句柄、Arrow 流读取、对象/模式元数据、manifest 发现
+src/redis_client.*     内置零依赖 Redis RESP2/RESP3 客户端、键浏览器与命令控制台适配
 src/driver_installer.* ADBC Driver Registry 目录拉取、SHA-256 校验与安全安装/卸载
 src/db.cpp             表格分页、行编辑/删除/插入、SQL 异步封装
 src/app.cpp            HuxerUI 壳、侧栏、数据表、SQL 页、设置页、对话框

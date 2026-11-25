@@ -1,6 +1,7 @@
 #include "model.h"
 
 #include "adbc_session.h"
+#include "redis_client.h"
 
 #include <huxerui/huxerui.h>
 
@@ -122,19 +123,6 @@ bool EqualsIgnoreCaseAscii(std::string_view left, std::string_view right) {
   return true;
 }
 
-std::string DisplayNameFromUri(std::string_view uri, std::string_view fallback) {
-  if (uri.empty()) {
-    return std::string(fallback);
-  }
-  const auto slash = uri.find_last_of("/\\");
-  std::string name = slash == std::string_view::npos ? std::string(uri)
-                                                     : std::string(uri.substr(slash + 1));
-  if (name.empty()) {
-    return std::string(fallback);
-  }
-  return name;
-}
-
 std::string BuildWhere(const Dialect dialect, const TableModel& model, const GridRow& row) {
   if (model.uses_rowid && row.rowid.has_value()) {
     return "rowid = " + std::to_string(*row.rowid);
@@ -161,9 +149,15 @@ std::string BuildWhere(const Dialect dialect, const TableModel& model, const Gri
   return where;
 }
 
+} // namespace
+
 TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
                              DbObject object, std::int64_t page, std::int64_t page_size,
                              std::optional<DataTableSort> sort, std::string filter) {
+  if (session.dialect == Dialect::Redis && session.redis) {
+    return LoadRedisTableBlocking(*session.redis, session_id, object, page, page_size,
+                                  std::move(sort), std::move(filter));
+  }
   TableModel model;
   model.session_id = session_id;
   model.object = object.name;
@@ -309,9 +303,14 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   return model;
 }
 
+namespace {
+
 AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model,
                                    std::size_t row_index, std::size_t column_index,
                                    const std::string& text) {
+  if (session.dialect == Dialect::Redis && session.redis) {
+    return UpdateRedisCellBlocking(*session.redis, model, row_index, column_index, text);
+  }
   AdbcQueryResult result;
   if (!model.snapshot || row_index >= model.snapshot->rows.size() ||
       column_index >= model.columns.size()) {
@@ -339,6 +338,9 @@ AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model
 
 AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
                                   std::size_t row_index) {
+  if (session.dialect == Dialect::Redis && session.redis) {
+    return DeleteRedisKeyBlocking(*session.redis, model, row_index);
+  }
   AdbcQueryResult result;
   if (!model.snapshot || row_index >= model.snapshot->rows.size()) {
     result.error = "目标行已失效";
@@ -447,9 +449,20 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
     session->id = model.next_session_id++;
     target_session_id = session->id;
     if (!session->objects.empty()) {
-      first_object = session->objects.front().name;
-      first_schema = session->objects.front().db_schema;
-      first_is_view = session->objects.front().is_view;
+      std::size_t first_idx = 0;
+      if (session->dialect == Dialect::Redis && session->session && session->session->redis) {
+        const std::string target_db =
+            "db" + std::to_string(session->session->redis->CurrentDb());
+        for (std::size_t idx = 0; idx < session->objects.size(); ++idx) {
+          if (session->objects[idx].name == target_db) {
+            first_idx = idx;
+            break;
+          }
+        }
+      }
+      first_object = session->objects[first_idx].name;
+      first_schema = session->objects[first_idx].db_schema;
+      first_is_view = session->objects[first_idx].is_view;
     }
     model.sessions.push_back(*session);
     model.active_session = target_session_id;
@@ -538,6 +551,9 @@ Task<AdbcQueryResult> DeleteRowAsync(std::shared_ptr<AdbcSession> session, Table
 
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows) {
+  if (session.dialect == Dialect::Redis && session.redis) {
+    return InsertRedisRowsBlocking(*session.redis, model, rows);
+  }
   if (rows.empty()) {
     return {};
   }
@@ -981,11 +997,13 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
     tab.session_id = session_id;
     tab.session_name = session->name;
     tab.session_uri = session->uri;
+    const bool is_redis = session->dialect == Dialect::Redis;
     tab.title = custom_title.empty()
-                    ? ("查询 " + std::to_string(ws.next_sql_index++))
+                    ? ((is_redis ? "Redis " : "查询 ") + std::to_string(ws.next_sql_index++))
                     : std::move(custom_title);
     tab.sql.editor = TextEditingValue::FromText(
-        initial_sql.empty() ? std::string{"SELECT 1;"} : std::move(initial_sql));
+        initial_sql.empty() ? std::string{is_redis ? "PING" : "SELECT 1;"}
+                            : std::move(initial_sql));
     ws.tabs.push_back(std::move(tab));
     ws.active_tab_id = created_id;
   });
@@ -1084,7 +1102,7 @@ void CloseSession(const State<AppModel>& app, const State<WorkspaceModel>& works
       model.active_session = 0;
       model.active_object.clear();
       model.active_is_view = false;
-      model.status = "没有打开的数据库";
+      model.status.clear();
     } else if (model.active_session == session_id) {
       model.active_session = model.sessions.front().id;
       model.active_object.clear();

@@ -159,6 +159,9 @@ target_link_libraries(dbpp PRIVATE
         adbc_driver_manager_shared
         nanoarrow
 )
+if (WIN32)
+    target_link_libraries(dbpp PRIVATE ws2_32)
+endif ()
 target_compile_definitions(dbpp PRIVATE
         DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
         DBPP_VERSION="${PROJECT_VERSION}"
@@ -266,6 +269,7 @@ if (DBPP_BUILD_TESTS)
     add_executable(test_adbc_core
             tests/test_adbc_core.cpp
             src/adbc_session.cpp
+            src/redis_client.cpp
             src/driver_installer.cpp
     )
     target_compile_features(test_adbc_core PRIVATE cxx_std_20)
@@ -282,6 +286,9 @@ if (DBPP_BUILD_TESTS)
             adbc_driver_manager_shared
             nanoarrow
     )
+    if (WIN32)
+        target_link_libraries(test_adbc_core PRIVATE ws2_32)
+    endif ()
     target_compile_definitions(test_adbc_core PRIVATE
             DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
     )
@@ -314,7 +321,10 @@ if (DBPP_BUILD_TESTS)
             src/cli.cpp
             src/db.cpp
             src/adbc_session.cpp
+            src/redis_client.cpp
             src/driver_installer.cpp
+            src/settings.cpp
+            src/theme_palette.cpp
     )
     target_compile_features(test_cli PRIVATE cxx_std_20)
     target_include_directories(test_cli PRIVATE
@@ -330,6 +340,9 @@ if (DBPP_BUILD_TESTS)
             adbc_driver_manager_shared
             nanoarrow
     )
+    if (WIN32)
+        target_link_libraries(test_cli PRIVATE ws2_32)
+    endif ()
     target_compile_definitions(test_cli PRIVATE
             DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
             DBPP_VERSION="${PROJECT_VERSION}"
@@ -362,6 +375,7 @@ if (DBPP_BUILD_TESTS)
             tests/test_instance.cpp
             src/instance.cpp
             src/adbc_session.cpp
+            src/redis_client.cpp
     )
     target_compile_features(test_instance PRIVATE cxx_std_20)
     target_include_directories(test_instance PRIVATE
@@ -377,6 +391,9 @@ if (DBPP_BUILD_TESTS)
             adbc_driver_manager_shared
             nanoarrow
     )
+    if (WIN32)
+        target_link_libraries(test_instance PRIVATE ws2_32)
+    endif ()
     target_compile_definitions(test_instance PRIVATE
             DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
     )
@@ -403,6 +420,59 @@ if (DBPP_BUILD_TESTS)
         )
     endif ()
     add_test(NAME instance COMMAND test_instance)
+
+    add_executable(test_redis
+            tests/test_redis.cpp
+            src/redis_client.cpp
+            src/adbc_session.cpp
+            src/db.cpp
+            src/cli.cpp
+            src/driver_installer.cpp
+            src/settings.cpp
+            src/theme_palette.cpp
+    )
+    target_compile_features(test_redis PRIVATE cxx_std_20)
+    target_include_directories(test_redis PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${DBPP_ADBC_DIR}/c/include"
+    )
+    target_include_directories(test_redis SYSTEM PRIVATE
+            "${DBPP_ADBC_DIR}/c/vendor"
+    )
+    target_link_libraries(test_redis PRIVATE
+            HuxerUI::huxerui
+            HuxerUI::DataTable
+            adbc_driver_manager_shared
+            nanoarrow
+    )
+    target_compile_definitions(test_redis PRIVATE
+            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+            DBPP_VERSION="${PROJECT_VERSION}"
+    )
+    add_dependencies(test_redis adbc_driver_sqlite_shared)
+    if (MSVC)
+        target_compile_options(test_redis PRIVATE /utf-8)
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_redis PRIVATE -Wall -Wextra -Wpedantic)
+    endif ()
+    if (WIN32)
+        target_link_libraries(test_redis PRIVATE ws2_32)
+        target_compile_definitions(test_redis PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+        add_custom_command(TARGET test_redis POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:HuxerUI::huxerui>"
+                        "$<TARGET_FILE_DIR:test_redis>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_manager_shared>"
+                        "$<TARGET_FILE_DIR:test_redis>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                        "$<TARGET_FILE_DIR:test_redis>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
+                COMMENT "Copying runtime DLLs next to test_redis.exe"
+                VERBATIM
+        )
+    endif ()
+    add_test(NAME redis COMMAND test_redis)
 endif ()
 
 add_custom_target(dbpp-run

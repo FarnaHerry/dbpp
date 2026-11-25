@@ -3,6 +3,7 @@
 #include "adbc_session.h"
 #include "driver_installer.h"
 #include "model.h"
+#include "redis_client.h"
 
 #include <algorithm>
 #include <cctype>
@@ -60,12 +61,14 @@ struct ConnOptions {
   std::string profile_name;
   std::string profiles_path;
   std::string sqlite_path;
+  std::string redis_uri;
   std::string driver;
   std::string uri;
   std::string user;
   std::string password;
   std::string password_env;
   bool has_sqlite = false;
+  bool has_redis = false;
   bool has_user = false;
   bool has_password = false;
   bool has_password_env = false;
@@ -247,6 +250,7 @@ std::string_view DialectName(Dialect dialect) {
     case Dialect::Postgresql: return "postgresql";
     case Dialect::Mysql: return "mysql";
     case Dialect::Duckdb: return "duckdb";
+    case Dialect::Redis: return "redis";
     case Dialect::Generic: return "generic";
   }
   return "generic";
@@ -374,6 +378,9 @@ bool TryConsumeConnFlag(const std::vector<std::string>& args, std::size_t& index
   } else if (flag == "--sqlite") {
     conn.has_sqlite = true;
     target = &conn.sqlite_path;
+  } else if (flag == "--redis") {
+    conn.has_redis = true;
+    target = &conn.redis_uri;
   } else if (flag == "--driver" || flag == "-d") {
     target = &conn.driver;
   } else if (flag == "--uri" || flag == "-u") {
@@ -403,22 +410,12 @@ std::string DefaultProfilesPath() {
   return (std::filesystem::path(data_dir) / "connections.tsv").string();
 }
 
-std::string InferDriverForUri(std::string_view uri) {
-  const std::string lower = LowerAscii(uri);
-  if (lower.starts_with("postgresql://") || lower.starts_with("postgres://")) {
-    return "postgresql";
-  }
-  if (lower.starts_with("mysql://") || lower.starts_with("mariadb://")) {
-    return "mysql";
-  }
-  if (lower.starts_with("duckdb:") || lower.ends_with(".duckdb")) {
-    return "duckdb";
-  }
-  return DefaultSqliteDriverPath();
-}
-
 int ResolveConnectionRequest(const ConnOptions& conn, ConnectionRequest& request_out,
                              std::string& error_out) {
+  if (conn.has_sqlite && conn.has_redis) {
+    error_out = "--sqlite 与 --redis 不能同时使用";
+    return kCliExitUsage;
+  }
   if (conn.has_sqlite) {
     if (!conn.profile_name.empty()) {
       error_out = "--sqlite 与 --profile 不能同时使用";
@@ -434,6 +431,21 @@ int ResolveConnectionRequest(const ConnOptions& conn, ConnectionRequest& request
     }
     request_out.driver_path = DefaultSqliteDriverPath();
     request_out.uri = conn.sqlite_path;
+  } else if (conn.has_redis) {
+    if (!conn.profile_name.empty()) {
+      error_out = "--redis 与 --profile 不能同时使用";
+      return kCliExitUsage;
+    }
+    if (!conn.uri.empty() || !conn.driver.empty()) {
+      error_out = "--redis 不能与 --driver 或 --uri 同时使用";
+      return kCliExitUsage;
+    }
+    if (conn.redis_uri.empty()) {
+      error_out = "--redis URI 不能为空";
+      return kCliExitUsage;
+    }
+    request_out.driver_path = "redis";
+    request_out.uri = conn.redis_uri;
   } else if (!conn.profile_name.empty()) {
     const std::string path =
         conn.profiles_path.empty() ? DefaultProfilesPath() : conn.profiles_path;
@@ -451,7 +463,8 @@ int ResolveConnectionRequest(const ConnOptions& conn, ConnectionRequest& request
     request_out.username = conn.has_user ? conn.user : it->username;
   } else {
     if (conn.uri.empty()) {
-      error_out = "缺少连接目标: 请指定 --profile <name>、--sqlite <path> 或 --uri <uri>";
+      error_out =
+          "缺少连接目标: 请指定 --profile <name>、--sqlite <path>、--redis <uri> 或 --uri <uri>";
       return kCliExitUsage;
     }
     request_out.uri = conn.uri;
@@ -935,6 +948,7 @@ void PrintTopLevelHelp(std::ostream& out) {
       << "Connection options (<conn>):\n"
       << "  --profile, -p <name>         Use saved profile from connections.tsv\n"
       << "  --sqlite <path>              Open local SQLite file (or :memory:)\n"
+      << "  --redis <uri>                Connect to Redis (redis://[user:pass@]host[:port][/db])\n"
       << "  --uri, -u <uri>              Connection URI (or libpq conninfo)\n"
       << "  --driver, -d <slug|path>     ADBC driver slug, .toml path, or shared lib path\n"
       << "  --user <name>                Override username\n"
@@ -950,7 +964,9 @@ void PrintTopLevelHelp(std::ostream& out) {
       << "Examples:\n"
       << "  dbpp doctor --json\n"
       << "  dbpp tables --sqlite ./app.sqlite --json\n"
-      << "  dbpp query --sqlite ./app.sqlite \"SELECT * FROM items LIMIT 10\" --json\n"
+      << "  dbpp rows   --redis redis://127.0.0.1:6379/0 db0 --where \"user:*\" --json\n"
+      << "  dbpp query  --redis redis://127.0.0.1:6379/0 \"INFO server\" --json\n"
+      << "  dbpp query  --sqlite ./app.sqlite \"SELECT * FROM items LIMIT 10\" --json\n"
       << "  dbpp profile save pg --driver postgresql --uri postgresql://127.0.0.1:5432/app --user dev\n"
       << "  PGPASS=secret dbpp tables -p pg --password-env PGPASS --json\n";
 }
@@ -2174,27 +2190,14 @@ int HandleRows(const std::vector<std::string>& args, std::ostream& out, std::ost
   }
 
   const Dialect dialect = opened.session->dialect;
-  const std::string qname = QualifiedName(dialect, *matched);
+  const std::string qname =
+      dialect == Dialect::Redis ? matched->name : QualifiedName(dialect, *matched);
   const std::vector<ColumnMeta> cols = ResolveColumnsForObject(*opened.session, *matched, error);
   if (!error.empty() && cols.empty()) {
     return EmitError(err, json_mode, error, kCliExitError);
   }
 
-  std::string where_clause;
-  if (!TrimAscii(where_expr).empty()) {
-    where_clause = " WHERE (" + std::string(TrimAscii(where_expr)) + ")";
-  }
-
-  const AdbcQueryResult count_res =
-      ExecuteBlocking(*opened.session, "SELECT COUNT(*) FROM " + qname + where_clause, true, 1);
-  if (!count_res.error.empty() || count_res.rows.empty() ||
-      count_res.rows.front().values.empty()) {
-    return EmitError(err, json_mode,
-                     count_res.error.empty() ? "COUNT 查询未返回结果" : count_res.error,
-                     kCliExitError);
-  }
-  const std::int64_t total = ParseStrictInt64(count_res.rows.front().values.front().text).value_or(0);
-
+  std::optional<huxerui::DataTableSort> redis_sort;
   std::string order_clause;
   if (!order_spec.empty()) {
     std::string_view col_part = order_spec;
@@ -2229,7 +2232,69 @@ int HandleRows(const std::vector<std::string>& args, std::ostream& out, std::ost
       return EmitError(err, json_mode, "未知排序列: " + std::string(col_part), kCliExitUsage);
     }
     order_clause = " ORDER BY " + QuoteIdentifier(dialect, matched_col->name) + " " + dir;
+    redis_sort = huxerui::DataTableSort{
+        .column_id = matched_col->name,
+        .direction = dir == "DESC" ? huxerui::DataTableSortDirection::Descending
+                                   : huxerui::DataTableSortDirection::Ascending,
+    };
   }
+
+  if (dialect == Dialect::Redis && opened.session->redis) {
+    const RedisPageResult page_res = LoadRedisKeysPageBlocking(
+        *opened.session->redis, *matched, offset, limit, redis_sort,
+        std::string(TrimAscii(where_expr)));
+    if (!page_res.error.empty()) {
+      return EmitError(err, json_mode, page_res.error, kCliExitError);
+    }
+    std::vector<std::string> col_names;
+    col_names.reserve(page_res.columns.size());
+    for (const ColumnMeta& c : page_res.columns) {
+      col_names.push_back(c.name);
+    }
+    const std::int64_t total = page_res.total;
+    const std::int64_t returned = static_cast<std::int64_t>(page_res.rows.size());
+    const bool truncated = (offset + returned < total);
+
+    if (json_mode) {
+      JsonWriter w;
+      w.BeginObject();
+      bool first = true;
+      w.KeyBool("ok", true, first);
+      w.KeyString("table", matched->name, first);
+      w.KeyString("qualified_name", qname, first);
+      w.KeyInt64("total", total, first);
+      w.KeyInt64("limit", limit, first);
+      w.KeyInt64("offset", offset, first);
+      w.KeyInt64("returned", returned, first);
+      w.KeyBool("truncated", truncated, first);
+      AppendJsonRowsColumns(w, col_names, page_res.rows, first);
+      w.EndObject();
+      w.Raw("\n");
+      out << w.buf;
+      return kCliExitOk;
+    }
+
+    WriteTabularText(out, format, col_names, page_res.rows);
+    if (format == OutputFormat::Table) {
+      out << "(" << returned << " of " << total << " rows, offset " << offset << ")\n";
+    }
+    return kCliExitOk;
+  }
+
+  std::string where_clause;
+  if (!TrimAscii(where_expr).empty()) {
+    where_clause = " WHERE (" + std::string(TrimAscii(where_expr)) + ")";
+  }
+
+  const AdbcQueryResult count_res =
+      ExecuteBlocking(*opened.session, "SELECT COUNT(*) FROM " + qname + where_clause, true, 1);
+  if (!count_res.error.empty() || count_res.rows.empty() ||
+      count_res.rows.front().values.empty()) {
+    return EmitError(err, json_mode,
+                     count_res.error.empty() ? "COUNT 查询未返回结果" : count_res.error,
+                     kCliExitError);
+  }
+  const std::int64_t total = ParseStrictInt64(count_res.rows.front().values.front().text).value_or(0);
 
   std::string tie_breaker;
   std::vector<const ColumnMeta*> pk_cols;
@@ -2418,13 +2483,18 @@ int HandleQueryOrExecOrSql(const std::string& mode, const std::vector<std::strin
     return read_code;
   }
 
-  if (read_only && !IsSqlReadStatement(sql_text)) {
-    return EmitError(err, json_mode, "使用 --read-only 时仅允许只读查询语句", kCliExitUsage);
-  }
-
   ConnectionRequest req;
   if (const int code = ResolveConnectionRequest(conn, req, error); code != kCliExitOk) {
     return EmitError(err, json_mode, error, code);
+  }
+
+  const bool anticipated_redis =
+      ContainsIgnoreCase(req.driver_path, "redis") ||
+      LowerAscii(req.uri).starts_with("redis://") ||
+      LowerAscii(req.uri).starts_with("rediss://");
+  if (read_only &&
+      !IsReadStatement(anticipated_redis ? Dialect::Redis : Dialect::Generic, sql_text)) {
+    return EmitError(err, json_mode, "使用 --read-only 时仅允许只读查询语句", kCliExitUsage);
   }
 
   const AdbcOpenResult opened = OpenAdbcBlocking(req);
@@ -2435,7 +2505,9 @@ int HandleQueryOrExecOrSql(const std::string& mode, const std::vector<std::strin
 
   if (mode == "exec" && script_mode) {
     const std::vector<std::string> stmts =
-        SplitSqlStatements(sql_text, opened.session->dialect);
+        opened.session->dialect == Dialect::Redis
+            ? SplitRedisScript(sql_text)
+            : SplitSqlStatements(sql_text, opened.session->dialect);
     if (stmts.empty()) {
       return EmitError(err, json_mode, "脚本中不包含可执行 SQL 语句", kCliExitUsage);
     }
@@ -2477,7 +2549,8 @@ int HandleQueryOrExecOrSql(const std::string& mode, const std::vector<std::strin
   }
 
   const bool want_rows =
-      (mode == "query") || (mode == "sql" && IsSqlReadStatement(sql_text));
+      (mode == "query") ||
+      (mode == "sql" && IsReadStatement(opened.session->dialect, sql_text));
   const AdbcQueryResult res =
       ExecuteBlocking(*opened.session, sql_text, want_rows, want_rows ? max_rows : 0);
   if (!res.error.empty() && (!want_rows || res.rows.empty())) {

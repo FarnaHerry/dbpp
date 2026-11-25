@@ -1,4 +1,5 @@
 #include "adbc_session.h"
+#include "redis_client.h"
 
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/adbc_driver_manager.h>
@@ -309,6 +310,9 @@ Dialect DetectDialectFromText(std::string_view text) {
   }
   if (key.find("duckdb") != std::string::npos) {
     return Dialect::Duckdb;
+  }
+  if (key.find("redis") != std::string::npos) {
+    return Dialect::Redis;
   }
   return Dialect::Generic;
 }
@@ -746,6 +750,27 @@ AdbcSession::~AdbcSession() {
 AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
   AdbcOpenResult result;
   auto session = std::make_shared<AdbcSession>();
+  const Dialect dialect = DetectDialect(request.driver_path, request.uri);
+  if (dialect == Dialect::Redis) {
+    const RedisParseUriResult parsed =
+        ParseRedisUri(request.uri, request.username, request.password);
+    if (!parsed.error.empty()) {
+      result.error = parsed.error;
+      return result;
+    }
+    auto client = std::make_unique<RedisClient>();
+    std::string conn_err;
+    if (!client->Connect(parsed.endpoint, conn_err)) {
+      result.error = conn_err;
+      return result;
+    }
+    session->dialect = Dialect::Redis;
+    session->redis = std::move(client);
+    session->initialized = true;
+    result.session = std::move(session);
+    return result;
+  }
+
   AdbcError error = MakeError();
 
   const auto fail = [&](std::string_view operation) -> AdbcOpenResult {
@@ -775,7 +800,6 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
     return fail("设置 ADBC driver");
   }
 
-  const Dialect dialect = DetectDialect(request.driver_path, request.uri);
   const std::string lower_uri = LowerAscii(request.uri);
   const std::string lower_driver = LowerAscii(request.driver_path);
   bool credentials_in_uri = false;
@@ -839,6 +863,9 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
 }
 
 AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
+  if (session.dialect == Dialect::Redis && session.redis) {
+    return LoadRedisObjectsBlocking(*session.redis);
+  }
   AdbcObjectsResult result;
   AdbcError error = MakeError();
   StreamHolder stream;
@@ -977,6 +1004,11 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
 }
 
 AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object) {
+  if (session.dialect == Dialect::Redis) {
+    AdbcSchemaResult result;
+    result.columns = RedisKeySchema();
+    return result;
+  }
   AdbcSchemaResult result;
   AdbcError error = MakeError();
   SchemaHolder schema;
@@ -1028,6 +1060,9 @@ AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object
 
 AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want_rows,
                                 std::size_t max_rows) {
+  if (session.dialect == Dialect::Redis && session.redis) {
+    return ExecuteRedisCommandBlocking(*session.redis, sql, max_rows);
+  }
   AdbcQueryResult result;
   AdbcError error = MakeError();
   AdbcStatement statement{};
@@ -1283,6 +1318,47 @@ bool IsSqlReadStatement(std::string_view sql) {
     return true;
   }
   return LowerAscii(text).find(" returning ") != std::string::npos;
+}
+
+bool IsReadStatement(Dialect dialect, std::string_view text) {
+  if (dialect == Dialect::Redis) {
+    return IsRedisReadCommand(text);
+  }
+  return IsSqlReadStatement(text);
+}
+
+std::string InferDriverForUri(std::string_view uri) {
+  const std::string lower = LowerAscii(uri);
+  if (lower.starts_with("redis://") || lower.starts_with("rediss://")) {
+    return "redis";
+  }
+  if (lower.starts_with("postgresql://") || lower.starts_with("postgres://")) {
+    return "postgresql";
+  }
+  if (lower.starts_with("mysql://") || lower.starts_with("mariadb://")) {
+    return "mysql";
+  }
+  if (lower.starts_with("duckdb:") || lower.ends_with(".duckdb")) {
+    return "duckdb";
+  }
+  return DefaultSqliteDriverPath();
+}
+
+std::string DisplayNameFromUri(std::string_view uri, std::string_view fallback) {
+  if (uri.empty()) {
+    return std::string(fallback);
+  }
+  const std::string lower = LowerAscii(uri);
+  if (lower.starts_with("redis://") || lower.starts_with("rediss://")) {
+    return FormatRedisDisplayName(uri);
+  }
+  const auto slash = uri.find_last_of("/\\");
+  std::string name = slash == std::string_view::npos ? std::string(uri)
+                                                     : std::string(uri.substr(slash + 1));
+  if (name.empty()) {
+    return std::string(fallback);
+  }
+  return name;
 }
 
 namespace {
@@ -1543,6 +1619,14 @@ const std::vector<DatabasePreset>& SupportedDatabasePresets() {
                 "mysql://127.0.0.1:3306/mydb"),
       make_file("duckdb", "DuckDB", "嵌入式列式分析数据库", "duckdb",
                 "/path/to/app.duckdb 或 :memory:", {"duckdb", "ddb", "db"}, false),
+      [&] {
+        DatabasePreset p = make_host(
+            "redis", "Redis", "内存键值数据库 · 内置 RESP 客户端 · 端口 6379", "redis",
+            DatabaseCategory::KeyValue, "redis", "127.0.0.1", "6379", "0", "",
+            "redis://127.0.0.1:6379/0");
+        p.builtin = true;
+        return p;
+      }(),
       make_host("mssql", "SQL Server", "Microsoft SQL Server · 端口 1433", "mssql",
                 DatabaseCategory::Relational, "mssql", "127.0.0.1", "1433", "master", "sa",
                 "mssql://127.0.0.1:1433?database=master"),
@@ -1625,6 +1709,15 @@ std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host
 
 std::optional<AdbcDriverInfo> FindInstalledDriverForPreset(
     const DatabasePreset& preset, const std::vector<AdbcDriverInfo>& discovered) {
+  if (preset.id == "redis") {
+    return AdbcDriverInfo{
+        .name = "Redis",
+        .path = "redis",
+        .detail = "内置 RESP2/RESP3 客户端",
+        .version = {},
+        .is_manifest = false,
+    };
+  }
   if (preset.builtin) {
     const std::string default_path = DefaultSqliteDriverPath();
     for (const AdbcDriverInfo& info : discovered) {
@@ -1709,6 +1802,7 @@ std::string DriverDisplayName(const std::filesystem::path& path) {
   if (lower == "postgresql" || lower == "postgres") return "PostgreSQL";
   if (lower == "mysql" || lower == "mariadb") return "MySQL";
   if (lower == "duckdb") return "DuckDB";
+  if (lower == "redis") return "Redis";
   if (lower == "flightsql") return "Flight SQL";
   if (lower == "snowflake") return "Snowflake";
   if (lower == "bigquery") return "BigQuery";

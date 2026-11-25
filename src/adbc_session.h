@@ -6,10 +6,15 @@
 
 #include <huxerui/task.h>
 
+#include <memory>
+
 namespace dbpp {
 
-/// Owns one ADBC database and connection. All ADBC calls for this session are
-/// serialized through `sequence`, which is the only supported access path.
+class RedisClient;
+
+/// Owns one ADBC database/connection or a native Redis client. All calls for
+/// this session are serialized through `sequence`, which is the only supported
+/// access path.
 struct AdbcSession {
   AdbcSession() = default;
   AdbcSession(const AdbcSession&) = delete;
@@ -18,6 +23,7 @@ struct AdbcSession {
 
   AdbcDatabase database{};
   AdbcConnection connection{};
+  std::unique_ptr<RedisClient> redis;
   huxerui::WorkerSequence sequence;
   Dialect dialect = Dialect::Generic;
   bool database_created = false;

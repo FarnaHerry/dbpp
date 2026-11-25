@@ -1,5 +1,7 @@
 #pragma once
 
+#include "settings.h"
+
 #include <huxerui/datatable.h>
 #include <huxerui/http.h>
 #include <huxerui/huxerui.h>
@@ -30,6 +32,7 @@ enum class Dialect {
   Postgresql,
   Mysql,
   Duckdb,
+  Redis,
   Generic,
 };
 
@@ -52,6 +55,7 @@ struct DbObject {
   std::string db_schema;
   std::string table_type;
   bool is_view = false;
+  std::optional<std::int64_t> item_count;
   std::vector<std::string> primary_key;
   std::vector<ColumnMeta> columns;
 };
@@ -87,6 +91,7 @@ struct AdbcDriverInfo {
 enum class DatabaseCategory {
   LocalFile,
   Relational,
+  KeyValue,
   AnalyticsCloud,
   Custom,
 };
@@ -294,7 +299,8 @@ struct ConnectContext {
   std::string profiles_path;
   std::string default_driver;
   std::string default_uri;
-  bool dark = false;
+  AppThemeConfig theme_config;
+  bool system_dark = false;
   NotifyFn notify;
   std::function<void(std::size_t initial_tab, std::string filter_slug)> open_manager;
 };
@@ -310,7 +316,8 @@ struct AdbcManagerContext {
   std::string default_uri;
   std::size_t initial_tab = 0;
   std::string initial_filter;
-  bool dark = false;
+  AppThemeConfig theme_config;
+  bool system_dark = false;
   NotifyFn notify;
 };
 
@@ -321,6 +328,9 @@ struct AdbcManagerContext {
 [[nodiscard]] std::string QualifiedName(Dialect dialect, const DbObject& object);
 [[nodiscard]] std::string BuildDropObjectSql(Dialect dialect, const DbObject& object);
 [[nodiscard]] bool IsSqlReadStatement(std::string_view sql);
+[[nodiscard]] bool IsReadStatement(Dialect dialect, std::string_view text);
+[[nodiscard]] std::string InferDriverForUri(std::string_view uri);
+[[nodiscard]] std::string DisplayNameFromUri(std::string_view uri, std::string_view fallback);
 [[nodiscard]] std::string SingleLineCellPreview(std::string_view text);
 [[nodiscard]] float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
                                            const GridSnapshot* snapshot);
@@ -377,6 +387,9 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
                                 std::size_t max_rows);
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows);
+TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
+                             DbObject object, std::int64_t page, std::int64_t page_size,
+                             std::optional<huxerui::DataTableSort> sort, std::string filter);
 
 // Async wrappers. Each one serializes its work on the owning session's
 // WorkerSequence, so ADBC connection handles are never used concurrently.

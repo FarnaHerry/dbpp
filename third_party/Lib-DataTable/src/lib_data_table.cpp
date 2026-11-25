@@ -87,6 +87,15 @@ Color GridLineColor(const ColorScheme& colors) {
   return line;
 }
 
+Color BlendColor(Color a, Color b, float t) {
+  return Color{
+      a.red + (b.red - a.red) * t,
+      a.green + (b.green - a.green) * t,
+      a.blue + (b.blue - a.blue) * t,
+      a.alpha + (b.alpha - a.alpha) * t,
+  };
+}
+
 bool RevealAxis(const ScrollController& controller, float start, float extent, float frozen) {
   const auto metrics = controller.Metrics();
   const float visible_extent = metrics.viewport_extent - frozen;
@@ -462,8 +471,11 @@ View BodyCell(std::shared_ptr<const TableContext> table, CellPosition position,
 
   const auto full = table->geometry->CellBounds(position.row + 1, position.column);
   const auto& colors = table->colors;
-  const Color background = position.column < table->geometry->frozen_count ? colors.surface_container_low
-                                                                         : colors.surface;
+  const Color base_surface =
+      (position.row % 2 == 1) ? BlendColor(colors.surface, colors.surface_container_low, 0.55F)
+                              : colors.surface;
+  const Color background =
+      position.column < table->geometry->frozen_count ? colors.surface_container_low : base_surface;
   View content = editing ? CellEditor(table, session, position) : std::move(display.view);
   View cell_view = ClippedTableCell(
       std::move(content), {full.width, full.height}, editing ? std::nullopt : std::optional{8.0F}

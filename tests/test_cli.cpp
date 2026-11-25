@@ -2,6 +2,8 @@
 #include "cli.h"
 #include "driver_installer.h"
 #include "model.h"
+#include "settings.h"
+#include "theme.h"
 
 #include <algorithm>
 #include <array>
@@ -803,6 +805,54 @@ void TestTableCellPreviewAndAutoWidth() {
          "Null snapshot width must remain within auto-fit bounds");
 }
 
+void TestSettingsAndThemePalettes(const fs::path& dir) {
+  const fs::path settings_path = dir / "sub" / "settings.tsv";
+  dbpp::TraySettings saved;
+  saved.tray_enabled = false;
+  saved.lightweight = true;
+  saved.theme_mode = dbpp::ThemeMode::Dark;
+  saved.theme_preset = dbpp::ThemePreset::VioletDusk;
+  Expect(dbpp::SaveTraySettings(settings_path.string(), saved),
+         "SaveTraySettings should create parent directory and succeed");
+
+  const dbpp::TraySettings loaded = dbpp::LoadTraySettings(settings_path.string());
+  Expect(loaded == saved, "LoadTraySettings round-trip with theme config mismatch");
+
+  const fs::path legacy_path = dir / "legacy_settings.tsv";
+  WriteTextFile(legacy_path, "tray.enabled\tfalse\ntray.lightweight\ttrue\n");
+  const dbpp::TraySettings legacy = dbpp::LoadTraySettings(legacy_path.string());
+  Expect(!legacy.tray_enabled && legacy.lightweight &&
+             legacy.theme_mode == dbpp::ThemeMode::System &&
+             legacy.theme_preset == dbpp::ThemePreset::GeminiSpark,
+         "Legacy 2-line settings.tsv must default theme to System + GeminiSpark");
+
+  const fs::path bogus_path = dir / "bogus_settings.tsv";
+  WriteTextFile(bogus_path, "theme.mode\tbogus\ntheme.preset\tunknown\n");
+  const dbpp::TraySettings bogus = dbpp::LoadTraySettings(bogus_path.string());
+  Expect(bogus.theme_mode == dbpp::ThemeMode::System &&
+             bogus.theme_preset == dbpp::ThemePreset::GeminiSpark,
+         "Unknown theme keys in settings.tsv must fall back safely");
+
+  const auto& presets = dbpp::ui::AvailableThemePresets();
+  Expect(presets.size() == 5 && presets.front().preset == dbpp::ThemePreset::GeminiSpark,
+         "AvailableThemePresets must expose 5 presets starting with GeminiSpark");
+
+  for (const auto& meta : presets) {
+    for (const bool dark : {false, true}) {
+      const huxerui::ThemeSpec spec = dbpp::ui::BuildThemeSpec(meta.preset, dark);
+      const dbpp::ui::SemanticColors sem = dbpp::ui::BuildSemanticColors(meta.preset, dark);
+      Expect(!(spec.colors.surface == spec.colors.surface_container_low),
+             "Theme surface and surface_container_low must be layered: " + meta.name);
+      Expect(!(spec.colors.surface == spec.colors.on_surface),
+             "Theme foreground and surface must remain distinct: " + meta.name);
+      Expect(spec.colors.scrim.alpha > 0.0F && spec.colors.scrim.alpha < 1.0F,
+             "Theme scrim must remain translucent: " + meta.name);
+      Expect(sem.uses_gradient_chrome == (meta.preset != dbpp::ThemePreset::Monochrome),
+             "Gradient chrome flag mismatch for preset: " + meta.name);
+    }
+  }
+}
+
 } // namespace
 
 int main() {
@@ -816,6 +866,7 @@ int main() {
   TestBatchInsertAndWorkspaceModel(temp.path, dbpp::DefaultSqliteDriverPath());
   TestConnectionOrdering();
   TestTableCellPreviewAndAutoWidth();
+  TestSettingsAndThemePalettes(temp.path);
 
   if (g_failures != 0) {
     std::cerr << g_failures << " CLI test assertion(s) failed\n";

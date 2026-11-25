@@ -11,11 +11,11 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 | --- | --- |
 | 任何修改后的构建/验证 | 本文件「最低验证命令」与 run.sh |
 | 任何 UI 改动（壳、侧栏、对话框、表格、SQL 页） | src/app.cpp、src/theme.h（先用既有控件，不重复造） |
-| 数据库访问、分页、行编辑、SQL 执行 | src/model.h（跨文件声明的唯一头）、src/db.cpp、src/adbc_session.h |
+| 数据库访问、分页、行编辑、SQL / Redis 执行 | src/model.h（跨文件声明的唯一头）、src/db.cpp、src/adbc_session.h、src/redis_client.h |
 | CLI 子命令、参数解析、JSON/表格输出 | src/cli.h、src/cli.cpp、platform/*/main.cpp、tests/test_cli.cpp |
 | ADBC 管理器、connections.tsv 与在线安装 | src/db.cpp 的 Load/SaveConnectionProfiles、src/driver_installer.* 与 README「ADBC 管理器」 |
 | 托盘、单实例、关闭策略、轻量级模式、settings.tsv | src/tray.h 注释、src/tray.cpp、src/instance.*、src/settings.cpp |
-| 主题/配色 | src/theme.*：只有单色黑白，禁止引入新色相 |
+| 主题/配色 | src/theme.h、src/theme_palette.cpp、src/theme.cpp（预设 + SemanticColors Token，禁止散落硬编码色值） |
 | 图标与打包 | resources/（运行时资源包，app::images::*）、assets/（平台二进制图标）、platform/ 与 CMakeLists.txt |
 | CI、安装器与发版 | .github/workflows/build.yml、cmake/FindSQLite3.cmake、platform/{windows,macos}/ 与 tests/ |
 
@@ -28,7 +28,7 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 - 托盘拥有应用生命周期：AppOptions 必须保持 `quit_on_last_window_closed = false`、`create_initial_window = false`；窗口一律经 `TrayRuntime::ShowWindow`（OpenWindow）创建，不要绕过托盘直接退出。
 - 轻量级模式关闭窗口会销毁全部 UI 状态并断开所有 ADBC 会话，唤出后是干净状态——这是设计行为。托盘不可用时关闭必须走确认退出对话框，不得让窗口无入口可唤回。
 - `MainWindowOptions`（src/tray.cpp）与 AppOptions.window 必须一致；UI 根工厂唯一来源是 src/root.h 的 AppRoot。
-- UI 只用 theme.* 共享控件与单色黑白主题，文案用中文。运行时资源放 resources/，Windows .ico 与 Linux 安装图标放 assets/，macOS .icns 放 platform/macos/，三者职责不混用。
+- UI 颜色、渐变与控件样式统一经 `src/theme.*` 的预设与 `SemanticColors` Token 管理，禁止在业务页面散落硬编码色值；文案用中文。运行时资源放 resources/，Windows .ico 与 Linux 安装图标放 assets/，macOS .icns 放 platform/macos/，三者职责不混用。
 - 平台入口只在 platform/<os>/main.cpp；Linux 桌面集成依赖二进制名与 dbpp.desktop 的 `Exec=dbpp`、`StartupWMClass=dbpp` 一致，改名需同步。
 
 ## 最低验证命令
