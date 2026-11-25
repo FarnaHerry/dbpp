@@ -405,9 +405,9 @@ bool TryConsumeConnFlag(const std::vector<std::string>& args, std::size_t& index
 std::string DefaultProfilesPath() {
   const std::string data_dir = DefaultAppDataDir();
   if (data_dir.empty()) {
-    return "connections.tsv";
+    return "dbpp.sqlite3";
   }
-  return (std::filesystem::path(data_dir) / "connections.tsv").string();
+  return (std::filesystem::path(data_dir) / "dbpp.sqlite3").string();
 }
 
 int ResolveConnectionRequest(const ConnOptions& conn, ConnectionRequest& request_out,
@@ -461,6 +461,7 @@ int ResolveConnectionRequest(const ConnOptions& conn, ConnectionRequest& request
     request_out.driver_path = conn.driver.empty() ? it->driver_path : conn.driver;
     request_out.uri = conn.uri.empty() ? it->uri : conn.uri;
     request_out.username = conn.has_user ? conn.user : it->username;
+    request_out.password = it->password;
   } else {
     if (conn.uri.empty()) {
       error_out =
@@ -932,7 +933,7 @@ void PrintTopLevelHelp(std::ostream& out) {
       << "  driver <list|catalog|install|uninstall>\n"
       << "                               Manage ADBC drivers\n"
       << "  profile <list|show|save|remove>\n"
-      << "                               Manage saved connection profiles (connections.tsv)\n"
+      << "                               Manage saved connection profiles (dbpp.sqlite3)\n"
       << "  tables   <conn>              List tables and views\n"
       << "  schema   <conn> [table]      Inspect columns and primary keys\n"
       << "  rows     <conn> <table>      Paginated table rows (--limit/--offset/--where/--order)\n"
@@ -946,7 +947,7 @@ void PrintTopLevelHelp(std::ostream& out) {
       << "  help [command]               Show help for top-level or subcommand\n"
       << "\n"
       << "Connection options (<conn>):\n"
-      << "  --profile, -p <name>         Use saved profile from connections.tsv\n"
+      << "  --profile, -p <name>         Use saved profile from dbpp.sqlite3\n"
       << "  --sqlite <path>              Open local SQLite file (or :memory:)\n"
       << "  --redis <uri>                Connect to Redis (redis://[user:pass@]host[:port][/db])\n"
       << "  --uri, -u <uri>              Connection URI (or libpq conninfo)\n"
@@ -954,7 +955,7 @@ void PrintTopLevelHelp(std::ostream& out) {
       << "  --user <name>                Override username\n"
       << "  --password <pw>              Provide password directly\n"
       << "  --password-env <VAR>         Read password from environment variable (fallback: DBPP_PASSWORD)\n"
-      << "  --profiles <path>            Override connections.tsv path (env DBPP_DATA_DIR)\n"
+      << "  --profiles <path>            Override dbpp.sqlite3 path (env DBPP_DATA_DIR)\n"
       << "\n"
       << "Output & exit codes:\n"
       << "  --json                       Shorthand for --format json ({\"ok\":true,...})\n"
@@ -994,9 +995,9 @@ bool PrintCommandHelp(std::string_view cmd, std::ostream& out) {
     out << "Usage:\n"
         << "  dbpp profile list [--profiles <path>] [--format table|tsv|csv|json] [--json]\n"
         << "  dbpp profile show <name> [--profiles <path>] [--json]\n"
-        << "  dbpp profile save <name> --driver <drv> --uri <uri> [--user <u>] [--profiles <path>] [--json]\n"
+        << "  dbpp profile save <name> --driver <drv> --uri <uri> [--user <u>] [--password <pw>|--password-env <VAR>] [--profiles <path>] [--json]\n"
         << "  dbpp profile remove <name> [--profiles <path>] [--json]\n"
-        << "Note: Passwords are never saved to connections.tsv; pass --password-env <VAR> at query time.\n";
+        << "Note: Passwords saved in dbpp.sqlite3 can still be overridden at query time via --password-env <VAR>.\n";
     return true;
   }
   if (cmd == "tables" || cmd == "objects") {
@@ -1452,9 +1453,13 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
   std::string driver;
   std::string uri;
   std::string user;
+  std::string password;
+  std::string password_env;
   bool has_driver = false;
   bool has_uri = false;
   bool has_user = false;
+  bool has_password = false;
+  bool has_password_env = false;
   std::optional<std::string> name_arg;
   std::string error;
 
@@ -1498,10 +1503,18 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
       continue;
     }
     if (sub == "save" && flag == "--password") {
-      return EmitError(
-          err, early_json,
-          "connections.tsv 不持久化保存密码；请在执行查询时通过 --password-env 或 --password 传入",
-          kCliExitUsage);
+      has_password = true;
+      if (!ConsumeFlagValue(args, i, inline_val, flag, password, error)) {
+        return EmitError(err, early_json, error, kCliExitUsage);
+      }
+      continue;
+    }
+    if (sub == "save" && flag == "--password-env") {
+      has_password_env = true;
+      if (!ConsumeFlagValue(args, i, inline_val, flag, password_env, error)) {
+        return EmitError(err, early_json, error, kCliExitUsage);
+      }
+      continue;
     }
     if (!args[i].empty() && args[i].front() == '-') {
       return EmitError(err, early_json, "未知参数: " + args[i], kCliExitUsage);
@@ -1542,6 +1555,7 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
         w.KeyString("driver", p.driver_path, fp);
         w.KeyString("uri", p.uri, fp);
         w.KeyString("user", p.username, fp);
+        w.KeyBool("has_password", !p.password.empty(), fp);
         w.EndObject();
       }
       w.EndArray();
@@ -1553,9 +1567,10 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
     std::vector<GridRow> rows;
     rows.reserve(profiles.size());
     for (const ConnectionProfile& p : profiles) {
-      rows.push_back(MakeTextRow({p.name, p.driver_path, p.uri, p.username}));
+      rows.push_back(MakeTextRow(
+          {p.name, p.driver_path, p.uri, p.username, p.password.empty() ? "false" : "true"}));
     }
-    WriteTabularText(out, format, {"name", "driver", "uri", "user"}, rows);
+    WriteTabularText(out, format, {"name", "driver", "uri", "user", "has_password"}, rows);
     return kCliExitOk;
   }
 
@@ -1582,6 +1597,7 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
       w.KeyString("driver", it->driver_path, fp);
       w.KeyString("uri", it->uri, fp);
       w.KeyString("user", it->username, fp);
+      w.KeyBool("has_password", !it->password.empty(), fp);
       w.EndObject();
       w.EndObject();
       w.Raw("\n");
@@ -1593,6 +1609,7 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
         MakeTextRow({"driver", it->driver_path}),
         MakeTextRow({"uri", it->uri}),
         MakeTextRow({"user", it->username}),
+        MakeTextRow({"has_password", it->password.empty() ? "false" : "true"}),
         MakeTextRow({"profiles_path", profiles_path}),
     };
     WriteTabularText(out, format, {"key", "value"}, rows);
@@ -1611,11 +1628,23 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
     if (!has_uri || uri.empty()) {
       return EmitError(err, json_mode, "缺少 --uri <uri>", kCliExitUsage);
     }
+    std::string effective_password;
+    if (has_password_env) {
+      const char* env_val = std::getenv(password_env.c_str());
+      if (env_val == nullptr || *env_val == '\0') {
+        return EmitError(err, json_mode, "环境变量 '" + password_env + "' 未设置或为空",
+                         kCliExitError);
+      }
+      effective_password = env_val;
+    } else if (has_password) {
+      effective_password = password;
+    }
     ConnectionProfile entry{
         .name = *name_arg,
         .driver_path = driver,
         .uri = uri,
         .username = has_user ? user : std::string{},
+        .password = std::move(effective_password),
     };
     bool updated = false;
     for (ConnectionProfile& existing : profiles) {
@@ -1629,7 +1658,7 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
       profiles.push_back(entry);
     }
     if (!SaveConnectionProfiles(profiles_path, profiles)) {
-      return EmitError(err, json_mode, "保存 connections.tsv 失败: " + profiles_path,
+      return EmitError(err, json_mode, "保存 dbpp.sqlite3 失败: " + profiles_path,
                        kCliExitError);
     }
     if (json_mode) {
@@ -1646,6 +1675,7 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
       w.KeyString("driver", entry.driver_path, fp);
       w.KeyString("uri", entry.uri, fp);
       w.KeyString("user", entry.username, fp);
+      w.KeyBool("has_password", !entry.password.empty(), fp);
       w.EndObject();
       w.EndObject();
       w.Raw("\n");
@@ -1669,7 +1699,7 @@ int HandleProfile(const std::vector<std::string>& args, std::ostream& out, std::
       return EmitError(err, json_mode, "未找到连接配置: " + *name_arg, kCliExitError);
     }
     if (!SaveConnectionProfiles(profiles_path, profiles)) {
-      return EmitError(err, json_mode, "保存 connections.tsv 失败: " + profiles_path,
+      return EmitError(err, json_mode, "保存 dbpp.sqlite3 失败: " + profiles_path,
                        kCliExitError);
     }
     if (json_mode) {

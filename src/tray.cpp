@@ -3,6 +3,7 @@
 // （quit_on_last_window_closed = false），窗口只是托盘之上的展示层。
 
 #include "tray.h"
+#include "config_db.h"
 #include "root.h"
 #include "settings.h"
 #include "app_resources.h"
@@ -163,11 +164,21 @@ huxerui::WindowOptions MainWindowOptions() {
 
 void InstallTrayRuntime(ApplicationContext& context) {
   auto runtime = std::make_shared<TrayRuntime>(UseApplication());
+  auto config_db = std::make_shared<ConfigDbService>();
   auto settings = std::make_shared<SettingsModel>();
   const File data_directory = runtime->application->Directories().data_directory;
-  settings->path = data_directory.Child("settings.tsv").Path();
-  settings->Load();
+  const std::string db_path = data_directory.Child("dbpp.sqlite3").Path();
+  settings->path = db_path;
+  const TraySettings startup = ConfigDbService::ReadStartupSettingsSync(db_path);
+  settings->tray_enabled = startup.tray_enabled;
+  settings->lightweight = startup.lightweight;
+  settings->theme_mode = startup.theme_mode;
+  settings->theme_preset = startup.theme_preset;
+  settings->persist_setting = [config_db](std::string key, std::string value) {
+    config_db->PersistSetting(std::move(key), std::move(value));
+  };
   runtime->settings = settings;
+  context.Provide(config_db);
   context.Provide(std::move(settings));
   context.Provide(runtime);
 
@@ -177,10 +188,10 @@ void InstallTrayRuntime(ApplicationContext& context) {
   runtime->tray.OnActivate([runtime] { runtime->ShowWindow(); });
 
   // Hooks run before the event loop can create native windows, so the main
-  // window opens from a task. The loop then keeps the tray presentation in
-  // sync with settings and recovers the window when no tray entry point
-  // remains (lightweight destroy + missing tray host must not strand the app).
-  tasks.Launch([runtime]() -> Task<void> {
+  // window opens from a task. Open/migrate the Lib-SQLite config database first
+  // so legacy TSV configs are imported cleanly before UI composition starts.
+  tasks.Launch([runtime, config_db, db_path, tasks]() -> Task<void> {
+    (void)co_await config_db->OpenAndMigrateAsync(db_path, tasks);
     runtime->ShowWindow();
     for (;;) {
       if (runtime->exit_requested) {

@@ -1,7 +1,7 @@
 # FindSQLite3.cmake — 当启用 DBPP_USE_VENDORED_SQLITE3（默认 ON）时，直接从
-# third_party/adbc/c/vendor/sqlite3 编译静态 SQLite3 目标并提供 SQLite::SQLite3
-# / SQLite3::SQLite3 别名，避免 Linux/macOS/Windows 发行包依赖宿主 libsqlite3
-# 动态库或 vcpkg；关闭时回落到 CMake 自带模块。
+# HuxerUI Lib-SQLite（third_party/sqlite）编译静态 SQLite3 目标并提供 SQLite::SQLite3
+# / SQLite3::SQLite3 别名，与 HuxerUI::SQLite 共用同一份 SQLite3 源码，避免各平台
+# 打包依赖宿主 libsqlite3 动态库或 vcpkg；关闭时回落到 CMake 自带模块。
 
 if (DEFINED DBPP_USE_VENDORED_SQLITE3 AND NOT DBPP_USE_VENDORED_SQLITE3)
     include("${CMAKE_ROOT}/Modules/FindSQLite3.cmake")
@@ -9,10 +9,13 @@ if (DEFINED DBPP_USE_VENDORED_SQLITE3 AND NOT DBPP_USE_VENDORED_SQLITE3)
 endif ()
 
 set(_dbpp_sqlite3_candidates)
-if (DEFINED DBPP_ADBC_DIR AND NOT DBPP_ADBC_DIR STREQUAL "")
-    list(APPEND _dbpp_sqlite3_candidates "${DBPP_ADBC_DIR}/c/vendor/sqlite3")
+if (DEFINED DBPP_SQLITE_LIB_DIR AND NOT DBPP_SQLITE_LIB_DIR STREQUAL "")
+    list(APPEND _dbpp_sqlite3_candidates "${DBPP_SQLITE_LIB_DIR}/third_party/sqlite")
 endif ()
-list(APPEND _dbpp_sqlite3_candidates "${CMAKE_SOURCE_DIR}/third_party/adbc/c/vendor/sqlite3")
+list(APPEND _dbpp_sqlite3_candidates
+        "${CMAKE_SOURCE_DIR}/third_party/Lib-SQLite/third_party/sqlite"
+        "${CMAKE_SOURCE_DIR}/../HuxerUI-libs/Lib-SQLite/third_party/sqlite"
+)
 
 set(_dbpp_sqlite3_dir "")
 foreach (_candidate IN LISTS _dbpp_sqlite3_candidates)

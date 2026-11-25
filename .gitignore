@@ -5,6 +5,7 @@
 compile_commands.json
 *.log
 /third_party/huxerui/
+/third_party/Lib-SQLite/
 /.huxerui/
 /dist/
 /dist-src/

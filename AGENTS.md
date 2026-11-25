@@ -13,8 +13,8 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 | 任何 UI 改动（壳、侧栏、对话框、表格、SQL 页） | src/app.cpp、src/theme.h（先用既有控件，不重复造） |
 | 数据库访问、分页、行编辑、SQL / Redis 执行 | src/model.h（跨文件声明的唯一头）、src/db.cpp、src/adbc_session.h、src/redis_client.h |
 | CLI 子命令、参数解析、JSON/表格输出 | src/cli.h、src/cli.cpp、platform/*/main.cpp、tests/test_cli.cpp |
-| ADBC 管理器、connections.tsv 与在线安装 | src/db.cpp 的 Load/SaveConnectionProfiles、src/driver_installer.* 与 README「ADBC 管理器」 |
-| 托盘、单实例、关闭策略、轻量级模式、settings.tsv | src/tray.h 注释、src/tray.cpp、src/instance.*、src/settings.cpp |
+| ADBC 管理器、dbpp.sqlite3 与在线安装 | src/config_db.*、src/db.cpp 的 Load/SaveConnectionProfiles、src/driver_installer.* 与 README |
+| 托盘、单实例、关闭策略、轻量级模式、设置存储 | src/tray.h 注释、src/tray.cpp、src/instance.*、src/settings.cpp、src/config_db.* |
 | 主题/配色 | src/theme.h、src/theme_palette.cpp、src/theme.cpp（预设 + SemanticColors Token，禁止散落硬编码色值） |
 | 图标与打包 | resources/（运行时资源包，app::images::*）、assets/（平台二进制图标）、platform/ 与 CMakeLists.txt |
 | CI、安装器与发版 | .github/workflows/build.yml、cmake/FindSQLite3.cmake、platform/{windows,macos}/ 与 tests/ |
@@ -24,7 +24,7 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件，
 - 修改前检查 `git status`，保留已有改动；不擅自 reset、restore 或清理无关文件。未经用户明确要求，不提交、打标签或推送。
 - 每次修改任何文件后都重新编译 dbpp 目标并运行 `git diff --check`；构建失败不得宣称完成，最终说明实际命令、结果与未覆盖范围。
 - ADBC 会话唯一访问路径是 `AdbcSession::sequence` 串行 Worker：阻塞查询/编辑一律放任务线程（`co_await *Async`），不得在组合回调里同步调用。
-- connections.tsv 不落密码，密码只随 ConnectionRequest 在内存传递。settings.tsv 同为 TSV：先写临时文件再原子替换，失败保留原文件。
+- 应用配置与连接统一持久化在 `dbpp.sqlite3`（使用 HuxerUI `Lib-SQLite` + WAL 模式，POSIX 下设为 0600 权限，自动迁移旧版 `connections.tsv` / `settings.tsv` 且保留原文件）。
 - 托盘拥有应用生命周期：AppOptions 必须保持 `quit_on_last_window_closed = false`、`create_initial_window = false`；窗口一律经 `TrayRuntime::ShowWindow`（OpenWindow）创建，不要绕过托盘直接退出。
 - 轻量级模式关闭窗口会销毁全部 UI 状态并断开所有 ADBC 会话，唤出后是干净状态——这是设计行为。托盘不可用时关闭必须走确认退出对话框，不得让窗口无入口可唤回。
 - `MainWindowOptions`（src/tray.cpp）与 AppOptions.window 必须一致；UI 根工厂唯一来源是 src/root.h 的 AppRoot。

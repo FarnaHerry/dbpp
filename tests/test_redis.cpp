@@ -920,7 +920,7 @@ void TestRedisSessionCrudAndCli(const fs::path& dir) {
              exec_script.out.find("\"statements_executed\":2") != std::string::npos,
          "CLI exec --script on Redis failed: " + exec_script.err);
 
-  const fs::path profiles_path = dir / "connections.tsv";
+  const fs::path profiles_path = dir / "dbpp.sqlite3";
   const CliRunResult save_prof = InvokeCli(
       {"profile", "save", "myredis", "--driver", "redis", "--uri", base_uri, "--user", "alice",
        "--profiles", profiles_path.string(), "--json"});
@@ -934,6 +934,20 @@ void TestRedisSessionCrudAndCli(const fs::path& dir) {
     Expect(use_prof.code == 0 && use_prof.out.find("xyz") != std::string::npos,
            "CLI query -p myredis --password-env failed: " + use_prof.err + " / " + use_prof.out);
   }
+
+  // Saved profile with persisted password connects directly without extra password flags.
+  const CliRunResult save_auth_prof = InvokeCli(
+      {"profile", "save", "myredis_saved", "--driver", "redis", "--uri", base_uri, "--user",
+       "alice", "--password", "secret123", "--profiles", profiles_path.string(), "--json"});
+  Expect(save_auth_prof.code == 0 &&
+             save_auth_prof.out.find("secret123") == std::string::npos,
+         "CLI profile save redis with --password failed: " + save_auth_prof.err);
+  const CliRunResult use_saved_prof = InvokeCli(
+      {"query", "-p", "myredis_saved", "--profiles", profiles_path.string(), "GET cache:token",
+       "--json"});
+  Expect(use_saved_prof.code == 0 && use_saved_prof.out.find("xyz") != std::string::npos,
+         "CLI query -p myredis_saved using saved password failed: " + use_saved_prof.err + " / " +
+             use_saved_prof.out);
 
   // Multi-line & comment console execution.
   const dbpp::AdbcQueryResult comment_ping =

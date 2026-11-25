@@ -31,8 +31,8 @@ struct AdbcSession {
   bool initialized = false;
 };
 
-/// Result of extracting and stripping embedded credentials from a URI so passwords
-/// are never persisted in `connections.tsv`.
+/// Result of extracting embedded credentials from a URI into dedicated fields
+/// so URI display/copy stays clean while preserving credentials separately.
 struct SanitizedUriResult {
   std::string uri;
   std::string username;
@@ -40,8 +40,8 @@ struct SanitizedUriResult {
   bool stripped_password = false;
 };
 
-/// Strips any embedded password from a `scheme://userinfo@host...` URI, returning
-/// the sanitized URI plus extracted username/password for in-memory use only.
+/// Strips any embedded credentials from a `scheme://userinfo@host...` URI,
+/// returning the sanitized URI plus extracted username/password.
 [[nodiscard]] SanitizedUriResult SanitizeUriCredentials(std::string_view uri);
 
 /// Driver path of the SQLite ADBC driver built next to this application.

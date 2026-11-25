@@ -1,9 +1,12 @@
 #include "adbc_session.h"
 #include "cli.h"
+#include "config_db.h"
 #include "driver_installer.h"
 #include "model.h"
 #include "settings.h"
 #include "theme.h"
+
+#include <huxerui/sqlite.h>
 
 #include <algorithm>
 #include <array>
@@ -259,7 +262,7 @@ void TestVersionHelpDoctor(const fs::path& dir) {
 }
 
 void TestProfilesLifecycle(const fs::path& dir) {
-  const fs::path profiles_file = dir / "connections.tsv";
+  const fs::path profiles_file = dir / "dbpp.sqlite3";
   const fs::path sqlite_db = dir / "profile_target.sqlite";
   const std::string driver = dbpp::DefaultSqliteDriverPath();
 
@@ -281,25 +284,60 @@ void TestProfilesLifecycle(const fs::path& dir) {
   Expect(saved.out.find("\"updated\":false") != std::string::npos,
          "first save should report updated:false");
 
-  const std::string raw_tsv = ReadBinaryFile(profiles_file);
-  Expect(raw_tsv.find("local_demo") != std::string::npos, "connections.tsv contains profile name");
+  const std::string raw_sqlite = ReadBinaryFile(profiles_file);
+  Expect(raw_sqlite.starts_with("SQLite format 3"), "dbpp.sqlite3 must be a valid SQLite file");
 
-  const auto pw_rejected = InvokeCli({
+  const auto pw_saved = InvokeCli({
       "profile",
       "save",
-      "bad",
+      "auth_demo",
       "--driver",
       "postgresql",
       "--uri",
       "postgresql://host/db",
+      "--user",
+      "bob",
       "--password",
       "secret",
       "--profiles",
       profiles_file.string(),
       "--json",
   });
-  Expect(pw_rejected.code == 2 && pw_rejected.err.find("\"ok\":false") != std::string::npos,
-         "profile save must reject --password");
+  Expect(pw_saved.code == 0 && pw_saved.out.find("\"has_password\":true") != std::string::npos &&
+             pw_saved.out.find("secret") == std::string::npos,
+         "profile save with --password must succeed without leaking secret: " + pw_saved.err);
+
+  const auto auth_shown = InvokeCli({
+      "profile",
+      "show",
+      "auth_demo",
+      "--profiles",
+      profiles_file.string(),
+      "--json",
+  });
+  Expect(auth_shown.code == 0 &&
+             auth_shown.out.find("\"has_password\":true") != std::string::npos &&
+             auth_shown.out.find("secret") == std::string::npos,
+         "profile show must report has_password:true without leaking plaintext password");
+
+  const std::vector<dbpp::ConnectionProfile> loaded_profiles =
+      dbpp::LoadConnectionProfiles(profiles_file.string());
+  Expect(loaded_profiles.size() == 2 && loaded_profiles[1].name == "auth_demo" &&
+             loaded_profiles[1].password == "secret",
+         "LoadConnectionProfiles must recover saved password");
+
+  // Backward compatibility: legacy 4-column rows load with empty password.
+  {
+    const fs::path legacy_file = dir / "legacy_connections.tsv";
+    WriteTextFile(legacy_file,
+                  "# db++ adbc connections v1\n"
+                  "legacy_pg\tpostgresql\tpostgresql://127.0.0.1:5432/app\tpostgres\n");
+    const std::vector<dbpp::ConnectionProfile> legacy_loaded =
+        dbpp::LoadConnectionProfiles(legacy_file.string());
+    Expect(legacy_loaded.size() == 1 && legacy_loaded[0].name == "legacy_pg" &&
+               legacy_loaded[0].username == "postgres" && legacy_loaded[0].password.empty(),
+           "Legacy 4-column connections.tsv must still load cleanly");
+  }
 
   const auto created = InvokeCli({
       "exec",
@@ -319,7 +357,8 @@ void TestProfilesLifecycle(const fs::path& dir) {
       profiles_file.string(),
       "--json",
   });
-  Expect(listed.code == 0 && listed.out.find("\"count\":1") != std::string::npos,
+  Expect(listed.code == 0 && listed.out.find("\"count\":2") != std::string::npos &&
+             listed.out.find("secret") == std::string::npos,
          "profile list failed: " + listed.err);
 
   const auto shown = InvokeCli({
@@ -343,6 +382,81 @@ void TestProfilesLifecycle(const fs::path& dir) {
   });
   Expect(removed.code == 0 && removed.out.find("\"removed\":true") != std::string::npos,
          "profile remove failed: " + removed.err);
+
+  const auto removed_auth = InvokeCli({
+      "profile",
+      "remove",
+      "auth_demo",
+      "--profiles",
+      profiles_file.string(),
+      "--json",
+  });
+  Expect(removed_auth.code == 0 && removed_auth.out.find("\"removed\":true") != std::string::npos,
+         "profile remove auth_demo failed: " + removed_auth.err);
+
+  // Settings + HuxerUI::SQLite read verification + legacy TSV auto-migration.
+  {
+    const dbpp::TraySettings custom_settings{
+        .tray_enabled = false,
+        .lightweight = true,
+        .theme_mode = dbpp::ThemeMode::Dark,
+        .theme_preset = dbpp::ThemePreset::Emerald,
+    };
+    Expect(dbpp::SaveTraySettings(profiles_file.string(), custom_settings),
+           "SaveTraySettings to dbpp.sqlite3 failed");
+    const dbpp::TraySettings loaded_settings = dbpp::LoadTraySettings(profiles_file.string());
+    Expect(loaded_settings == custom_settings, "LoadTraySettings round-trip failed");
+    const dbpp::TraySettings startup_settings =
+        dbpp::ConfigDbService::ReadStartupSettingsSync(profiles_file.string());
+    Expect(startup_settings == custom_settings,
+           "ConfigDbService::ReadStartupSettingsSync round-trip failed");
+
+    std::int64_t user_version = 0;
+    auto version_res = huxerui::sqlite::Database::QueryReadOnlySync(
+        huxerui::File{profiles_file.string()}, "PRAGMA user_version",
+        [&user_version](const huxerui::sqlite::RowView& row) -> huxerui::sqlite::Result<void> {
+          auto v = row.Get<std::int64_t>(0);
+          if (!v) return v.Error();
+          user_version = *v;
+          return {};
+        });
+    Expect(static_cast<bool>(version_res) && user_version == 1,
+           "dbpp.sqlite3 user_version must be 1");
+  }
+
+  {
+    const fs::path mig_dir = dir / "legacy_upgrade";
+    fs::create_directories(mig_dir);
+    const fs::path old_settings = mig_dir / "settings.tsv";
+    const fs::path old_conns = mig_dir / "connections.tsv";
+    const fs::path new_db = mig_dir / "dbpp.sqlite3";
+    WriteTextFile(old_settings,
+                  "tray.enabled\tfalse\n"
+                  "tray.lightweight\ttrue\n"
+                  "theme.mode\tdark\n"
+                  "theme.preset\twarm_amber\n");
+    WriteTextFile(old_conns,
+                  "# db++ adbc connections v1\n"
+                  "migrated_pg\tpostgresql\tpostgresql://127.0.0.1:5432/demo\tdev\n");
+
+    const dbpp::TraySettings pre_open = dbpp::ConfigDbService::ReadStartupSettingsSync(new_db.string());
+    Expect(!pre_open.tray_enabled && pre_open.lightweight &&
+               pre_open.theme_mode == dbpp::ThemeMode::Dark &&
+               pre_open.theme_preset == dbpp::ThemePreset::WarmAmber,
+           "ReadStartupSettingsSync must fall back to settings.tsv before dbpp.sqlite3 exists");
+
+    const auto migrated_conns = dbpp::LoadConnectionProfiles(new_db.string());
+    const auto migrated_settings = dbpp::LoadTraySettings(new_db.string());
+    Expect(fs::exists(new_db) && fs::exists(old_settings) && fs::exists(old_conns),
+           "Migration must create dbpp.sqlite3 while preserving legacy TSV files");
+    Expect(migrated_conns.size() == 1 && migrated_conns[0].name == "migrated_pg" &&
+               migrated_conns[0].username == "dev",
+           "Legacy connections.tsv must auto-migrate into dbpp.sqlite3");
+    Expect(!migrated_settings.tray_enabled && migrated_settings.lightweight &&
+               migrated_settings.theme_mode == dbpp::ThemeMode::Dark &&
+               migrated_settings.theme_preset == dbpp::ThemePreset::WarmAmber,
+           "Legacy settings.tsv must auto-migrate into dbpp.sqlite3");
+  }
 
   const auto missing = InvokeCli({
       "profile",

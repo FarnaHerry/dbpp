@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+namespace dbpp {
+enum class DatabaseBrand;
+} // namespace dbpp
+
 namespace dbpp::ui {
 
 namespace font_size {
@@ -97,6 +101,9 @@ enum class ButtonTone {
 
 huxerui::View ActionButton(huxerui::View action, ButtonTone tone = ButtonTone::Default);
 huxerui::View AccentDot(huxerui::Color color, float size = 7.0F);
+huxerui::View DatabaseIcon(dbpp::DatabaseBrand brand, float size = 16.0F);
+huxerui::View DatabaseBadgeIcon(dbpp::DatabaseBrand brand, float icon_size = 20.0F,
+                                float tile_size = 34.0F);
 huxerui::View StatusBadge(std::string text, huxerui::Color foreground,
                           huxerui::Color background,
                           huxerui::Color border = huxerui::Color::Transparent());
@@ -104,7 +111,8 @@ huxerui::View TitleBarButton(std::string label, std::function<void()> on_click,
                              bool active = false);
 huxerui::View NavItem(std::string label, std::string detail, bool selected,
                       std::function<void()> on_click, huxerui::View trailing = {},
-                      std::optional<huxerui::Color> accent_dot = std::nullopt);
+                      std::optional<huxerui::Color> accent_dot = std::nullopt,
+                      huxerui::View leading = {});
 
 struct TreeRowOptions {
   std::string prefix;
@@ -117,6 +125,7 @@ struct TreeRowOptions {
   bool muted = false;
   std::optional<huxerui::Color> prefix_color{};
   std::optional<huxerui::Color> status_dot{};
+  huxerui::View leading_icon{};
 };
 
 huxerui::View TreeRow(TreeRowOptions options, std::function<void()> on_click = {});
@@ -128,6 +137,7 @@ struct WorkspaceTabItemOptions {
   bool dirty = false;
   std::optional<huxerui::Color> kind_accent{};
   bool is_sql = false;
+  huxerui::View leading_icon{};
 };
 
 huxerui::View WorkspaceTabItem(WorkspaceTabItemOptions options,

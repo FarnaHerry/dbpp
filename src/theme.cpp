@@ -1,4 +1,5 @@
 #include "theme.h"
+#include "app_resources.h"
 #include "model.h"
 
 #include <algorithm>
@@ -40,6 +41,53 @@ View AccentDot(Color color, float size) {
       Frame{.width = size, .height = size, .min_width = size, .max_width = size,
             .min_height = size, .max_height = size},
       CornerRadius{size * 0.5F}, Background{VisualFill{color}});
+}
+
+namespace {
+
+const huxerui::ImageResource& BrandImageResource(dbpp::DatabaseBrand brand) {
+  switch (brand) {
+    case dbpp::DatabaseBrand::Sqlite: return app::images::db_sqlite;
+    case dbpp::DatabaseBrand::Postgresql: return app::images::db_postgresql;
+    case dbpp::DatabaseBrand::Mysql: return app::images::db_mysql;
+    case dbpp::DatabaseBrand::Mariadb: return app::images::db_mariadb;
+    case dbpp::DatabaseBrand::Duckdb: return app::images::db_duckdb;
+    case dbpp::DatabaseBrand::Redis: return app::images::db_redis;
+    case dbpp::DatabaseBrand::Mssql: return app::images::db_mssql;
+    case dbpp::DatabaseBrand::Clickhouse: return app::images::db_clickhouse;
+    case dbpp::DatabaseBrand::FlightSql: return app::images::db_flightsql;
+    case dbpp::DatabaseBrand::Snowflake: return app::images::db_snowflake;
+    case dbpp::DatabaseBrand::BigQuery: return app::images::db_bigquery;
+    case dbpp::DatabaseBrand::Trino: return app::images::db_trino;
+    case dbpp::DatabaseBrand::Databricks: return app::images::db_databricks;
+    case dbpp::DatabaseBrand::Redshift: return app::images::db_redshift;
+    case dbpp::DatabaseBrand::Custom:
+    default:
+      return app::images::db_custom;
+  }
+}
+
+} // namespace
+
+View DatabaseIcon(dbpp::DatabaseBrand brand, float size) {
+  return Image(BrandImageResource(brand))
+      .Fit(ImageFit::Contain)
+      .With(Grow(0.0F),
+            Frame{.width = size, .height = size, .min_width = size, .max_width = size,
+                  .min_height = size, .max_height = size});
+}
+
+[[huxerui::composable]] View DatabaseBadgeIcon(dbpp::DatabaseBrand brand, float icon_size,
+                                               float tile_size) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  return Column{DatabaseIcon(brand, icon_size)}
+      .With(Grow(0.0F),
+            Frame{.width = tile_size, .height = tile_size, .min_width = tile_size,
+                  .max_width = tile_size, .min_height = tile_size, .max_height = tile_size},
+            MainAlign{MainAxisAlignment::Center}, CrossAlign{CrossAxisAlignment::Center},
+            CornerRadius{8.0F}, Background{VisualFill{spec.colors.surface_container_low}},
+            Border{semantic.border_subtle, 1.0F});
 }
 
 View StatusBadge(std::string text, Color foreground, Color background, Color border) {
@@ -149,7 +197,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
 
 [[huxerui::composable]] View NavItem(std::string label, std::string detail, bool selected,
                                      std::function<void()> on_click, View trailing,
-                                     std::optional<Color> accent_dot) {
+                                     std::optional<Color> accent_dot, View leading) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   auto interaction = UseState(InteractionState{});
@@ -170,7 +218,9 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
   }
 
   Views row_items;
-  if (accent_dot.has_value()) {
+  if (leading) {
+    row_items.Add(std::move(leading));
+  } else if (accent_dot.has_value()) {
     row_items.Add(AccentDot(*accent_dot, 8.0F));
   }
   row_items.Add(std::move(label_view).With(Grow(1.0F)));
@@ -248,7 +298,10 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
                      .LineLimit(1)
                      .With(Frame{.width = 12.0F}));
   }
-  if (options.status_dot.has_value()) {
+  const bool has_leading_icon = static_cast<bool>(options.leading_icon);
+  if (options.leading_icon) {
+    children.Add(std::move(options.leading_icon));
+  } else if (options.status_dot.has_value()) {
     children.Add(AccentDot(*options.status_dot, 7.0F));
   }
 
@@ -262,6 +315,10 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
                    .LineLimit(1)
                    .Overflow(TextOverflow::Ellipsis)
                    .With(Grow(1.0F)));
+
+  if (has_leading_icon && options.status_dot.has_value()) {
+    children.Add(AccentDot(*options.status_dot, 6.0F));
+  }
 
   if (!options.trailing_text.empty()) {
     children.Add(Text(options.trailing_text)
@@ -309,7 +366,9 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
                      : Font::System(font_size::kChip).WithWeight(FontWeight::Medium);
 
   Views label_parts;
-  if (options.kind_accent.has_value()) {
+  if (options.leading_icon) {
+    label_parts.Add(std::move(options.leading_icon));
+  } else if (options.kind_accent.has_value()) {
     label_parts.Add(AccentDot(*options.kind_accent, 6.0F));
   }
   if (options.dirty) {

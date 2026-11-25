@@ -1,4 +1,5 @@
 #include "model.h"
+#include "config_db.h"
 #include "theme.h"
 #include "adbc_session.h"
 #include "driver_installer.h"
@@ -191,19 +192,6 @@ bool ContainsIgnoreCaseAscii(std::string_view haystack, std::string_view needle)
   return it != haystack.end();
 }
 
-bool StartsWithIgnoreCaseAscii(std::string_view text, std::string_view prefix) {
-  if (text.size() < prefix.size()) {
-    return false;
-  }
-  for (std::size_t i = 0; i < prefix.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(text[i])) !=
-        std::tolower(static_cast<unsigned char>(prefix[i]))) {
-      return false;
-    }
-  }
-  return true;
-}
-
 std::string_view StripLeadingV(std::string_view text) {
   if (!text.empty() && (text.front() == 'v' || text.front() == 'V')) {
     text.remove_prefix(1);
@@ -371,37 +359,6 @@ View TableEmptyState(const std::string& text) {
          Background{semantic.hero_glow});
 }
 
-bool ProfileNeedsPasswordPrompt(const ConnectionProfile& profile) {
-  const std::string_view uri = profile.uri;
-  const bool is_redis_scheme =
-      StartsWithIgnoreCaseAscii(uri, "redis://") || StartsWithIgnoreCaseAscii(uri, "rediss://");
-  if (!is_redis_scheme &&
-      (ContainsIgnoreCaseAscii(profile.driver_path, "sqlite") ||
-       ContainsIgnoreCaseAscii(profile.driver_path, "duckdb"))) {
-    return false;
-  }
-  const std::size_t scheme_pos = uri.find("://");
-  if (scheme_pos != std::string_view::npos) {
-    const std::size_t auth_start = scheme_pos + 3;
-    const std::size_t auth_end_pos = uri.find_first_of("/?#", auth_start);
-    const std::size_t auth_end =
-        auth_end_pos == std::string_view::npos ? uri.size() : auth_end_pos;
-    const std::string_view authority = uri.substr(auth_start, auth_end - auth_start);
-    const std::size_t at = authority.rfind('@');
-    if (at != std::string_view::npos) {
-      const std::string_view userinfo = authority.substr(0, at);
-      if (userinfo.find(':') != std::string_view::npos) {
-        return false;
-      }
-    }
-    return true;
-  }
-  if (ContainsIgnoreCaseAscii(uri, "host=")) {
-    return !ContainsIgnoreCaseAscii(uri, "password=");
-  }
-  return false;
-}
-
 std::optional<std::size_t> FindMatchingSessionIndex(const ConnectionProfile& profile,
                                                     const std::vector<DbSession>& sessions,
                                                     const std::vector<bool>& claimed) {
@@ -423,50 +380,178 @@ std::optional<std::size_t> FindMatchingSessionIndex(const ConnectionProfile& pro
   return std::nullopt;
 }
 
-[[huxerui::composable]] View SavedProfilePasswordDialog(
-    DialogContext dialog, ConnectionProfile profile, State<AppModel> app,
-    State<WorkspaceModel> workspace, TaskScope tasks, NotifyFn notify) {
-  const std::string display_name =
-      profile.name.empty() ? UriDisplayName(profile.uri) : profile.name;
-  auto username = UseState(TextEditingValue::FromText(profile.username));
-  auto password = UseState(TextEditingValue::FromText({}));
+bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config_db,
+                                  const std::string& profiles_path,
+                                  const std::vector<ConnectionProfile>& list) {
+  if (config_db) {
+    config_db->PersistConnections(list);
+    return true;
+  }
+  return !profiles_path.empty() && SaveConnectionProfiles(profiles_path, list);
+}
 
-  const auto connect = [dialog, profile, username, password, app, workspace, tasks, notify,
-                        display_name] {
+[[huxerui::composable]] View EditConnectionProfileDialog(
+    DialogContext dialog, std::optional<ConnectionProfile> original_profile,
+    ConnectionProfile initial_values, std::optional<std::uint64_t> active_session_id,
+    State<AppModel> app, State<WorkspaceModel> workspace,
+    State<std::vector<ConnectionProfile>> profiles, std::string profiles_path, TaskScope tasks,
+    NotifyFn notify) {
+  const auto config_db = UseService<ConfigDbService>();
+  auto name = UseState(TextEditingValue::FromText(initial_values.name));
+  auto driver = UseState(TextEditingValue::FromText(initial_values.driver_path));
+  auto uri = UseState(TextEditingValue::FromText(initial_values.uri));
+  auto username = UseState(TextEditingValue::FromText(initial_values.username));
+  auto password = UseState(TextEditingValue::FromText(initial_values.password));
+  auto show_password = UseState(false);
+
+  const auto persist_profile = [original_profile, name, driver, uri, username, password,
+                                profiles, profiles_path, config_db,
+                                notify](ConnectionProfile& out_profile) {
+    const std::string driver_text = TrimmedSql(driver.Get().text);
+    const std::string uri_raw = TrimmedSql(uri.Get().text);
+    if (driver_text.empty() || uri_raw.empty()) {
+      if (notify) {
+        notify("ADBC 驱动与连接 URI 都不能为空");
+      }
+      return false;
+    }
+    const SanitizedUriResult sanitized = SanitizeUriCredentials(uri_raw);
+    const std::string title_text = TrimmedSql(name.Get().text);
+    const std::string user_text =
+        username.Get().text.empty() ? sanitized.username : username.Get().text;
+    const std::string pass_text =
+        password.Get().text.empty() ? sanitized.password : password.Get().text;
+    out_profile = ConnectionProfile{
+        .name = title_text.empty() ? UriDisplayName(sanitized.uri) : title_text,
+        .driver_path = driver_text,
+        .uri = sanitized.uri,
+        .username = user_text,
+        .password = pass_text,
+    };
+
+    if (!profiles_path.empty()) {
+      std::vector<ConnectionProfile> list = profiles.Get();
+      bool replaced = false;
+      if (original_profile.has_value()) {
+        if (auto it = std::ranges::find(list, *original_profile); it != list.end()) {
+          *it = out_profile;
+          replaced = true;
+        } else {
+          for (ConnectionProfile& existing : list) {
+            if (existing.name == original_profile->name &&
+                existing.uri == original_profile->uri) {
+              existing = out_profile;
+              replaced = true;
+              break;
+            }
+          }
+        }
+      }
+      if (!replaced) {
+        for (ConnectionProfile& existing : list) {
+          if (existing.name == out_profile.name) {
+            existing = out_profile;
+            replaced = true;
+            break;
+          }
+        }
+      }
+      if (!replaced) {
+        list.push_back(out_profile);
+      }
+      if (!PersistConnectionProfileList(config_db, profiles_path, list)) {
+        if (notify) {
+          notify("保存连接配置失败: " + profiles_path);
+        }
+        return false;
+      }
+      profiles = std::move(list);
+    }
+    return true;
+  };
+
+  const auto save_only = [dialog, persist_profile, notify] {
+    ConnectionProfile saved;
+    if (!persist_profile(saved)) {
+      return;
+    }
+    dialog.Dismiss();
+    if (notify) {
+      notify("已更新连接配置 " + saved.name);
+    }
+  };
+
+  const auto save_and_connect = [dialog, persist_profile, active_session_id, app, workspace,
+                                 tasks, notify] {
+    ConnectionProfile saved;
+    if (!persist_profile(saved)) {
+      return;
+    }
+    if (active_session_id.has_value()) {
+      CloseSession(app, workspace, tasks, *active_session_id, {});
+    }
     ConnectionRequest request{
-        .driver_path = profile.driver_path,
-        .uri = profile.uri,
-        .username = username.Get().text,
-        .password = password.Get().text,
-        .title = display_name,
+        .driver_path = saved.driver_path,
+        .uri = saved.uri,
+        .username = saved.username,
+        .password = saved.password,
+        .title = saved.name,
     };
     OpenConnection(app, workspace, tasks, std::move(request), notify);
     dialog.Dismiss();
   };
 
+  const DatabaseBrand icon_brand = DetectDatabaseBrand(driver.Get().text, uri.Get().text);
   return DialogCard(Column{
       Row{
-          Text("连接 " + display_name, TextRole::Title),
+          DatabaseIcon(icon_brand, 20.0F),
+          Text("编辑连接", TextRole::Title),
           Spacer(),
           ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button("连接").OnClick(connect), ButtonTone::Primary),
+          ActionButton(Button("保存").OnClick(save_only)),
+          ActionButton(Button(active_session_id.has_value() ? "保存并重连" : "保存并连接")
+                           .OnClick(save_and_connect),
+                       ButtonTone::Primary),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText(profile.uri),
+      TextField(name)
+          .Label("显示名称（可选）")
+          .Placeholder("留空则自动命名")
+          .Variant(TextFieldVariant::Outlined)
+          .LineLimits(TextFieldLineLimits::SingleLine())
+          .OnChanged([name](const TextEditingValue& value) { name = value; }),
+      MonospaceField(
+          TextField(driver)
+              .Label("ADBC 驱动（短名或路径）")
+              .Placeholder("redis · postgresql · /path/to/libadbc_driver_*.so")
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([driver](const TextEditingValue& value) { driver = value; })),
+      MonospaceField(
+          TextField(uri)
+              .Label("连接 URI")
+              .Placeholder("redis://127.0.0.1:6379/0 · postgresql://127.0.0.1:5432/postgres")
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([uri](const TextEditingValue& value) { uri = value; })),
       TextField(username)
-          .Label("用户名")
+          .Label("用户名（可选）")
           .Variant(TextFieldVariant::Outlined)
           .LineLimits(TextFieldLineLimits::SingleLine())
-          .OnChanged([username](const TextEditingValue& value) { username = value; })
-          .OnSubmitted([connect] { connect(); }),
-      TextField(password)
-          .Label("密码（不保存，留空则无密码连接）")
-          .Variant(TextFieldVariant::Outlined)
-          .LineLimits(TextFieldLineLimits::SingleLine())
-          .Secure(true)
-          .OnChanged([password](const TextEditingValue& value) { password = value; })
-          .OnSubmitted([connect] { connect(); }),
+          .OnChanged([username](const TextEditingValue& value) { username = value; }),
+      Row{
+          TextField(password)
+              .Label("密码（可选，留空则无密码）")
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .Secure(!show_password.Get())
+              .OnChanged([password](const TextEditingValue& value) { password = value; })
+              .OnSubmitted([save_and_connect] { save_and_connect(); })
+              .With(Grow(1.0F)),
+          ActionButton(Button(show_password.Get() ? "隐藏" : "显示")
+                           .OnClick([show_password] { show_password = !show_password.Get(); })),
+      }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-                    .With(Frame{.width = 480.0F}));
+                    .With(Frame{.width = 540.0F}));
 }
 
 struct SidebarObjectGroup {
@@ -684,13 +769,15 @@ std::string ObjectKindLabel(const DbObject& object) {
 [[huxerui::composable]] View DeleteSavedProfileDialog(
     DialogContext dialog, ConnectionProfile profile, std::string display_name,
     State<std::vector<ConnectionProfile>> profiles, std::string profiles_path, NotifyFn notify) {
-  const auto confirm = [dialog, profile, display_name, profiles, profiles_path, notify] {
+  const auto config_db = UseService<ConfigDbService>();
+  const auto confirm = [dialog, profile, display_name, profiles, profiles_path, config_db,
+                        notify] {
     std::vector<ConnectionProfile> updated = profiles.Get();
     const auto it = std::ranges::find(updated, profile);
     if (it != updated.end()) {
       updated.erase(it);
     }
-    if (!SaveConnectionProfiles(profiles_path, updated)) {
+    if (!PersistConnectionProfileList(config_db, profiles_path, updated)) {
       if (notify) {
         notify("保存连接配置失败");
       }
@@ -763,6 +850,7 @@ struct SidebarConnectionEntry {
     std::function<void(ConnectionProfile)> connect_profile) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const auto config_db = UseService<ConfigDbService>();
   const auto menu = UseMenu();
   const auto dialogs = UseDialog();
   const auto clipboard = UseApplication().Clipboard();
@@ -847,8 +935,9 @@ struct SidebarConnectionEntry {
     }
   }
 
-  const auto reorder_connections = [profiles, profiles_path, custom_order, notify, natural_keys,
-                                    candidates](std::string from_key, std::string to_key) {
+  const auto reorder_connections = [profiles, profiles_path, config_db, custom_order, notify,
+                                    natural_keys, candidates](std::string from_key,
+                                                              std::string to_key) {
     const std::vector<std::string> next_order =
         ReorderConnectionKeys(natural_keys, custom_order.Get(), from_key, to_key);
     custom_order = next_order;
@@ -865,7 +954,7 @@ struct SidebarConnectionEntry {
     }
     if (reordered_profiles != profiles.Get()) {
       profiles = reordered_profiles;
-      if (!SaveConnectionProfiles(profiles_path, reordered_profiles) && notify) {
+      if (!PersistConnectionProfileList(config_db, profiles_path, reordered_profiles) && notify) {
         notify("保存连接顺序失败");
       }
     }
@@ -894,6 +983,17 @@ struct SidebarConnectionEntry {
       const ConnectionProfile& profile = *entry.profile;
       const std::string display_name =
           profile.name.empty() ? UriDisplayName(profile.uri) : profile.name;
+      const auto open_edit_profile_dialog = [dialogs, profile, app, workspace, profiles,
+                                             profiles_path, tasks, notify, theme_config,
+                                             system_dark] {
+        dialogs.Show([profile, app, workspace, profiles, profiles_path, tasks, notify,
+                      theme_config, system_dark](DialogContext dialog) {
+          return WithDialogTheme(
+              theme_config, system_dark,
+              EditConnectionProfileDialog(dialog, profile, profile, std::nullopt, app, workspace,
+                                          profiles, profiles_path, tasks, notify));
+        });
+      };
       const auto open_delete_profile_dialog = [dialogs, profile, display_name, profiles,
                                                profiles_path, notify, theme_config, system_dark] {
         dialogs.Show([profile, display_name, profiles, profiles_path, notify, theme_config,
@@ -916,6 +1016,8 @@ struct SidebarConnectionEntry {
                       .muted = true,
                       .prefix_color = std::nullopt,
                       .status_dot = WithAlpha(spec.colors.on_surface_variant, 0.45F),
+                      .leading_icon =
+                          DatabaseIcon(DetectDatabaseBrand(profile.driver_path, profile.uri), 15.0F),
                   },
                   [connect_profile, profile] { connect_profile(profile); })
               .With(Grow(1.0F),
@@ -927,10 +1029,11 @@ struct SidebarConnectionEntry {
               .On<DragSourceEvents::Canceled>(
                   [drop_hover_key](const DragEvent&) { drop_hover_key = std::string{}; })
               .On<ViewEvents::ContextMenuRequested>(
-                  [menu, connect_profile, profile, copy_text, open_delete_profile_dialog](
-                      Point position) {
+                  [menu, connect_profile, profile, copy_text, open_edit_profile_dialog,
+                   open_delete_profile_dialog](Point position) {
                     menu.ShowAt(position, {
                         MenuItem("连接", [connect_profile, profile] { connect_profile(profile); }),
+                        MenuItem("编辑连接…", open_edit_profile_dialog),
                         MenuSection{},
                         MenuItem("复制连接 URI",
                                  [copy_text, uri = profile.uri] { copy_text(uri, "连接 URI"); }),
@@ -1030,6 +1133,8 @@ struct SidebarConnectionEntry {
                 .muted = false,
                 .prefix_color = std::nullopt,
                 .status_dot = semantic.success,
+                .leading_icon = DatabaseIcon(
+                    DetectDatabaseBrand(session.driver_path, session.uri, session.dialect), 15.0F),
             },
             toggle_session)
             .With(Grow(1.0F),
@@ -1040,6 +1145,27 @@ struct SidebarConnectionEntry {
                 [drop_hover_key](const DragDropResult&) { drop_hover_key = std::string{}; })
             .On<DragSourceEvents::Canceled>(
                 [drop_hover_key](const DragEvent&) { drop_hover_key = std::string{}; });
+
+    const ConnectionProfile edit_initial = entry.profile.value_or(ConnectionProfile{
+        .name = session.name,
+        .driver_path = session.driver_path,
+        .uri = session.uri,
+        .username = {},
+        .password = {},
+    });
+    const std::optional<ConnectionProfile> edit_original = entry.profile;
+    const auto open_edit_session_dialog = [dialogs, edit_original, edit_initial, session_id, app,
+                                           workspace, profiles, profiles_path, tasks, notify,
+                                           theme_config, system_dark] {
+      dialogs.Show([edit_original, edit_initial, session_id, app, workspace, profiles,
+                    profiles_path, tasks, notify, theme_config,
+                    system_dark](DialogContext dialog) {
+        return WithDialogTheme(
+            theme_config, system_dark,
+            EditConnectionProfileDialog(dialog, edit_original, edit_initial, session_id, app,
+                                        workspace, profiles, profiles_path, tasks, notify));
+      });
+    };
 
     tree_rows.Add(
         Row{std::move(connection_row), std::move(close)}
@@ -1067,7 +1193,7 @@ struct SidebarConnectionEntry {
                 })
             .On<ViewEvents::ContextMenuRequested>(
                 [menu, is_expanded, toggle_session, refresh_session, app, workspace, copy_text,
-                 disconnect_session, session_id, uri = session.uri,
+                 open_edit_session_dialog, disconnect_session, session_id, uri = session.uri,
                  session_name = session.name, is_redis = (session.dialect == Dialect::Redis),
                  notify](Point position) {
                   menu.ShowAt(position, {
@@ -1080,6 +1206,7 @@ struct SidebarConnectionEntry {
                                  (void)OpenSqlTab(app, workspace, session_id);
                                }),
                       MenuSection{},
+                      MenuItem("编辑连接…", open_edit_session_dialog),
                       MenuItem("复制连接 URI",
                                [copy_text, uri] { copy_text(uri, "连接 URI"); }),
                       MenuSection{},
@@ -1356,6 +1483,7 @@ struct SidebarConnectionEntry {
 
 [[huxerui::composable]] View AdbcManagerDialog(DialogContext dialog,
                                                    AdbcManagerContext context) {
+  const auto config_db = UseService<ConfigDbService>();
   auto profiles = context.profiles;
   auto dialog_tasks = UseTaskScope();
   auto tab = UseState(context.initial_tab);
@@ -1496,7 +1624,8 @@ struct SidebarConnectionEntry {
     });
   };
 
-  const auto save_profile = [context, profiles, selected, driver, uri, username, name]() -> bool {
+  const auto save_profile = [context, config_db, profiles, selected, driver, uri, username,
+                             password, name]() -> bool {
     const std::string driver_path = driver.Get().text;
     const std::string uri_text = uri.Get().text;
     if (driver_path.empty() || uri_text.empty()) {
@@ -1508,11 +1637,14 @@ struct SidebarConnectionEntry {
     const SanitizedUriResult sanitized = SanitizeUriCredentials(uri_text);
     const std::string effective_user =
         username.Get().text.empty() ? sanitized.username : username.Get().text;
+    const std::string effective_password =
+        password.Get().text.empty() ? sanitized.password : password.Get().text;
     ConnectionProfile profile{
         .name = name.Get().text.empty() ? UriDisplayName(sanitized.uri) : name.Get().text,
         .driver_path = driver_path,
         .uri = sanitized.uri,
         .username = effective_user,
+        .password = effective_password,
     };
     std::vector<ConnectionProfile> list = profiles.Get();
     int index = selected.Get();
@@ -1522,7 +1654,7 @@ struct SidebarConnectionEntry {
       list.push_back(profile);
       index = static_cast<int>(list.size()) - 1;
     }
-    if (!SaveConnectionProfiles(context.profiles_path, list)) {
+    if (!PersistConnectionProfileList(config_db, context.profiles_path, list)) {
       if (context.notify) {
         context.notify("保存连接配置失败: " + context.profiles_path);
       }
@@ -1537,7 +1669,7 @@ struct SidebarConnectionEntry {
     return true;
   };
 
-  const auto delete_profile = [context, profiles, selected, name] {
+  const auto delete_profile = [context, config_db, profiles, selected, name] {
     const int index = selected.Get();
     std::vector<ConnectionProfile> list = profiles.Get();
     if (index < 0 || static_cast<std::size_t>(index) >= list.size()) {
@@ -1546,7 +1678,7 @@ struct SidebarConnectionEntry {
     const auto position = list.begin() + index;
     const std::string removed = position->name.empty() ? position->uri : position->name;
     list.erase(position);
-    if (!SaveConnectionProfiles(context.profiles_path, list)) {
+    if (!PersistConnectionProfileList(config_db, context.profiles_path, list)) {
       if (context.notify) {
         context.notify("删除后保存失败: " + context.profiles_path);
       }
@@ -1595,10 +1727,12 @@ struct SidebarConnectionEntry {
                   driver = TextEditingValue::FromText(value.driver_path);
                   uri = TextEditingValue::FromText(value.uri);
                   username = TextEditingValue::FromText(value.username);
-                  password = TextEditingValue::FromText({});
+                  password = TextEditingValue::FromText(value.password);
                   name = TextEditingValue::FromText(value.name);
                   selected = static_cast<int>(index);
-                })
+                },
+                {}, std::nullopt,
+                DatabaseIcon(DetectDatabaseBrand(profile.driver_path, profile.uri), 18.0F))
             .Key("profile-" + std::to_string(index) + "-" + profile.uri));
   }
 
@@ -1609,7 +1743,8 @@ struct SidebarConnectionEntry {
     const std::string& detail = info.detail.empty() ? info.path : info.detail;
     driver_rows.Add(
         NavItem(info.name, detail, driver.Get().text == info.path,
-                [driver, info] { driver = TextEditingValue::FromText(info.path); })
+                [driver, info] { driver = TextEditingValue::FromText(info.path); }, {},
+                std::nullopt, DatabaseIcon(DetectDatabaseBrand(info.path + " " + info.name), 18.0F))
             .Key("driver-" + info.path + "-" + detail));
   }
 
@@ -1656,7 +1791,7 @@ struct SidebarConnectionEntry {
               .OnChanged([username](const TextEditingValue& value) { username = value; })
               .With(Grow(1.0F)),
           TextField(password)
-              .Label("密码（不保存）")
+              .Label("密码（可选）")
               .Variant(TextFieldVariant::Outlined)
               .Secure(true)
               .OnChanged([password](const TextEditingValue& value) { password = value; })
@@ -1670,8 +1805,9 @@ struct SidebarConnectionEntry {
   }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
 
   View manage_tab = Column{
-      MutedText("保存的连接不含密码；自动发现标准 ADBC manifest 目录、ADBC_DRIVER_PATH、"
-                "DBPP_ADBC_DRIVERS 与系统库目录，支持短名、.toml 与动态库路径。"),
+      MutedText("连接配置（默认保留可选密码）保存在 dbpp.sqlite3；自动发现标准 ADBC manifest "
+                "目录、ADBC_DRIVER_PATH、DBPP_ADBC_DRIVERS 与系统库目录，支持短名、.toml "
+                "与动态库路径。"),
       Row{
           std::move(saved_panel),
           Divider(Axis::Vertical),
@@ -1753,7 +1889,8 @@ struct SidebarConnectionEntry {
     }
 
     registry_rows.Add(
-        NavItem(item.name + " (" + item.slug + ")", detail, false, {}, std::move(trailing))
+        NavItem(item.name + " (" + item.slug + ")", detail, false, {}, std::move(trailing),
+                std::nullopt, DatabaseIcon(DetectDatabaseBrand(item.slug + " " + item.name), 20.0F))
             .Key("registry-" + item.slug));
   }
 
@@ -1826,6 +1963,7 @@ struct SidebarConnectionEntry {
 }
 
 [[huxerui::composable]] View ConnectDialog(DialogContext dialog, ConnectContext context) {
+  const auto config_db = UseService<ConfigDbService>();
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   auto dialog_tasks = UseTaskScope();
@@ -1949,14 +2087,6 @@ struct SidebarConnectionEntry {
     grid_rows.Reserve((visible.size() + 1) / 2);
     const auto make_card = [spec, semantic, &driver_list,
                             select_preset](const DatabasePreset& preset) {
-      Color cat_dot = semantic.category_relational;
-      switch (preset.category) {
-        case DatabaseCategory::LocalFile: cat_dot = semantic.category_local; break;
-        case DatabaseCategory::Relational: cat_dot = semantic.category_relational; break;
-        case DatabaseCategory::KeyValue: cat_dot = semantic.danger; break;
-        case DatabaseCategory::AnalyticsCloud: cat_dot = semantic.category_analytics; break;
-        case DatabaseCategory::Custom: cat_dot = semantic.category_custom; break;
-      }
       View badge;
       if (preset.builtin) {
         badge = StatusBadge("内置", semantic.success, semantic.success_container,
@@ -1973,7 +2103,8 @@ struct SidebarConnectionEntry {
       }
       View nav = NavItem(
           preset.name, preset.subtitle, false,
-          [select_preset, preset]() mutable { select_preset(preset); }, std::move(badge), cat_dot);
+          [select_preset, preset]() mutable { select_preset(preset); }, std::move(badge),
+          std::nullopt, DatabaseBadgeIcon(DetectDatabaseBrand(preset.id), 20.0F, 34.0F));
       return Column{std::move(nav)}
           .With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch},
                 Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
@@ -2130,8 +2261,8 @@ struct SidebarConnectionEntry {
     });
   };
 
-  const auto connect = [context, active_preset, input_mode, driver, uri, host, port, database,
-                        username, password, title, save_profile_flag, dialog] {
+  const auto connect = [context, config_db, active_preset, input_mode, driver, uri, host, port,
+                        database, username, password, title, save_profile_flag, dialog] {
     const std::string effective_uri =
         (active_preset.form_kind == ConnectionFormKind::HostPort && input_mode.Get() == 0)
             ? ComposePresetUri(active_preset, host.Get().text, port.Get().text, database.Get().text)
@@ -2158,6 +2289,7 @@ struct SidebarConnectionEntry {
           .driver_path = request.driver_path,
           .uri = request.uri,
           .username = request.username,
+          .password = request.password,
       };
       std::vector<ConnectionProfile> list = context.profiles.Get();
       bool updated = false;
@@ -2169,9 +2301,19 @@ struct SidebarConnectionEntry {
         }
       }
       if (!updated) {
+        for (ConnectionProfile& existing : list) {
+          if (existing.driver_path == profile.driver_path && existing.uri == profile.uri &&
+              existing.username == profile.username) {
+            existing = profile;
+            updated = true;
+            break;
+          }
+        }
+      }
+      if (!updated) {
         list.push_back(profile);
       }
-      if (!SaveConnectionProfiles(context.profiles_path, list)) {
+      if (!PersistConnectionProfileList(config_db, context.profiles_path, list)) {
         if (context.notify) {
           context.notify("保存连接配置失败: " + context.profiles_path);
         }
@@ -2297,7 +2439,7 @@ struct SidebarConnectionEntry {
                   .OnChanged([username](const TextEditingValue& value) { username = value; })
                   .With(Grow(1.0F)),
               TextField(password)
-                  .Label("密码（不保存）")
+                  .Label("密码（可选）")
                   .Variant(TextFieldVariant::Outlined)
                   .LineLimits(TextFieldLineLimits::SingleLine())
                   .Secure(true)
@@ -2325,7 +2467,7 @@ struct SidebarConnectionEntry {
                   .OnChanged([username](const TextEditingValue& value) { username = value; })
                   .With(Grow(1.0F)),
               TextField(password)
-                  .Label("密码（不保存）")
+                  .Label("密码（可选）")
                   .Variant(TextFieldVariant::Outlined)
                   .LineLimits(TextFieldLineLimits::SingleLine())
                   .Secure(true)
@@ -2365,7 +2507,7 @@ struct SidebarConnectionEntry {
                 .OnChanged([username](const TextEditingValue& value) { username = value; })
                 .With(Grow(1.0F)),
             TextField(password)
-                .Label("密码（不保存）")
+                .Label("密码（可选）")
                 .Variant(TextFieldVariant::Outlined)
                 .LineLimits(TextFieldLineLimits::SingleLine())
                 .Secure(true)
@@ -2393,7 +2535,9 @@ struct SidebarConnectionEntry {
       const std::string& detail = info.detail.empty() ? info.path : info.detail;
       discovered_rows.Add(
           NavItem(info.name, detail, driver.Get().text == info.path,
-                  [driver, info] { driver = TextEditingValue::FromText(info.path); })
+                  [driver, info] { driver = TextEditingValue::FromText(info.path); }, {},
+                  std::nullopt,
+                  DatabaseIcon(DetectDatabaseBrand(info.path + " " + info.name), 18.0F))
               .Key("custom-driver-" + info.path + "-" + detail));
     }
     if (discovered_rows.Size() > 0) {
@@ -2427,7 +2571,7 @@ struct SidebarConnectionEntry {
                 .OnChanged([username](const TextEditingValue& value) { username = value; })
                 .With(Grow(1.0F)),
             TextField(password)
-                .Label("密码（不保存）")
+                .Label("密码（可选）")
                 .Variant(TextFieldVariant::Outlined)
                 .LineLimits(TextFieldLineLimits::SingleLine())
                 .Secure(true)
@@ -2444,7 +2588,7 @@ struct SidebarConnectionEntry {
   }
 
   form_fields.Add(
-      Switch("保存到已保存连接（connections.tsv，不含密码）", save_profile_flag)
+      Switch("保存到已保存连接（默认保留密码）", save_profile_flag)
           .OnChanged([save_profile_flag](bool value) { save_profile_flag = value; }));
 
   View step1_body = Column{
@@ -2452,6 +2596,7 @@ struct SidebarConnectionEntry {
           ActionButton(Button("← 选择类型").OnClick([step] {
             step = 0;
           })),
+          DatabaseIcon(DetectDatabaseBrand(active_preset.id), 22.0F),
           Text("连接 " + active_preset.name, TextRole::Title),
           Spacer(),
           ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
@@ -3186,7 +3331,8 @@ struct SidebarConnectionEntry {
 
   return Column{
       Row{
-          AccentDot(semantic.accent_sql, 8.0F),
+          DatabaseIcon(DetectDatabaseBrand(session->driver_path, session->uri, session->dialect),
+                       20.0F),
           Text(is_redis ? "Redis 控制台" : "SQL", TextRole::Title),
           MutedText(session->name),
           Spacer(),
@@ -3238,7 +3384,7 @@ struct SidebarConnectionEntry {
   const bool system_dark = UseSystemThemeBrightness() == ThemeBrightness::Dark;
   const AppThemeConfig theme_config = settings->ThemeConfig();
 
-  // 明暗真正变化时使用圆形扩散过渡（参考 Clash-Flux），并将偏好持久化到 settings.tsv。
+  // 明暗真正变化时使用圆形扩散过渡（参考 Clash-Flux），并将偏好持久化到 dbpp.sqlite3。
   const auto apply_mode = [settings, notify, transition, tasks, animating, system_dark,
                            current_mode = theme_config.mode,
                            motion = spec.motion](ThemeMode next_mode) {
@@ -3366,12 +3512,19 @@ struct SidebarConnectionEntry {
   auto picker = UseService<FilePicker>();
   auto http = UseService<HttpClient>();
   auto application = UseApplication();
+  const auto config_db = UseService<ConfigDbService>();
   const File profile_dir = application.Directories().data_directory;
-  const std::string profiles_path = profile_dir.Child("connections.tsv").Path();
+  const std::string profiles_path = profile_dir.Child("dbpp.sqlite3").Path();
   const File default_file = application.Directories().data_directory.Child("untitled.sqlite");
   auto profiles = UseState(std::vector<ConnectionProfile>{});
-  Lifecycle([profiles, profiles_path] {
-    profiles = LoadConnectionProfiles(profiles_path);
+  Lifecycle([profiles, profiles_path, config_db, tasks] {
+    if (config_db) {
+      tasks.Launch([profiles, config_db]() -> Task<void> {
+        profiles = co_await config_db->LoadConnectionsAsync();
+      });
+    } else {
+      profiles = LoadConnectionProfiles(profiles_path);
+    }
     return [] {};
   });
 
@@ -3522,26 +3675,18 @@ struct SidebarConnectionEntry {
     (void)OpenSqlTab(app, workspace, active_session->id);
   };
 
-  const auto connect_profile = [dialogs, app, workspace, tasks, notify, theme_config, system_dark,
+  const auto connect_profile = [app, workspace, tasks, notify,
                                 show_settings](ConnectionProfile profile) {
     show_settings = false;
-    if (!ProfileNeedsPasswordPrompt(profile)) {
-      ConnectionRequest request{
-          .driver_path = profile.driver_path,
-          .uri = profile.uri,
-          .username = profile.username,
-          .password = {},
-          .title = profile.name.empty() ? UriDisplayName(profile.uri) : profile.name,
-      };
-      OpenConnection(app, workspace, tasks, std::move(request), notify);
-      return;
-    }
-    dialogs.Show([profile = std::move(profile), app, workspace, tasks, notify, theme_config,
-                  system_dark](DialogContext dialog) {
-      return WithDialogTheme(
-          theme_config, system_dark,
-          SavedProfilePasswordDialog(dialog, profile, app, workspace, tasks, notify));
-    });
+    const SanitizedUriResult sanitized = SanitizeUriCredentials(profile.uri);
+    ConnectionRequest request{
+        .driver_path = profile.driver_path,
+        .uri = sanitized.uri,
+        .username = profile.username.empty() ? sanitized.username : profile.username,
+        .password = profile.password.empty() ? sanitized.password : profile.password,
+        .title = profile.name.empty() ? UriDisplayName(sanitized.uri) : profile.name,
+    };
+    OpenConnection(app, workspace, tasks, std::move(request), notify);
   };
 
   const auto request_close_tabs = [dialogs, app, workspace, theme_config,
@@ -3632,6 +3777,13 @@ struct SidebarConnectionEntry {
       const Color tab_accent = t.kind == WorkspaceTabKind::Sql
                                    ? semantic.accent_sql
                                    : (t.is_view ? semantic.accent_view : semantic.accent_table);
+      DatabaseBrand tab_brand = DetectDatabaseBrand({}, t.session_uri);
+      for (const DbSession& open : model.sessions) {
+        if (open.id == t.session_id) {
+          tab_brand = DetectDatabaseBrand(open.driver_path, open.uri, open.dialect);
+          break;
+        }
+      }
       tab_items.Add(
           WorkspaceTabItem(
               WorkspaceTabItemOptions{
@@ -3641,6 +3793,7 @@ struct SidebarConnectionEntry {
                   .dirty = dirty,
                   .kind_accent = tab_accent,
                   .is_sql = t.kind == WorkspaceTabKind::Sql,
+                  .leading_icon = DatabaseIcon(tab_brand, 14.0F),
               },
               [app, workspace, tid] { ActivateWorkspaceTab(app, workspace, tid); },
               [request_close_tabs, tid] { request_close_tabs({tid}); })

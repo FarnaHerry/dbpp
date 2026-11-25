@@ -2,9 +2,9 @@
 #
 # 参考 Clash-Flux/.github/workflows/build.yml 适配，按桌面项目裁剪：
 #   * 使用标准 C++20（无 C++23 modules / import std），无需额外 LLVM 工具链；
-#   * 通过 cmake/FindSQLite3.cmake（DBPP_USE_VENDORED_SQLITE3=ON）直接编译 ADBC
-#     内置 SQLite3，避免各平台打包依赖外部 sqlite3 动态库或 vcpkg；
-#   * HuxerUI 源码钉在 HUXERUI_COMMIT，clone 到 third_party/huxerui/（已 gitignore）。
+#   * 通过 cmake/FindSQLite3.cmake（DBPP_USE_VENDORED_SQLITE3=ON）直接编译 Lib-SQLite
+#     内置 SQLite3，与 HuxerUI::SQLite 共用同一份 SQLite 源码，避免各平台依赖外部 sqlite3；
+#   * HuxerUI 与 Lib-SQLite 源码钉在 COMMIT，分别 clone 到 third_party/{huxerui,Lib-SQLite}/（已 gitignore）。
 
 name: build
 
@@ -32,6 +32,8 @@ concurrency:
 env:
   HUXERUI_REPO: 'https://github.com/FarnaHerry/HuxerUI.git'
   HUXERUI_COMMIT: 'b581978c9412baf49dedaded38b7e0d55757d579'
+  LIB_SQLITE_REPO: 'https://github.com/FarnaHerry/Lib-SQLite.git'
+  LIB_SQLITE_COMMIT: '882665a9772cc973b1cbfb7f491913703da1d636'
 
 jobs:
   # ------------------------------------------------------------------ Linux
@@ -91,12 +93,14 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Fetch HuxerUI source (pinned)
+      - name: Fetch HuxerUI & Lib-SQLite sources (pinned)
         shell: bash
         run: |
           set -euo pipefail
           git clone --filter=blob:none "$HUXERUI_REPO" third_party/huxerui
           git -C third_party/huxerui checkout "$HUXERUI_COMMIT"
+          git clone --filter=blob:none "$LIB_SQLITE_REPO" third_party/Lib-SQLite
+          git -C third_party/Lib-SQLite checkout "$LIB_SQLITE_COMMIT"
 
       - name: Configure
         run: |
@@ -176,12 +180,14 @@ jobs:
         shell: pwsh
         run: Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE
 
-      - name: Fetch HuxerUI source (pinned)
+      - name: Fetch HuxerUI & Lib-SQLite sources (pinned)
         shell: bash
         run: |
           set -euo pipefail
           git clone --filter=blob:none "$HUXERUI_REPO" third_party/huxerui
           git -C third_party/huxerui checkout "$HUXERUI_COMMIT"
+          git clone --filter=blob:none "$LIB_SQLITE_REPO" third_party/Lib-SQLite
+          git -C third_party/Lib-SQLite checkout "$LIB_SQLITE_COMMIT"
 
       - name: Ensure CMake >= 4.4 and Ninja
         shell: pwsh
@@ -384,11 +390,13 @@ jobs:
           DEVELOPER_DIR="$dev_dir" xcodebuild -version
           DEVELOPER_DIR="$dev_dir" xcrun clang++ --version
 
-      - name: Fetch HuxerUI source (pinned)
+      - name: Fetch HuxerUI & Lib-SQLite sources (pinned)
         run: |
           set -euo pipefail
           git clone --filter=blob:none "$HUXERUI_REPO" third_party/huxerui
           git -C third_party/huxerui checkout "$HUXERUI_COMMIT"
+          git clone --filter=blob:none "$LIB_SQLITE_REPO" third_party/Lib-SQLite
+          git -C third_party/Lib-SQLite checkout "$LIB_SQLITE_COMMIT"
 
       - name: Ensure CMake >= 4.4 and Ninja
         run: |

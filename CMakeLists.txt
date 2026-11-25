@@ -9,15 +9,24 @@ else ()
     set(_dbpp_default_huxerui_dir "${CMAKE_CURRENT_SOURCE_DIR}/../HuxerUI-fork")
 endif ()
 set(DBPP_HUXERUI_DIR "${_dbpp_default_huxerui_dir}" CACHE PATH "HuxerUI source directory")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Lib-SQLite/CMakeLists.txt")
+    set(_dbpp_default_sqlite_lib_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Lib-SQLite")
+else ()
+    set(_dbpp_default_sqlite_lib_dir "${CMAKE_CURRENT_SOURCE_DIR}/../HuxerUI-libs/Lib-SQLite")
+endif ()
+set(DBPP_SQLITE_LIB_DIR "${_dbpp_default_sqlite_lib_dir}" CACHE PATH "HuxerUI Lib-SQLite source directory")
 set(DBPP_DATATABLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Lib-DataTable" CACHE PATH "Lib-DataTable source directory")
 set(DBPP_ADBC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/adbc" CACHE PATH "Apache Arrow ADBC source directory")
 
-option(DBPP_USE_VENDORED_SQLITE3 "Build SQLite3 from the vendored ADBC amalgamation" ON)
+option(DBPP_USE_VENDORED_SQLITE3 "Build SQLite3 from Lib-SQLite bundled sqlite source" ON)
 option(DBPP_BUILD_TESTS "Build db++ headless unit tests" ON)
 option(HUXERUI_PACKAGE "Configure desktop packaging and installer targets" OFF)
 
 if (NOT EXISTS "${DBPP_HUXERUI_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "DBPP_HUXERUI_DIR does not contain a HuxerUI checkout: ${DBPP_HUXERUI_DIR}")
+endif ()
+if (NOT EXISTS "${DBPP_SQLITE_LIB_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "DBPP_SQLITE_LIB_DIR does not contain a Lib-SQLite checkout: ${DBPP_SQLITE_LIB_DIR}")
 endif ()
 if (NOT EXISTS "${DBPP_DATATABLE_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "DBPP_DATATABLE_DIR does not contain a Lib-DataTable checkout: ${DBPP_DATATABLE_DIR}")
@@ -148,6 +157,10 @@ huxerui_use_library(dbpp
         TARGET HuxerUI::DataTable
         PATH "${DBPP_DATATABLE_DIR}"
 )
+huxerui_use_library(dbpp
+        TARGET HuxerUI::SQLite
+        PATH "${DBPP_SQLITE_LIB_DIR}"
+)
 
 target_include_directories(dbpp PRIVATE
         "${DBPP_ADBC_DIR}/c/include"
@@ -156,6 +169,7 @@ target_include_directories(dbpp SYSTEM PRIVATE
         "${DBPP_ADBC_DIR}/c/vendor"
 )
 target_link_libraries(dbpp PRIVATE
+        SQLite::SQLite3
         adbc_driver_manager_shared
         nanoarrow
 )
@@ -319,6 +333,7 @@ if (DBPP_BUILD_TESTS)
     add_executable(test_cli
             tests/test_cli.cpp
             src/cli.cpp
+            src/config_db.cpp
             src/db.cpp
             src/adbc_session.cpp
             src/redis_client.cpp
@@ -337,6 +352,8 @@ if (DBPP_BUILD_TESTS)
     target_link_libraries(test_cli PRIVATE
             HuxerUI::huxerui
             HuxerUI::DataTable
+            HuxerUI::SQLite
+            SQLite::SQLite3
             adbc_driver_manager_shared
             nanoarrow
     )
@@ -442,6 +459,7 @@ if (DBPP_BUILD_TESTS)
     target_link_libraries(test_redis PRIVATE
             HuxerUI::huxerui
             HuxerUI::DataTable
+            SQLite::SQLite3
             adbc_driver_manager_shared
             nanoarrow
     )

@@ -4,6 +4,7 @@
 #include "redis_client.h"
 
 #include <huxerui/huxerui.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <cctype>
@@ -1371,7 +1372,7 @@ float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
   return std::round(std::clamp(raw_width, kAutoMinColumnWidth, kAutoMaxColumnWidth));
 }
 
-std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
+std::vector<ConnectionProfile> LoadConnectionProfilesFromTsv(const std::string& path) {
   std::vector<ConnectionProfile> profiles;
   std::ifstream input(path, std::ios::binary);
   if (!input) {
@@ -1379,12 +1380,15 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
   }
   std::string line;
   while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
     if (line.empty() || line.front() == '#') {
       continue;
     }
     std::vector<std::string_view> fields;
     std::size_t start = 0;
-    while (start <= line.size() && fields.size() < 4) {
+    while (start <= line.size() && fields.size() < 5) {
       const std::size_t tab = line.find('\t', start);
       if (tab == std::string::npos) {
         fields.emplace_back(line.data() + start, line.size() - start);
@@ -1393,7 +1397,8 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
       fields.emplace_back(line.data() + start, tab - start);
       start = tab + 1;
     }
-    if (fields.size() != 4) {
+    // Accept both legacy 4-column rows (no password) and 5-column rows (with password).
+    if (fields.size() != 4 && fields.size() != 5) {
       continue;
     }
     ConnectionProfile profile;
@@ -1401,6 +1406,9 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
     profile.driver_path = DecodeProfileField(fields[1]);
     profile.uri = DecodeProfileField(fields[2]);
     profile.username = DecodeProfileField(fields[3]);
+    if (fields.size() == 5) {
+      profile.password = DecodeProfileField(fields[4]);
+    }
     if (!profile.driver_path.empty() && !profile.uri.empty()) {
       profiles.push_back(std::move(profile));
     }
@@ -1408,8 +1416,8 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
   return profiles;
 }
 
-bool SaveConnectionProfiles(const std::string& path,
-                            const std::vector<ConnectionProfile>& profiles) {
+bool SaveConnectionProfilesToTsv(const std::string& path,
+                                 const std::vector<ConnectionProfile>& profiles) {
   const std::filesystem::path file_path(path);
   if (file_path.has_parent_path()) {
     std::error_code error;
@@ -1422,12 +1430,13 @@ bool SaveConnectionProfiles(const std::string& path,
     if (!output) {
       return false;
     }
-    output << "# db++ adbc connections v1\n";
+    output << "# db++ adbc connections v2\n";
     for (const ConnectionProfile& profile : profiles) {
       output << EncodeProfileField(profile.name) << '\t'
              << EncodeProfileField(profile.driver_path) << '\t'
              << EncodeProfileField(profile.uri) << '\t'
-             << EncodeProfileField(profile.username) << '\n';
+             << EncodeProfileField(profile.username) << '\t'
+             << EncodeProfileField(profile.password) << '\n';
     }
     output.flush();
     if (!output) {
@@ -1436,10 +1445,18 @@ bool SaveConnectionProfiles(const std::string& path,
       return false;
     }
   }
+#if !defined(_WIN32)
+  {
+    std::error_code perm_ec;
+    std::filesystem::permissions(
+        temp_path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, perm_ec);
+  }
+#endif
   std::error_code error;
   std::filesystem::rename(temp_path, file_path, error);
   if (error) {
-    // Windows cannot rename onto an existing file; remove target then rename.
     std::error_code remove_ec;
     std::filesystem::remove(file_path, remove_ec);
     error.clear();
@@ -1451,6 +1468,145 @@ bool SaveConnectionProfiles(const std::string& path,
     }
   }
   return true;
+}
+
+std::string ColumnTextString(sqlite3_stmt* stmt, int col) {
+  const unsigned char* ptr = sqlite3_column_text(stmt, col);
+  const int bytes = sqlite3_column_bytes(stmt, col);
+  if (ptr == nullptr || bytes <= 0) {
+    return {};
+  }
+  return std::string(reinterpret_cast<const char*>(ptr), static_cast<std::size_t>(bytes));
+}
+
+std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
+  if (path.empty()) {
+    return {};
+  }
+  if (detail::IsLegacyTsvPath(path)) {
+    return LoadConnectionProfilesFromTsv(path);
+  }
+
+  std::error_code ec;
+  const std::filesystem::path target(path);
+  const bool db_exists = std::filesystem::is_regular_file(target, ec);
+  const std::filesystem::path legacy_tsv = target.parent_path() / "connections.tsv";
+  const std::filesystem::path legacy_settings_tsv = target.parent_path() / "settings.tsv";
+  if (!db_exists) {
+    if (std::filesystem::is_regular_file(legacy_tsv, ec) ||
+        std::filesystem::is_regular_file(legacy_settings_tsv, ec)) {
+      if (!detail::EnsureConfigSqliteSync(path)) {
+        return LoadConnectionProfilesFromTsv(legacy_tsv.string());
+      }
+    } else {
+      return {};
+    }
+  }
+
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
+      db == nullptr) {
+    if (db != nullptr) {
+      sqlite3_close_v2(db);
+    }
+    return {};
+  }
+  sqlite3_busy_timeout(db, 5000);
+
+  sqlite3_stmt* stmt = nullptr;
+  std::vector<ConnectionProfile> profiles;
+  if (sqlite3_prepare_v2(
+          db,
+          "SELECT name, driver_path, uri, username, password "
+          "FROM connections ORDER BY sort_order ASC, id ASC;",
+          -1, &stmt, nullptr) == SQLITE_OK) {
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      ConnectionProfile profile;
+      profile.name = ColumnTextString(stmt, 0);
+      profile.driver_path = ColumnTextString(stmt, 1);
+      profile.uri = ColumnTextString(stmt, 2);
+      profile.username = ColumnTextString(stmt, 3);
+      profile.password = ColumnTextString(stmt, 4);
+      if (!profile.driver_path.empty() && !profile.uri.empty()) {
+        profiles.push_back(std::move(profile));
+      }
+    }
+    sqlite3_finalize(stmt);
+  }
+  sqlite3_close_v2(db);
+  return profiles;
+}
+
+bool SaveConnectionProfiles(const std::string& path,
+                            const std::vector<ConnectionProfile>& profiles) {
+  if (path.empty()) {
+    return false;
+  }
+  if (detail::IsLegacyTsvPath(path)) {
+    return SaveConnectionProfilesToTsv(path, profiles);
+  }
+  if (!detail::EnsureConfigSqliteSync(path)) {
+    return false;
+  }
+
+  sqlite3* db = nullptr;
+  if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK ||
+      db == nullptr) {
+    if (db != nullptr) {
+      sqlite3_close_v2(db);
+    }
+    return false;
+  }
+  sqlite3_busy_timeout(db, 5000);
+
+  bool ok = sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
+  if (ok) {
+    ok = sqlite3_exec(db, "DELETE FROM connections;", nullptr, nullptr, nullptr) == SQLITE_OK;
+  }
+  if (ok && !profiles.empty()) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db,
+            "INSERT INTO connections "
+            "(sort_order, name, driver_path, uri, username, password) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            -1, &stmt, nullptr) != SQLITE_OK) {
+      ok = false;
+    } else {
+      for (std::size_t i = 0; i < profiles.size(); ++i) {
+        const auto& p = profiles[i];
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(i));
+        sqlite3_bind_text(stmt, 2, p.name.data(), static_cast<int>(p.name.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, p.driver_path.data(), static_cast<int>(p.driver_path.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, p.uri.data(), static_cast<int>(p.uri.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, p.username.data(), static_cast<int>(p.username.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, p.password.data(), static_cast<int>(p.password.size()),
+                          SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+          ok = false;
+          break;
+        }
+      }
+      sqlite3_finalize(stmt);
+    }
+  }
+  if (ok) {
+    ok = sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK;
+  }
+  if (!ok) {
+    sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+  }
+  sqlite3_close_v2(db);
+  if (ok) {
+    detail::RestrictConfigFilePermissions(path);
+  }
+  return ok;
 }
 
 std::vector<std::string> OrderConnectionKeys(const std::vector<std::string>& natural_keys,

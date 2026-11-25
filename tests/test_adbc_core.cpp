@@ -597,6 +597,54 @@ void TestUtf8ValidationAndSanitization() {
   }
 }
 
+void TestDatabaseBrandDetection() {
+  using dbpp::DatabaseBrand;
+  using dbpp::DetectDatabaseBrand;
+  using dbpp::Dialect;
+
+  // All 15 preset IDs map 1:1.
+  Expect(DetectDatabaseBrand("sqlite") == DatabaseBrand::Sqlite, "sqlite preset brand");
+  Expect(DetectDatabaseBrand("postgresql") == DatabaseBrand::Postgresql, "postgresql preset brand");
+  Expect(DetectDatabaseBrand("mysql") == DatabaseBrand::Mysql, "mysql preset brand");
+  Expect(DetectDatabaseBrand("mariadb") == DatabaseBrand::Mariadb, "mariadb preset brand");
+  Expect(DetectDatabaseBrand("duckdb") == DatabaseBrand::Duckdb, "duckdb preset brand");
+  Expect(DetectDatabaseBrand("redis") == DatabaseBrand::Redis, "redis preset brand");
+  Expect(DetectDatabaseBrand("mssql") == DatabaseBrand::Mssql, "mssql preset brand");
+  Expect(DetectDatabaseBrand("clickhouse") == DatabaseBrand::Clickhouse, "clickhouse preset brand");
+  Expect(DetectDatabaseBrand("flightsql") == DatabaseBrand::FlightSql, "flightsql preset brand");
+  Expect(DetectDatabaseBrand("snowflake") == DatabaseBrand::Snowflake, "snowflake preset brand");
+  Expect(DetectDatabaseBrand("bigquery") == DatabaseBrand::BigQuery, "bigquery preset brand");
+  Expect(DetectDatabaseBrand("trino") == DatabaseBrand::Trino, "trino preset brand");
+  Expect(DetectDatabaseBrand("databricks") == DatabaseBrand::Databricks, "databricks preset brand");
+  Expect(DetectDatabaseBrand("redshift") == DatabaseBrand::Redshift, "redshift preset brand");
+  Expect(DetectDatabaseBrand("custom") == DatabaseBrand::Custom, "custom preset brand");
+
+  // Precedence checks: Redshift over PostgreSQL, MariaDB over MySQL.
+  Expect(DetectDatabaseBrand("redshift", "postgresql://cluster.redshift:5439/dev",
+                             Dialect::Postgresql) == DatabaseBrand::Redshift,
+         "redshift driver must win over postgresql URI/dialect");
+  Expect(DetectDatabaseBrand("", "postgresql://my-cluster.redshift.amazonaws.com:5439/dev") ==
+             DatabaseBrand::Redshift,
+         "redshift URI must be detected before postgresql");
+  Expect(DetectDatabaseBrand("mariadb", "mysql://127.0.0.1:3306/app", Dialect::Mysql) ==
+             DatabaseBrand::Mariadb,
+         "mariadb driver must win over mysql URI/dialect");
+
+  // Shared library path, URI scheme, and dialect fallbacks.
+  Expect(DetectDatabaseBrand("/usr/lib/libadbc_driver_duckdb.so") == DatabaseBrand::Duckdb,
+         "duckdb shared library path detection");
+  Expect(DetectDatabaseBrand("adbc_driver_sqlite.dll") == DatabaseBrand::Sqlite,
+         "sqlite Windows DLL path detection");
+  Expect(DetectDatabaseBrand("", "rediss://cache.example.com:6379/1") == DatabaseBrand::Redis,
+         "rediss:// URI detection");
+  Expect(DetectDatabaseBrand("", "demo.sqlite") == DatabaseBrand::Sqlite,
+         "sqlite file extension detection");
+  Expect(DetectDatabaseBrand("", "", Dialect::Redis) == DatabaseBrand::Redis,
+         "dialect fallback to Redis");
+  Expect(DetectDatabaseBrand("", "", Dialect::Generic) == DatabaseBrand::Custom,
+         "generic fallback to Custom");
+}
+
 } // namespace
 
 int main() {
@@ -609,6 +657,7 @@ int main() {
   TestPostgresUriAndSqlReadDetection();
   TestDatabasePresetsAndUriComposer(temp.path);
   TestUtf8ValidationAndSanitization();
+  TestDatabaseBrandDetection();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

@@ -36,6 +36,25 @@ enum class Dialect {
   Generic,
 };
 
+/// Database brand used to select per-database vector logos and branding.
+enum class DatabaseBrand {
+  Sqlite,
+  Postgresql,
+  Mysql,
+  Mariadb,
+  Duckdb,
+  Redis,
+  Mssql,
+  Clickhouse,
+  FlightSql,
+  Snowflake,
+  BigQuery,
+  Trino,
+  Databricks,
+  Redshift,
+  Custom,
+};
+
 struct AdbcSession;
 
 struct ColumnMeta {
@@ -68,12 +87,13 @@ struct ConnectionRequest {
   std::string title;
 };
 
-/// User-saved ADBC connection. Passwords are intentionally not persisted.
+/// User-saved ADBC connection (persisted in `connections.tsv`, including optional password).
 struct ConnectionProfile {
   std::string name;
   std::string driver_path;
   std::string uri;
   std::string username;
+  std::string password;
 
   bool operator==(const ConnectionProfile&) const = default;
 };
@@ -332,6 +352,9 @@ struct AdbcManagerContext {
 [[nodiscard]] bool IsSqlReadStatement(std::string_view sql);
 [[nodiscard]] bool IsReadStatement(Dialect dialect, std::string_view text);
 [[nodiscard]] std::string InferDriverForUri(std::string_view uri);
+[[nodiscard]] DatabaseBrand DetectDatabaseBrand(std::string_view driver_or_id,
+                                                std::string_view uri = {},
+                                                Dialect dialect = Dialect::Generic);
 [[nodiscard]] std::string DisplayNameFromUri(std::string_view uri, std::string_view fallback);
 [[nodiscard]] std::string SingleLineCellPreview(std::string_view text);
 [[nodiscard]] float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
@@ -345,6 +368,14 @@ struct AdbcManagerContext {
                                            std::string_view port, std::string_view database);
 [[nodiscard]] std::optional<AdbcDriverInfo> FindInstalledDriverForPreset(
     const DatabasePreset& preset, const std::vector<AdbcDriverInfo>& discovered);
+namespace detail {
+[[nodiscard]] bool IsLegacyTsvPath(std::string_view path) noexcept;
+void RestrictConfigFilePermissions(std::string_view db_path) noexcept;
+[[nodiscard]] std::vector<std::pair<std::string, std::string>>
+LoadLegacySettingsTsvPairs(const std::string& path);
+[[nodiscard]] bool EnsureConfigSqliteSync(const std::string& db_path);
+} // namespace detail
+
 [[nodiscard]] std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path);
 bool SaveConnectionProfiles(const std::string& path,
                             const std::vector<ConnectionProfile>& profiles);

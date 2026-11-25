@@ -2,10 +2,16 @@
 
 #include <huxerui/huxerui.h>
 
+#include <functional>
 #include <string>
 #include <string_view>
 
 namespace dbpp {
+
+inline constexpr std::string_view kSettingTrayEnabled = "tray.enabled";
+inline constexpr std::string_view kSettingLightweight = "tray.lightweight";
+inline constexpr std::string_view kSettingThemeMode = "theme.mode";
+inline constexpr std::string_view kSettingThemePreset = "theme.preset";
 
 enum class ThemeMode {
   System = 0,
@@ -33,8 +39,8 @@ struct AppThemeConfig {
 [[nodiscard]] std::string_view ThemePresetKey(ThemePreset preset);
 [[nodiscard]] ThemePreset ThemePresetFromKey(std::string_view key);
 
-/// Persisted tray and theme preferences. Stored as key/value TSV in the
-/// application data directory (`settings.tsv`), same format as `connections.tsv`.
+/// Persisted tray and theme preferences. Stored as key/value rows in SQLite
+/// (`dbpp.sqlite3` `settings` table, automatically migrating legacy `settings.tsv`).
 struct TraySettings {
   bool tray_enabled = true;
   bool lightweight = false;
@@ -56,6 +62,7 @@ struct SettingsModel {
   huxerui::State<ThemeMode> theme_mode{ThemeMode::System};
   huxerui::State<ThemePreset> theme_preset{ThemePreset::GeminiSpark};
   std::string path;
+  std::function<void(std::string, std::string)> persist_setting;
 
   void Load();
   bool SetTrayEnabled(bool enabled);

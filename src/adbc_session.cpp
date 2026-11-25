@@ -1968,6 +1968,96 @@ std::optional<AdbcDriverInfo> FindInstalledDriverForPreset(
   return std::nullopt;
 }
 
+DatabaseBrand DetectDatabaseBrand(std::string_view driver_or_id, std::string_view uri,
+                                  Dialect dialect) {
+  if (!driver_or_id.empty()) {
+    const std::string lower = LowerAscii(driver_or_id);
+    if (lower.find("redis") != std::string::npos) return DatabaseBrand::Redis;
+    if (lower.find("mariadb") != std::string::npos) return DatabaseBrand::Mariadb;
+    if (lower.find("mysql") != std::string::npos) return DatabaseBrand::Mysql;
+    // Check redshift before postgresql because Redshift uses postgresql:// URIs.
+    if (lower.find("redshift") != std::string::npos) return DatabaseBrand::Redshift;
+    if (lower.find("postgres") != std::string::npos ||
+        lower.find("pgsql") != std::string::npos ||
+        lower.find("libpq") != std::string::npos) {
+      return DatabaseBrand::Postgresql;
+    }
+    if (lower.find("sqlite") != std::string::npos) return DatabaseBrand::Sqlite;
+    if (lower.find("duckdb") != std::string::npos) return DatabaseBrand::Duckdb;
+    if (lower.find("mssql") != std::string::npos ||
+        lower.find("sqlserver") != std::string::npos ||
+        lower.find("sql server") != std::string::npos) {
+      return DatabaseBrand::Mssql;
+    }
+    if (lower.find("clickhouse") != std::string::npos) return DatabaseBrand::Clickhouse;
+    if (lower.find("flightsql") != std::string::npos ||
+        lower.find("flight_sql") != std::string::npos ||
+        lower.find("flight sql") != std::string::npos ||
+        lower.find("arrow") != std::string::npos) {
+      return DatabaseBrand::FlightSql;
+    }
+    if (lower.find("snowflake") != std::string::npos) return DatabaseBrand::Snowflake;
+    if (lower.find("bigquery") != std::string::npos) return DatabaseBrand::BigQuery;
+    if (lower.find("trino") != std::string::npos ||
+        lower.find("presto") != std::string::npos) {
+      return DatabaseBrand::Trino;
+    }
+    if (lower.find("databricks") != std::string::npos) return DatabaseBrand::Databricks;
+  }
+
+  if (!uri.empty()) {
+    const std::string lower = LowerAscii(uri);
+    if (lower.starts_with("redis://") || lower.starts_with("rediss://")) {
+      return DatabaseBrand::Redis;
+    }
+    if (lower.starts_with("mariadb://")) return DatabaseBrand::Mariadb;
+    if (lower.starts_with("mysql://")) return DatabaseBrand::Mysql;
+    if (lower.find("redshift") != std::string::npos ||
+        lower.find(":5439") != std::string::npos) {
+      return DatabaseBrand::Redshift;
+    }
+    if (lower.starts_with("postgres://") || lower.starts_with("postgresql://")) {
+      return DatabaseBrand::Postgresql;
+    }
+    if (lower.find("duckdb") != std::string::npos ||
+        lower.find(".ddb") != std::string::npos) {
+      return DatabaseBrand::Duckdb;
+    }
+    if (lower.starts_with("mssql://") || lower.starts_with("sqlserver://")) {
+      return DatabaseBrand::Mssql;
+    }
+    if (lower.find("clickhouse") != std::string::npos ||
+        lower.find(":8123") != std::string::npos) {
+      return DatabaseBrand::Clickhouse;
+    }
+    if (lower.find("flightsql") != std::string::npos ||
+        lower.find(":31337") != std::string::npos) {
+      return DatabaseBrand::FlightSql;
+    }
+    if (lower.find("snowflake") != std::string::npos) return DatabaseBrand::Snowflake;
+    if (lower.starts_with("bigquery://")) return DatabaseBrand::BigQuery;
+    if (lower.starts_with("trino://")) return DatabaseBrand::Trino;
+    if (lower.starts_with("databricks://")) return DatabaseBrand::Databricks;
+    if (lower.find(".sqlite3") != std::string::npos ||
+        lower.find(".sqlite") != std::string::npos ||
+        lower.find(".db3") != std::string::npos ||
+        lower.find(".s3db") != std::string::npos) {
+      return DatabaseBrand::Sqlite;
+    }
+  }
+
+  switch (dialect) {
+    case Dialect::Sqlite: return DatabaseBrand::Sqlite;
+    case Dialect::Postgresql: return DatabaseBrand::Postgresql;
+    case Dialect::Mysql: return DatabaseBrand::Mysql;
+    case Dialect::Duckdb: return DatabaseBrand::Duckdb;
+    case Dialect::Redis: return DatabaseBrand::Redis;
+    case Dialect::Generic:
+    default:
+      return DatabaseBrand::Custom;
+  }
+}
+
 namespace {
 
 void StripVersionSuffixes(std::string& base) {

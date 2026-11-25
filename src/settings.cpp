@@ -1,23 +1,279 @@
 #include "settings.h"
 
+#include "model.h"
+
+#include <sqlite3.h>
+
+#include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace dbpp {
 
 namespace {
 
-constexpr std::string_view kKeyTrayEnabled = "tray.enabled";
-constexpr std::string_view kKeyLightweight = "tray.lightweight";
-constexpr std::string_view kKeyThemeMode = "theme.mode";
-constexpr std::string_view kKeyThemePreset = "theme.preset";
+std::string LowerAsciiCopy(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const unsigned char c : text) {
+    out.push_back(static_cast<char>(std::tolower(c)));
+  }
+  return out;
+}
 
 std::string_view FlagText(bool value) {
   return value ? "true" : "false";
 }
 
+bool ExecSql(sqlite3* db, const char* sql) {
+  return sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
+}
+
+struct SqliteGuard {
+  sqlite3* db = nullptr;
+  ~SqliteGuard() {
+    if (db != nullptr) {
+      sqlite3_close_v2(db);
+    }
+  }
+};
+
+struct StmtGuard {
+  sqlite3_stmt* stmt = nullptr;
+  ~StmtGuard() {
+    if (stmt != nullptr) {
+      sqlite3_finalize(stmt);
+    }
+  }
+};
+
 } // namespace
+
+namespace detail {
+
+bool IsLegacyTsvPath(std::string_view path) noexcept {
+  return LowerAsciiCopy(path).ends_with(".tsv");
+}
+
+void RestrictConfigFilePermissions(std::string_view db_path) noexcept {
+#if !defined(_WIN32)
+  if (db_path.empty()) {
+    return;
+  }
+  const std::string base(db_path);
+  for (const std::string_view suffix : {"", "-wal", "-shm", "-journal"}) {
+    const std::filesystem::path candidate(base + std::string(suffix));
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(candidate, ec)) {
+      std::filesystem::permissions(
+          candidate,
+          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+          std::filesystem::perm_options::replace, ec);
+    }
+  }
+#else
+  (void)db_path;
+#endif
+}
+
+std::vector<std::pair<std::string, std::string>>
+LoadLegacySettingsTsvPairs(const std::string& path) {
+  std::vector<std::pair<std::string, std::string>> pairs;
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    return pairs;
+  }
+  std::string line;
+  while (std::getline(stream, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos || tab == 0) {
+      continue;
+    }
+    pairs.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+  }
+  return pairs;
+}
+
+bool EnsureConfigSqliteSync(const std::string& db_path) {
+  if (db_path.empty()) {
+    return false;
+  }
+  const std::filesystem::path target(db_path);
+  if (target.has_parent_path()) {
+    std::error_code dir_error;
+    std::filesystem::create_directories(target.parent_path(), dir_error);
+  }
+
+  SqliteGuard conn;
+  if (sqlite3_open_v2(db_path.c_str(), &conn.db,
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK ||
+      conn.db == nullptr) {
+    return false;
+  }
+  sqlite3_busy_timeout(conn.db, 5000);
+
+  if (!ExecSql(conn.db, "PRAGMA journal_mode = WAL;") ||
+      !ExecSql(conn.db, "PRAGMA foreign_keys = ON;") ||
+      !ExecSql(conn.db,
+               "CREATE TABLE IF NOT EXISTS settings ("
+               "key TEXT NOT NULL PRIMARY KEY, "
+               "value TEXT NOT NULL DEFAULT ''"
+               ");") ||
+      !ExecSql(conn.db,
+               "CREATE TABLE IF NOT EXISTS connections ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "sort_order INTEGER NOT NULL DEFAULT 0, "
+               "name TEXT NOT NULL DEFAULT '', "
+               "driver_path TEXT NOT NULL, "
+               "uri TEXT NOT NULL, "
+               "username TEXT NOT NULL DEFAULT '', "
+               "password TEXT NOT NULL DEFAULT ''"
+               ");") ||
+      !ExecSql(conn.db,
+               "CREATE INDEX IF NOT EXISTS idx_connections_sort_order "
+               "ON connections (sort_order, id);")) {
+    return false;
+  }
+
+  {
+    StmtGuard version_stmt;
+    if (sqlite3_prepare_v2(conn.db, "PRAGMA user_version;", -1, &version_stmt.stmt, nullptr) !=
+        SQLITE_OK) {
+      return false;
+    }
+    int version = 0;
+    if (sqlite3_step(version_stmt.stmt) == SQLITE_ROW) {
+      version = sqlite3_column_int(version_stmt.stmt, 0);
+    }
+    if (version == 0 && !ExecSql(conn.db, "PRAGMA user_version = 1;")) {
+      return false;
+    }
+  }
+
+  bool already_migrated = false;
+  {
+    StmtGuard check_stmt;
+    if (sqlite3_prepare_v2(conn.db,
+                           "SELECT 1 FROM settings WHERE key = 'meta.tsv_migrated' LIMIT 1;",
+                           -1, &check_stmt.stmt, nullptr) != SQLITE_OK) {
+      return false;
+    }
+    already_migrated = sqlite3_step(check_stmt.stmt) == SQLITE_ROW;
+  }
+
+  if (!already_migrated) {
+    if (!ExecSql(conn.db, "BEGIN IMMEDIATE;")) {
+      return false;
+    }
+    bool migrated_in_tx = false;
+    {
+      StmtGuard check_stmt;
+      if (sqlite3_prepare_v2(conn.db,
+                             "SELECT 1 FROM settings WHERE key = 'meta.tsv_migrated' LIMIT 1;",
+                             -1, &check_stmt.stmt, nullptr) == SQLITE_OK) {
+        migrated_in_tx = sqlite3_step(check_stmt.stmt) == SQLITE_ROW;
+      }
+    }
+    bool ok = true;
+    if (!migrated_in_tx) {
+      std::error_code ec;
+      const std::filesystem::path legacy_settings = target.parent_path() / "settings.tsv";
+      if (std::filesystem::is_regular_file(legacy_settings, ec)) {
+        const auto pairs = LoadLegacySettingsTsvPairs(legacy_settings.string());
+        StmtGuard ins_stmt;
+        if (sqlite3_prepare_v2(
+                conn.db, "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?);", -1,
+                &ins_stmt.stmt, nullptr) != SQLITE_OK) {
+          ok = false;
+        } else {
+          for (const auto& [k, v] : pairs) {
+            sqlite3_reset(ins_stmt.stmt);
+            sqlite3_clear_bindings(ins_stmt.stmt);
+            sqlite3_bind_text(ins_stmt.stmt, 1, k.data(), static_cast<int>(k.size()),
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins_stmt.stmt, 2, v.data(), static_cast<int>(v.size()),
+                              SQLITE_TRANSIENT);
+            if (sqlite3_step(ins_stmt.stmt) != SQLITE_DONE) {
+              ok = false;
+              break;
+            }
+          }
+        }
+      }
+
+      const std::filesystem::path legacy_conns = target.parent_path() / "connections.tsv";
+      if (ok && std::filesystem::is_regular_file(legacy_conns, ec)) {
+        int existing_count = 0;
+        StmtGuard cnt_stmt;
+        if (sqlite3_prepare_v2(conn.db, "SELECT COUNT(*) FROM connections;", -1, &cnt_stmt.stmt,
+                               nullptr) != SQLITE_OK) {
+          ok = false;
+        } else if (sqlite3_step(cnt_stmt.stmt) == SQLITE_ROW) {
+          existing_count = sqlite3_column_int(cnt_stmt.stmt, 0);
+        }
+        if (ok && existing_count == 0) {
+          const std::vector<ConnectionProfile> legacy =
+              LoadConnectionProfiles(legacy_conns.string());
+          StmtGuard ins_stmt;
+          if (!legacy.empty()) {
+            if (sqlite3_prepare_v2(
+                    conn.db,
+                    "INSERT INTO connections "
+                    "(sort_order, name, driver_path, uri, username, password) "
+                    "VALUES (?, ?, ?, ?, ?, ?);",
+                    -1, &ins_stmt.stmt, nullptr) != SQLITE_OK) {
+              ok = false;
+            } else {
+              for (std::size_t i = 0; i < legacy.size(); ++i) {
+                const auto& p = legacy[i];
+                sqlite3_reset(ins_stmt.stmt);
+                sqlite3_clear_bindings(ins_stmt.stmt);
+                sqlite3_bind_int64(ins_stmt.stmt, 1, static_cast<sqlite3_int64>(i));
+                sqlite3_bind_text(ins_stmt.stmt, 2, p.name.data(), static_cast<int>(p.name.size()),
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_text(ins_stmt.stmt, 3, p.driver_path.data(),
+                                  static_cast<int>(p.driver_path.size()), SQLITE_TRANSIENT);
+                sqlite3_bind_text(ins_stmt.stmt, 4, p.uri.data(), static_cast<int>(p.uri.size()),
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_text(ins_stmt.stmt, 5, p.username.data(),
+                                  static_cast<int>(p.username.size()), SQLITE_TRANSIENT);
+                sqlite3_bind_text(ins_stmt.stmt, 6, p.password.data(),
+                                  static_cast<int>(p.password.size()), SQLITE_TRANSIENT);
+                if (sqlite3_step(ins_stmt.stmt) != SQLITE_DONE) {
+                  ok = false;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (ok && !ExecSql(conn.db,
+                         "INSERT OR REPLACE INTO settings (key, value) "
+                         "VALUES ('meta.tsv_migrated', '1');")) {
+        ok = false;
+      }
+    }
+
+    if (!ok || !ExecSql(conn.db, "COMMIT;")) {
+      ExecSql(conn.db, "ROLLBACK;");
+      return false;
+    }
+  }
+
+  RestrictConfigFilePermissions(db_path);
+  return true;
+}
+
+} // namespace detail
 
 std::string_view ThemeModeKey(ThemeMode mode) {
   switch (mode) {
@@ -67,74 +323,157 @@ ThemePreset ThemePresetFromKey(std::string_view key) {
 
 TraySettings LoadTraySettings(const std::string& path) {
   TraySettings settings;
-  std::ifstream stream(path);
-  if (!stream) {
+  if (path.empty()) {
     return settings;
   }
-  std::string line;
-  while (std::getline(stream, line)) {
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-    const auto tab = line.find('\t');
-    if (tab == std::string::npos) {
-      continue;
-    }
-    const std::string key = line.substr(0, tab);
-    const std::string value = line.substr(tab + 1);
-    if (key == kKeyTrayEnabled) {
+
+  const auto apply_pair = [&settings](std::string_view key, std::string_view value) {
+    if (key == kSettingTrayEnabled) {
       settings.tray_enabled = value == "true";
-    } else if (key == kKeyLightweight) {
+    } else if (key == kSettingLightweight) {
       settings.lightweight = value == "true";
-    } else if (key == kKeyThemeMode) {
+    } else if (key == kSettingThemeMode) {
       settings.theme_mode = ThemeModeFromKey(value);
-    } else if (key == kKeyThemePreset) {
+    } else if (key == kSettingThemePreset) {
       settings.theme_preset = ThemePresetFromKey(value);
+    }
+  };
+
+  if (detail::IsLegacyTsvPath(path)) {
+    for (const auto& [k, v] : detail::LoadLegacySettingsTsvPairs(path)) {
+      apply_pair(k, v);
+    }
+    return settings;
+  }
+
+  std::error_code ec;
+  const std::filesystem::path target(path);
+  const bool db_exists = std::filesystem::is_regular_file(target, ec);
+  const std::filesystem::path legacy_tsv = target.parent_path() / "settings.tsv";
+  if (!db_exists) {
+    if (std::filesystem::is_regular_file(legacy_tsv, ec)) {
+      return LoadTraySettings(legacy_tsv.string());
+    }
+    return settings;
+  }
+
+  SqliteGuard conn;
+  if (sqlite3_open_v2(path.c_str(), &conn.db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
+      conn.db == nullptr) {
+    return settings;
+  }
+  sqlite3_busy_timeout(conn.db, 5000);
+  StmtGuard stmt;
+  if (sqlite3_prepare_v2(
+          conn.db,
+          "SELECT key, value FROM settings "
+          "WHERE key IN ('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset');",
+          -1, &stmt.stmt, nullptr) != SQLITE_OK) {
+    return settings;
+  }
+  while (sqlite3_step(stmt.stmt) == SQLITE_ROW) {
+    const unsigned char* k_ptr = sqlite3_column_text(stmt.stmt, 0);
+    const unsigned char* v_ptr = sqlite3_column_text(stmt.stmt, 1);
+    const int k_len = sqlite3_column_bytes(stmt.stmt, 0);
+    const int v_len = sqlite3_column_bytes(stmt.stmt, 1);
+    if (k_ptr != nullptr && v_ptr != nullptr) {
+      apply_pair(std::string_view(reinterpret_cast<const char*>(k_ptr), static_cast<std::size_t>(k_len)),
+                 std::string_view(reinterpret_cast<const char*>(v_ptr), static_cast<std::size_t>(v_len)));
     }
   }
   return settings;
 }
 
 bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
-  // Write to a sibling temp file and atomically replace the target so a
-  // crash mid-write never corrupts the previous settings.
-  const std::filesystem::path target(path);
-  if (target.has_parent_path()) {
-    std::error_code dir_error;
-    std::filesystem::create_directories(target.parent_path(), dir_error);
+  if (path.empty()) {
+    return false;
   }
-  const std::filesystem::path temp =
-      target.parent_path() / (target.filename().string() + ".tmp");
-  {
-    std::ofstream stream(temp, std::ios::binary | std::ios::trunc);
-    if (!stream) {
-      return false;
+
+  if (detail::IsLegacyTsvPath(path)) {
+    const std::filesystem::path target(path);
+    if (target.has_parent_path()) {
+      std::error_code dir_error;
+      std::filesystem::create_directories(target.parent_path(), dir_error);
     }
-    stream << kKeyTrayEnabled << '\t' << FlagText(settings.tray_enabled) << '\n'
-           << kKeyLightweight << '\t' << FlagText(settings.lightweight) << '\n'
-           << kKeyThemeMode << '\t' << ThemeModeKey(settings.theme_mode) << '\n'
-           << kKeyThemePreset << '\t' << ThemePresetKey(settings.theme_preset) << '\n';
-    stream.flush();
-    if (!stream) {
-      std::error_code cleanup_error;
-      std::filesystem::remove(temp, cleanup_error);
-      return false;
+    const std::filesystem::path temp =
+        target.parent_path() / (target.filename().string() + ".tmp");
+    {
+      std::ofstream stream(temp, std::ios::binary | std::ios::trunc);
+      if (!stream) {
+        return false;
+      }
+      stream << kSettingTrayEnabled << '\t' << FlagText(settings.tray_enabled) << '\n'
+             << kSettingLightweight << '\t' << FlagText(settings.lightweight) << '\n'
+             << kSettingThemeMode << '\t' << ThemeModeKey(settings.theme_mode) << '\n'
+             << kSettingThemePreset << '\t' << ThemePresetKey(settings.theme_preset) << '\n';
+      stream.flush();
+      if (!stream) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temp, cleanup_error);
+        return false;
+      }
     }
-  }
-  std::error_code error;
-  std::filesystem::rename(temp, target, error);
-  if (error) {
-    // Windows cannot rename onto an existing file; fall back to a replace.
-    std::error_code remove_error;
-    std::filesystem::remove(target, remove_error);
-    error.clear();
+    std::error_code error;
     std::filesystem::rename(temp, target, error);
     if (error) {
-      std::error_code cleanup_error;
-      std::filesystem::remove(temp, cleanup_error);
+      std::error_code remove_error;
+      std::filesystem::remove(target, remove_error);
+      error.clear();
+      std::filesystem::rename(temp, target, error);
+      if (error) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temp, cleanup_error);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (!detail::EnsureConfigSqliteSync(path)) {
+    return false;
+  }
+  SqliteGuard conn;
+  if (sqlite3_open_v2(path.c_str(), &conn.db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK ||
+      conn.db == nullptr) {
+    return false;
+  }
+  sqlite3_busy_timeout(conn.db, 5000);
+  if (!ExecSql(conn.db, "BEGIN IMMEDIATE;")) {
+    return false;
+  }
+
+  const std::pair<std::string_view, std::string> entries[] = {
+      {kSettingTrayEnabled, std::string(FlagText(settings.tray_enabled))},
+      {kSettingLightweight, std::string(FlagText(settings.lightweight))},
+      {kSettingThemeMode, std::string(ThemeModeKey(settings.theme_mode))},
+      {kSettingThemePreset, std::string(ThemePresetKey(settings.theme_preset))},
+  };
+
+  StmtGuard upsert;
+  if (sqlite3_prepare_v2(
+          conn.db,
+          "INSERT INTO settings (key, value) VALUES (?, ?) "
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+          -1, &upsert.stmt, nullptr) != SQLITE_OK) {
+    ExecSql(conn.db, "ROLLBACK;");
+    return false;
+  }
+  for (const auto& [k, v] : entries) {
+    sqlite3_reset(upsert.stmt);
+    sqlite3_clear_bindings(upsert.stmt);
+    sqlite3_bind_text(upsert.stmt, 1, k.data(), static_cast<int>(k.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(upsert.stmt, 2, v.data(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(upsert.stmt) != SQLITE_DONE) {
+      ExecSql(conn.db, "ROLLBACK;");
       return false;
     }
   }
+
+  if (!ExecSql(conn.db, "COMMIT;")) {
+    ExecSql(conn.db, "ROLLBACK;");
+    return false;
+  }
+  detail::RestrictConfigFilePermissions(path);
   return true;
 }
 
@@ -164,21 +503,37 @@ AppThemeConfig SettingsModel::ThemeConfig() const {
 
 bool SettingsModel::SetTrayEnabled(bool enabled) {
   tray_enabled = enabled;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingTrayEnabled), std::string(FlagText(enabled)));
+    return true;
+  }
   return SaveTraySettings(path, Snapshot());
 }
 
 bool SettingsModel::SetLightweight(bool value) {
   lightweight = value;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingLightweight), std::string(FlagText(value)));
+    return true;
+  }
   return SaveTraySettings(path, Snapshot());
 }
 
 bool SettingsModel::SetThemeMode(ThemeMode mode) {
   theme_mode = mode;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingThemeMode), std::string(ThemeModeKey(mode)));
+    return true;
+  }
   return SaveTraySettings(path, Snapshot());
 }
 
 bool SettingsModel::SetThemePreset(ThemePreset preset) {
   theme_preset = preset;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingThemePreset), std::string(ThemePresetKey(preset)));
+    return true;
+  }
   return SaveTraySettings(path, Snapshot());
 }
 

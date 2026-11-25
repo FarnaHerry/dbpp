@@ -7,10 +7,10 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 
 ## 功能
 
-- 顶部工具栏与统一连接树：左上角提供「新建连接 / 新建查询 / 驱动管理」快捷按钮，左侧栏以单一可滚动树统一展示已连接会话与已保存连接（点击原地连接并展开/收起其下「表 / 视图 / 物化视图 / 外部表」等对象分组、不改变连接排列顺序，支持拖拽连接行调整顺序并持久化到 `connections.tsv`，以及右键菜单刷新、新建查询、查看结构、复制名称/URI/SELECT、删除对象和断开/删除配置）
+- 顶部工具栏与统一连接树：左上角提供「新建连接 / 新建查询 / 驱动管理」快捷按钮，左侧栏以单一可滚动树统一展示已连接会话与已保存连接（点击原地直接连接并展开/收起其下「表 / 视图 / 物化视图 / 外部表」等对象分组、不改变连接排列顺序，支持拖拽连接行调整顺序并持久化到 `dbpp.sqlite3`，以及右键菜单编辑连接、刷新、新建查询、查看结构、复制名称/URI/SELECT、删除对象和断开/删除配置）
 - 打开/连接数据库：两步式「新建连接」向导先选择数据库类型（SQLite / PostgreSQL / MySQL / MariaDB / DuckDB / Redis / SQL Server / ClickHouse / Arrow Flight SQL / Snowflake / BigQuery / Trino / Databricks / Amazon Redshift / 自定义 ADBC 驱动），显示驱动就绪状态与一键安装，并按类型展示文件选择或主机/端口/库名表单（可切换原始 URI）
 - Redis 内置支持：零外部依赖 RESP2/RESP3 TCP 客户端，左侧按 `db0`..`db15` 展示逻辑库与键计数，右侧虚拟表格支持 `MATCH` 模式筛选、分页/排序、内联编辑（String 保留 TTL、Hash/List/Set/ZSet JSON 编辑、TTL `EXPIRE`/`PERSIST`、`RENAMENX` 改名、批量新建与删除键），并内置 Redis 命令控制台
-- ADBC 管理器：保存连接配置（不含密码）、发现本机驱动、在线安装/更新/卸载 ADBC 驱动、
+- ADBC 管理器：保存连接配置（默认保留密码）、发现本机驱动、在线安装/更新/卸载 ADBC 驱动、
   从列表中选择驱动/连接并删除配置
 - 单行紧凑表与视图列表、右侧多标签页工作区（同屏打开并独立保留多个表、视图与 SQL 查询页状态）
 - 虚拟化数据表格（Lib-DataTable）：单元格与表头单行显示、超出宽度自动省略号（不换行），首次打开按采样内容自动调节初始列宽，后续保留用户手动拖拽拉伸的列宽；支持底部分页、排序、`WHERE` 筛选（SQLite 使用 `rowid`，其它数据库使用主键约束做行标识）
@@ -19,17 +19,16 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 - 系统托盘：托盘图标与菜单（显示主窗口 / 启用托盘 / 轻量级模式 / 退出），
   托盘拥有应用生命周期；托盘不可用时关闭会弹确认退出
 - 桌面单实例：同一时间只允许运行一个 GUI 实例；重复启动或通过桌面打开文件会唤醒已有窗口并转发待打开数据库（CLI 子命令仍可并发无头运行）
-- 无头 CLI：`dbpp <command> ...`，无需 GUI/显示服务即可直接查表、执行 SQL、管理 `connections.tsv` 与在线安装/卸载 ADBC 驱动，支持 `--json` 结构化输出供 AI Agent 调用
+- 无头 CLI：`dbpp <command> ...`，无需 GUI/显示服务即可直接查表、执行 SQL、管理 `dbpp.sqlite3` 连接配置与在线安装/卸载 ADBC 驱动，支持 `--json` 结构化输出供 AI Agent 调用
 - 轻量级模式：关闭窗口时销毁整个界面（断开全部 ADBC 会话），从托盘唤出时重建，
-  空闲内存占用更低；设置页可开关，持久化在 `settings.tsv`
-- 多预设主题与图标：默认采用「Gemini 星光」分层配色（蓝-紫-珊瑚星光渐变与四色语义高亮），支持切换翡翠青 / 暖沙琥珀 / 暮光紫 / 极简黑白及跟随系统/深/浅模式并持久化至 `settings.tsv`；附带应用图标（Windows .ico / macOS .icns / Linux hicolor + desktop 文件）与托盘图标
+  空闲内存占用更低；设置页可开关，持久化在 `dbpp.sqlite3`
+- 多预设主题与图标：默认采用「Gemini 星光」分层配色（蓝-紫-珊瑚星光渐变与四色语义高亮），支持切换翡翠青 / 暖沙琥珀 / 暮光紫 / 极简黑白及跟随系统/深/浅模式并持久化至 `dbpp.sqlite3`；附带应用图标（Windows .ico / macOS .icns / Linux hicolor + desktop 文件）与托盘图标
 - 启动参数：无参或 `dbpp /path/to/file.sqlite`（以及 `dbpp gui` / `dbpp open`）启动 GUI；`dbpp <command>` 走无头 CLI；也可用 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
 
 ## 构建与测试
 
 依赖：CMake ≥ 3.30、Ninja、GCC/Clang/MSVC（C++20）；Linux 需要 GTK4 ≥ 4.14、
-libepoxy、libsoup3 开发包。ADBC 与 SQLite3（`DBPP_USE_VENDORED_SQLITE3=ON`）以源码形式
-vendored 在 `third_party/adbc`，开箱即编。
+libepoxy、libsoup3 开发包。SQLite3 统一使用 [HuxerUI/Lib-SQLite](../HuxerUI-libs/Lib-SQLite) 自带源码（`3.53.4`，无重复 vendored 副本），ADBC 与 Lib-DataTable 均源码构建，开箱即编。
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -39,14 +38,15 @@ ctest --test-dir build --output-on-failure
 ```
 
 `DBPP_HUXERUI_DIR` 自动优先检测 `third_party/huxerui`，否则回落到
-`../HuxerUI-fork`；`DBPP_ADBC_DIR` 指向 `third_party/adbc`，`DBPP_DATATABLE_DIR`
+`../HuxerUI-fork`；`DBPP_SQLITE_LIB_DIR` 自动优先检测 `third_party/Lib-SQLite`，否则回落到
+`../HuxerUI-libs/Lib-SQLite`；`DBPP_ADBC_DIR` 指向 `third_party/adbc`，`DBPP_DATATABLE_DIR`
 指向 `third_party/Lib-DataTable`。
 
 ## ADBC 管理器
 
 侧栏“ADBC 管理器…”用于管理连接和驱动：
 
-- 连接配置保存在应用数据目录的 `connections.tsv`（表格格式，密码不落盘）。
+- 连接配置与偏好设置统一保存在应用数据目录的 `dbpp.sqlite3`（基于 `HuxerUI::SQLite` WAL 模式，默认保留可选密码，POSIX 下以 `0600` 权限保存；首次启动自动迁移旧版 `connections.tsv` 与 `settings.tsv` 并保留原文件；可在侧栏右键「编辑连接…」随时修改）。
 - 驱动列表同时发现两类来源：
   1. 标准 ADBC driver manifest（`.toml`）：按 `ADBC_DRIVER_PATH`、`DBPP_ADBC_DRIVERS`、
      `$VIRTUAL_ENV/etc/adbc/drivers`、`$CONDA_PREFIX/etc/adbc/drivers`、用户配置目录
