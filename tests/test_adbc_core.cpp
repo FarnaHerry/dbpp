@@ -564,6 +564,39 @@ void TestDatabasePresetsAndUriComposer(const fs::path& dir) {
   (void)dir;
 }
 
+void TestUtf8ValidationAndSanitization() {
+  Expect(dbpp::IsValidUtf8(""), "Empty string must be valid UTF-8");
+  Expect(dbpp::IsValidUtf8("hello world"), "ASCII must be valid UTF-8");
+  const std::string valid_utf8 = "连接失败: 数据库拒绝访问 🎉";
+  Expect(dbpp::IsValidUtf8(valid_utf8), "Chinese + emoji must be valid UTF-8");
+  Expect(dbpp::SanitizeUtf8(valid_utf8) == valid_utf8,
+         "SanitizeUtf8 must preserve valid UTF-8 verbatim");
+
+  // Raw GBK / CP936 bytes (e.g. from Windows FormatMessageA / gai_strerror).
+  const std::string gbk_bytes = "\xD3\xC9\xD3\xDA\xC4\xBF\xB1\xEA";
+  Expect(!dbpp::IsValidUtf8(gbk_bytes), "Raw GBK bytes must fail IsValidUtf8");
+  const std::string cleaned_gbk = dbpp::SanitizeUtf8(gbk_bytes);
+  Expect(dbpp::IsValidUtf8(cleaned_gbk) &&
+             cleaned_gbk.find("\xEF\xBF\xBD") != std::string::npos,
+         "SanitizeUtf8 must convert GBK bytes to valid UTF-8 with U+FFFD");
+
+  const std::string mixed = "连接失败: \xD3\xC9\xD3\xDA";
+  const std::string cleaned_mixed = dbpp::SanitizeUtf8(mixed);
+  Expect(dbpp::IsValidUtf8(cleaned_mixed) && cleaned_mixed.starts_with("连接失败: "),
+         "SanitizeUtf8 must keep valid UTF-8 prefix intact");
+
+  for (const std::string_view bad : {
+           std::string_view("\xC0\xAF", 2),         // overlong 2-byte
+           std::string_view("\xED\xA0\x80", 3),     // UTF-16 high surrogate
+           std::string_view("\xE8\xBF", 2),         // truncated 3-byte
+           std::string_view("\xF4\x90\x80\x80", 4), // > U+10FFFF
+       }) {
+    Expect(!dbpp::IsValidUtf8(bad), "Malformed UTF-8 edge case must be rejected");
+    Expect(dbpp::IsValidUtf8(dbpp::SanitizeUtf8(bad)),
+           "Malformed UTF-8 edge case must sanitize cleanly");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -575,6 +608,7 @@ int main() {
   TestDriverInstallDiscoverLoadUninstall(temp.path, driver_path);
   TestPostgresUriAndSqlReadDetection();
   TestDatabasePresetsAndUriComposer(temp.path);
+  TestUtf8ValidationAndSanitization();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

@@ -322,6 +322,8 @@ struct AdbcManagerContext {
 };
 
 // ---- value and identifier helpers -----------------------------------------
+[[nodiscard]] bool IsValidUtf8(std::string_view text) noexcept;
+[[nodiscard]] std::string SanitizeUtf8(std::string_view text);
 [[nodiscard]] std::string QuoteIdentifier(Dialect dialect, std::string_view identifier);
 [[nodiscard]] std::string SqlLiteral(Dialect dialect, std::string_view text,
                                      std::string_view declared_type, bool is_null);

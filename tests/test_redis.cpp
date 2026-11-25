@@ -770,6 +770,10 @@ void TestUriAndParsingHelpers() {
          "Mixed read+write script must not be read-only");
   Expect(dbpp::IsRedisReadCommand("# comment\nPING\nDBSIZE"),
          "Comment + read-only lines must be read-only");
+
+  const std::string preview = dbpp::SingleLineCellPreview("前缀\r\n\xD3\xC9\xD3\xDA");
+  Expect(dbpp::IsValidUtf8(preview) && preview.starts_with("前缀 "),
+         "SingleLineCellPreview must return valid UTF-8 on invalid byte sequences");
 }
 
 void TestRedisSessionCrudAndCli(const fs::path& dir) {

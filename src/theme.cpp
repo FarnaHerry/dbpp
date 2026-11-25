@@ -1,4 +1,5 @@
 #include "theme.h"
+#include "model.h"
 
 #include <algorithm>
 #include <utility>
@@ -371,13 +372,13 @@ View PageTitle(std::string title, View actions) {
 
 [[huxerui::composable]] View MutedText(std::string text) {
   const ThemeSpec& spec = UseTheme();
-  return Text(text).Style(
+  return Text(SanitizeUtf8(text)).Style(
       TextStyle{Font::System(font_size::kCaption), spec.colors.on_surface_variant});
 }
 
 [[huxerui::composable]] View ErrorText(std::string text) {
   const ThemeSpec& spec = UseTheme();
-  return Text(text).Style(
+  return Text(SanitizeUtf8(text)).Style(
       TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::SemiBold), spec.colors.error});
 }
 

@@ -225,10 +225,11 @@ std::string TrimmedSql(std::string_view text) {
 }
 
 std::string NormalizeToastMessage(std::string_view text) {
+  const std::string utf8 = SanitizeUtf8(text);
   std::string out;
-  out.reserve(text.size());
+  out.reserve(utf8.size());
   bool pending_sep = false;
-  for (const char c : text) {
+  for (const char c : utf8) {
     if (c == '\r' || c == '\n') {
       if (!out.empty()) {
         pending_sep = true;

@@ -12,11 +12,13 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -57,8 +59,82 @@ void ReleaseError(AdbcError& error) {
   }
 }
 
+bool DecodeUtf8Sequence(std::string_view text, std::size_t index, std::size_t& out_len) noexcept {
+  out_len = 0;
+  if (index >= text.size()) {
+    return false;
+  }
+  const auto first = static_cast<std::uint8_t>(text[index]);
+  if (first <= 0x7FU) {
+    out_len = 1;
+    return true;
+  }
+  std::size_t length = 0;
+  std::uint32_t value = 0;
+  std::uint32_t minimum = 0;
+  if ((first & 0xE0U) == 0xC0U) {
+    length = 2;
+    value = first & 0x1FU;
+    minimum = 0x80U;
+  } else if ((first & 0xF0U) == 0xE0U) {
+    length = 3;
+    value = first & 0x0FU;
+    minimum = 0x800U;
+  } else if ((first & 0xF8U) == 0xF0U) {
+    length = 4;
+    value = first & 0x07U;
+    minimum = 0x10000U;
+  } else {
+    return false;
+  }
+  if (length > text.size() - index) {
+    return false;
+  }
+  for (std::size_t offset = 1; offset < length; ++offset) {
+    const auto continuation = static_cast<std::uint8_t>(text[index + offset]);
+    if ((continuation & 0xC0U) != 0x80U) {
+      return false;
+    }
+    value = (value << 6U) | (continuation & 0x3FU);
+  }
+  if (value < minimum || value > 0x10FFFFU || (value >= 0xD800U && value <= 0xDFFFU)) {
+    return false;
+  }
+  out_len = length;
+  return true;
+}
+
+std::string DecodeSystemTextToUtf8(std::string_view raw) {
+  if (raw.empty() || IsValidUtf8(raw)) {
+    return std::string(raw);
+  }
+#if defined(_WIN32)
+  if (raw.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    const int src_len = static_cast<int>(raw.size());
+    const int wide_len = MultiByteToWideChar(CP_ACP, 0, raw.data(), src_len, nullptr, 0);
+    if (wide_len > 0) {
+      std::wstring wide(static_cast<std::size_t>(wide_len), L'\0');
+      if (MultiByteToWideChar(CP_ACP, 0, raw.data(), src_len, wide.data(), wide_len) ==
+          wide_len) {
+        const int utf8_len =
+            WideCharToMultiByte(CP_UTF8, 0, wide.data(), wide_len, nullptr, 0, nullptr, nullptr);
+        if (utf8_len > 0) {
+          std::string utf8(static_cast<std::size_t>(utf8_len), '\0');
+          if (WideCharToMultiByte(CP_UTF8, 0, wide.data(), wide_len, utf8.data(), utf8_len,
+                                  nullptr, nullptr) == utf8_len) {
+            return SanitizeUtf8(utf8);
+          }
+        }
+      }
+    }
+  }
+#endif
+  return SanitizeUtf8(raw);
+}
+
 std::string TakeError(AdbcError& error) {
-  std::string message = error.message != nullptr ? error.message : "unknown ADBC error";
+  std::string message =
+      error.message != nullptr ? DecodeSystemTextToUtf8(error.message) : "unknown ADBC error";
   ReleaseError(error);
   return message;
 }
@@ -398,7 +474,7 @@ struct FieldInfo {
 
 std::string StreamError(ArrowArrayStream& stream) {
   const char* message = stream.get_last_error != nullptr ? stream.get_last_error(&stream) : nullptr;
-  return message != nullptr ? message : "Arrow stream error";
+  return message != nullptr ? DecodeSystemTextToUtf8(message) : "Arrow stream error";
 }
 
 std::string FormatDouble(double value) {
@@ -493,7 +569,8 @@ CellValue ExtractCell(const ArrowArrayView& view, int64_t row, const FieldInfo& 
     case NANOARROW_TYPE_STRING_VIEW: {
       const ArrowStringView value = ArrowArrayViewGetStringUnsafe(&view, row);
       if (value.data != nullptr) {
-        cell.text.assign(value.data, static_cast<std::size_t>(value.size_bytes));
+        const std::string_view sv(value.data, static_cast<std::size_t>(value.size_bytes));
+        cell.text = IsValidUtf8(sv) ? std::string(sv) : SanitizeUtf8(sv);
       }
       return cell;
     }
@@ -941,13 +1018,13 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
     ArrowError arrow_error;
     ArrowErrorInit(&arrow_error);
     if (ArrowArrayViewInitFromSchema(&root, &schema.schema, &arrow_error) != NANOARROW_OK) {
-      result.error = arrow_error.message;
+      result.error = DecodeSystemTextToUtf8(arrow_error.message);
       array.release(&array);
       return result;
     }
     ArrowErrorInit(&arrow_error);
     if (ArrowArrayViewSetArray(&root, &array, &arrow_error) != NANOARROW_OK) {
-      result.error = arrow_error.message;
+      result.error = DecodeSystemTextToUtf8(arrow_error.message);
       array.release(&array);
       ArrowArrayViewReset(&root);
       return result;
@@ -1169,7 +1246,7 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
   ArrowError arrow_error;
   ArrowErrorInit(&arrow_error);
   if (ArrowArrayViewInitFromSchema(&root, &schema.schema, &arrow_error) != NANOARROW_OK) {
-    result.error = arrow_error.message;
+    result.error = DecodeSystemTextToUtf8(arrow_error.message);
     cleanup();
     return result;
   }
@@ -1188,13 +1265,13 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
     ArrowArrayViewReset(&root);
     ArrowErrorInit(&arrow_error);
     if (ArrowArrayViewInitFromSchema(&root, &schema.schema, &arrow_error) != NANOARROW_OK) {
-      result.error = arrow_error.message;
+      result.error = DecodeSystemTextToUtf8(arrow_error.message);
       array.release(&array);
       break;
     }
     ArrowErrorInit(&arrow_error);
     if (ArrowArrayViewSetArray(&root, &array, &arrow_error) != NANOARROW_OK) {
-      result.error = arrow_error.message;
+      result.error = DecodeSystemTextToUtf8(arrow_error.message);
       array.release(&array);
       break;
     }
@@ -1221,6 +1298,38 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
   ArrowArrayViewReset(&root);
   cleanup();
   return result;
+}
+
+bool IsValidUtf8(std::string_view text) noexcept {
+  std::size_t index = 0;
+  while (index < text.size()) {
+    std::size_t len = 0;
+    if (!DecodeUtf8Sequence(text, index, len)) {
+      return false;
+    }
+    index += len;
+  }
+  return true;
+}
+
+std::string SanitizeUtf8(std::string_view text) {
+  if (IsValidUtf8(text)) {
+    return std::string(text);
+  }
+  std::string out;
+  out.reserve(text.size() + 8);
+  std::size_t index = 0;
+  while (index < text.size()) {
+    std::size_t len = 0;
+    if (DecodeUtf8Sequence(text, index, len)) {
+      out.append(text.substr(index, len));
+      index += len;
+    } else {
+      out += "\xEF\xBF\xBD";
+      ++index;
+    }
+  }
+  return out;
 }
 
 std::string QuoteIdentifier(Dialect dialect, std::string_view identifier) {

@@ -1298,6 +1298,11 @@ float EstimateDisplayUnits(std::string_view text, float stop_units) {
 } // namespace
 
 std::string SingleLineCellPreview(std::string_view text) {
+  std::string sanitized;
+  if (!IsValidUtf8(text)) {
+    sanitized = SanitizeUtf8(text);
+    text = sanitized;
+  }
   constexpr std::size_t kMaxPreviewBytes = 1024;
   std::string out;
   out.reserve(std::min(text.size(), kMaxPreviewBytes));

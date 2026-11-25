@@ -158,19 +158,41 @@ void CloseSocketHandle(SocketHandle s) {
   }
 }
 
+std::string WideToUtf8(const wchar_t* wide) {
+  if (wide == nullptr || *wide == L'\0') {
+    return {};
+  }
+  const int utf8_len =
+      WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+  if (utf8_len <= 1) {
+    return {};
+  }
+  std::string out(static_cast<std::size_t>(utf8_len - 1), '\0');
+  if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), utf8_len, nullptr, nullptr) <= 0) {
+    return {};
+  }
+  return out;
+}
+
 std::string LastSocketErrorText(int err_code = 0) {
   const int code = err_code != 0 ? err_code : WSAGetLastError();
-  char* msg = nullptr;
-  FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+  wchar_t* msg = nullptr;
+  FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                      FORMAT_MESSAGE_IGNORE_INSERTS,
                  nullptr, static_cast<DWORD>(code), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                 reinterpret_cast<LPSTR>(&msg), 0, nullptr);
-  std::string out = msg != nullptr ? std::string(TrimAscii(msg))
-                                   : ("WSA error " + std::to_string(code));
+                 reinterpret_cast<LPWSTR>(&msg), 0, nullptr);
+  std::string converted = WideToUtf8(msg);
   if (msg != nullptr) {
     LocalFree(msg);
   }
-  return out;
+  const std::string_view trimmed = TrimAscii(converted);
+  return trimmed.empty() ? ("WSA error " + std::to_string(code)) : std::string(trimmed);
+}
+
+std::string GaiErrorText(int err_code) {
+  std::string converted = WideToUtf8(gai_strerrorW(err_code));
+  const std::string_view trimmed = TrimAscii(converted);
+  return trimmed.empty() ? ("getaddrinfo error " + std::to_string(err_code)) : std::string(trimmed);
 }
 
 bool SetNonBlocking(SocketHandle s, bool non_blocking) {
@@ -237,6 +259,12 @@ void CloseSocketHandle(SocketHandle s) {
 std::string LastSocketErrorText(int err_code = 0) {
   const int code = err_code != 0 ? err_code : errno;
   return std::strerror(code);
+}
+
+std::string GaiErrorText(int err_code) {
+  const char* msg = gai_strerror(err_code);
+  return (msg != nullptr && *msg != '\0') ? std::string(msg)
+                                          : ("getaddrinfo error " + std::to_string(err_code));
 }
 
 bool SetNonBlocking(SocketHandle s, bool non_blocking) {
@@ -1690,7 +1718,7 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
   struct addrinfo* res = nullptr;
   const int gai = getaddrinfo(endpoint_.host.c_str(), port_str.c_str(), &hints, &res);
   if (gai != 0 || res == nullptr) {
-    error_out = "解析主机失败 (" + endpoint_.host + "): " + gai_strerror(gai);
+    error_out = "解析主机失败 (" + endpoint_.host + "): " + GaiErrorText(gai);
     return false;
   }
 
