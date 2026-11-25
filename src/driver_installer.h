@@ -81,10 +81,20 @@ struct DriverInstallResult {
 huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
     std::shared_ptr<huxerui::HttpClient> http);
 
+/// Synchronously fetches and parses the ADBC Driver Registry catalog for
+/// headless CLI execution (supports `http(s)://` via curl and `file://` URLs).
+[[nodiscard]] RegistryCatalogResult FetchRegistryCatalogBlocking(
+    std::string_view registry_url_override = {});
+
 /// Downloads, verifies, extracts, and installs `driver` asynchronously, invoking
 /// `on_progress` on the application thread with Chinese status text.
 huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
     std::shared_ptr<huxerui::HttpClient> http, RegistryDriverInfo driver,
     std::function<void(std::string)> on_progress = {});
+
+/// Synchronously downloads (or copies for `file://`), verifies, extracts, and
+/// installs `driver` for headless CLI execution.
+[[nodiscard]] DriverInstallResult InstallRegistryDriverBlocking(
+    const RegistryDriverInfo& driver, const std::filesystem::path& user_drivers_dir = {});
 
 } // namespace dbpp

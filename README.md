@@ -7,19 +7,23 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 
 ## 功能
 
-- 打开/连接数据库：SQLite 文件、任意 ADBC driver（PostgreSQL / MySQL / DuckDB …）
+- 顶部工具栏与统一连接树：左上角提供「新建连接 / 新建查询 / 驱动管理」快捷按钮，左侧栏以单一可滚动树统一展示已连接会话与已保存连接（点击原地连接并展开/收起其下「表 / 视图 / 物化视图 / 外部表」等对象分组、不改变连接排列顺序，支持拖拽连接行调整顺序并持久化到 `connections.tsv`，以及右键菜单刷新、新建查询、查看结构、复制名称/URI/SELECT、删除对象和断开/删除配置）
+- 打开/连接数据库：两步式「新建连接」向导先选择数据库类型（SQLite / PostgreSQL / MySQL / MariaDB / DuckDB / SQL Server / ClickHouse / Arrow Flight SQL / Snowflake / BigQuery / Trino / Databricks / Amazon Redshift / 自定义 ADBC 驱动），显示驱动就绪状态与一键安装，并按类型展示文件选择或主机/端口/库名表单（可切换原始 URI）
 - ADBC 管理器：保存连接配置（不含密码）、发现本机驱动、在线安装/更新/卸载 ADBC 驱动、
   从列表中选择驱动/连接并删除配置
-- 表与视图列表、虚拟化数据表格（Lib-DataTable）、分页、排序、`WHERE` 筛选
-- SQLite 使用 `rowid`，其它数据库使用主键约束做行标识；支持行内编辑、添加行、删除行
-- SQL 控制台：结果表格、影响行数、执行后自动刷新对象列表
+- 单行紧凑表与视图列表、右侧多标签页工作区（同屏打开并独立保留多个表、视图与 SQL 查询页状态）
+- 虚拟化数据表格（Lib-DataTable）：单元格与表头单行显示、超出宽度自动省略号（不换行），首次打开按采样内容自动调节初始列宽，后续保留用户手动拖拽拉伸的列宽；支持底部分页、排序、`WHERE` 筛选（SQLite 使用 `rowid`，其它数据库使用主键约束做行标识）
+- 行内编辑、底部内联空白草稿行添加（未提交前不做入库校验，支持「提交」事务写入或「回滚」放弃）与删除行
+- SQL 控制台：独立查询标签页、结果表格、影响行数、执行后自动刷新对象列表
 - 系统托盘：托盘图标与菜单（显示主窗口 / 启用托盘 / 轻量级模式 / 退出），
   托盘拥有应用生命周期；托盘不可用时关闭会弹确认退出
+- 桌面单实例：同一时间只允许运行一个 GUI 实例；重复启动或通过桌面打开文件会唤醒已有窗口并转发待打开数据库（CLI 子命令仍可并发无头运行）
+- 无头 CLI：`dbpp <command> ...`，无需 GUI/显示服务即可直接查表、执行 SQL、管理 `connections.tsv` 与在线安装/卸载 ADBC 驱动，支持 `--json` 结构化输出供 AI Agent 调用
 - 轻量级模式：关闭窗口时销毁整个界面（断开全部 ADBC 会话），从托盘唤出时重建，
   空闲内存占用更低；设置页可开关，持久化在 `settings.tsv`
 - 单色黑白主题与应用图标（标题栏 logo / 托盘图标 / Windows .ico / macOS .icns /
   Linux hicolor 图标 + desktop 文件）
-- 启动参数：`dbpp /path/to/file.sqlite`，或 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
+- 启动参数：无参或 `dbpp /path/to/file.sqlite`（以及 `dbpp gui` / `dbpp open`）启动 GUI；`dbpp <command>` 走无头 CLI；也可用 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
 
 ## 构建与测试
 
@@ -88,14 +92,54 @@ DBPP_SQLITE_DRIVER=/path/to/libadbc_driver_sqlite.so ./build/dbpp
 ADBC 驱动管理器启用标准搜索标志（`ADBC_LOAD_FLAG_DEFAULT`），可通过 `dbc install <slug>`、系统包或自定义路径安装对应驱动后直接使用。
 分页使用 `LIMIT … OFFSET …`，标识符按方言引用（MySQL 使用反引号，其余双引号）。
 
+## CLI（AI Agent / 终端操作）
+
+同一份 `dbpp` 可执行文件在传入子命令时完全无头运行（不初始化 GTK/Win32/AppKit 窗口或托盘），与桌面端共用 `connections.tsv` 与用户 ADBC 驱动目录。全局支持 `--json`（等同 `--format json`，成功输出 `{"ok":true,...}`，错误向 stderr 输出 `{"ok":false,"error":"..."}`）、`--format table|tsv|csv|json`，退出码约定为 `0`（成功）/ `1`（运行时或数据库错误）/ `2`（用法或参数错误）。
+
+常用命令：
+
+```sh
+# 诊断本机环境（版本、数据目录、SQLite 驱动、已发现驱动）
+dbpp doctor --json
+
+# 管理 ADBC 驱动（与 GUI「ADBC 管理器」共用目录）
+dbpp driver list --json
+dbpp driver catalog --filter postgres --json
+dbpp driver install postgresql --json
+dbpp driver uninstall postgresql --json
+
+# 管理已保存连接（passwords 不落盘；查询时通过 --password-env 传入）
+dbpp profile save pg --driver postgresql --uri postgresql://127.0.0.1:5432/myapp --user dev
+dbpp profile list --json
+dbpp profile show pg --json
+dbpp profile remove pg --json
+
+# 查看对象 / 表结构 / 分页数据 / 执行 SQL（支持 SQL 字面量、--file 或 stdin `-`）
+dbpp tables --sqlite ./app.sqlite --json
+dbpp schema --sqlite ./app.sqlite items --json
+dbpp rows   --sqlite ./app.sqlite items --where "id >= 1" --order id:desc --limit 20 --json
+dbpp query  --sqlite ./app.sqlite "SELECT id, name FROM items ORDER BY id" --read-only --json
+dbpp exec   --sqlite ./app.sqlite --script --file ./init.sql --json
+dbpp sql    --sqlite ./app.sqlite - --json <<'SQL'
+SELECT COUNT(*) AS total FROM items;
+SQL
+
+# 复用已保存的 PostgreSQL 配置（通过环境变量传密码，不暴露到进程命令行或磁盘）
+PGPASS=secret dbpp tables -p pg --password-env PGPASS --json
+```
+
+完整说明可执行 `dbpp --help` 或 `dbpp <command> --help`。
+
 ## 目录
 
 ```
+src/cli.*              无头 CLI 解析、JSON/TSV/CSV/表格输出、Agent 子命令分发
 src/adbc_session.*     ADBC 句柄、Arrow 流读取、对象/模式元数据、manifest 发现
 src/driver_installer.* ADBC Driver Registry 目录拉取、SHA-256 校验与安全安装/卸载
 src/db.cpp             表格分页、行编辑/删除/插入、SQL 异步封装
 src/app.cpp            HuxerUI 壳、侧栏、数据表、SQL 页、设置页、对话框
 src/theme.*            黑白主题与共享控件
+src/instance.*         跨平台 GUI 单实例锁与唤出/文件转发通道
 src/tray.*             托盘运行时：图标/菜单、关闭策略、轻量级模式
 src/settings.*         settings.tsv 读写与应用级 SettingsModel
 resources/             运行时资源包（应用内 logo、托盘图标）

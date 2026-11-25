@@ -328,6 +328,7 @@ bool TableContext::CancelOnEscape(const KeyEvent& event) const {
 
 View ResizeHandle(std::shared_ptr<const TableContext> table, std::size_t index) {
   const auto id = table->options->columns[index].id;
+  const auto bounds = table->options->columns[index].width;
   const float width = table->geometry->ColumnWidth(index);
   const auto update = [table, id, index](const DragEvent& event) {
     const std::optional<ColumnDrag>& drag = table->drag;
@@ -335,10 +336,33 @@ View ResizeHandle(std::shared_ptr<const TableContext> table, std::size_t index) 
       table->Resize(index, drag->width + event.window_position.x - drag->window_x);
     }
   };
-  const auto end = [table, id](const DragEvent& event) {
+  const auto end_drag = [table, id, index, bounds](const DragEvent& event) {
     const std::optional<ColumnDrag>& drag = table->drag;
-    if (drag && drag->pointer_id == event.pointer_id && drag->column_id == id) {
-      table->drag = std::nullopt;
+    if (!drag || drag->pointer_id != event.pointer_id || drag->column_id != id) {
+      return;
+    }
+    const float drag_start_width = drag->width;
+    const float final_width =
+        std::clamp(drag_start_width + event.window_position.x - drag->window_x, bounds.min, bounds.max);
+    table->Resize(index, final_width);
+    table->drag = std::nullopt;
+    if (final_width != drag_start_width) {
+      table->events.Emit<DataTableEvents::ColumnResized>(DataTableColumnResize{id, final_width});
+    }
+  };
+  const auto cancel_drag = [table, id, bounds](const DragEvent& event) {
+    const std::optional<ColumnDrag>& drag = table->drag;
+    if (!drag || drag->pointer_id != event.pointer_id || drag->column_id != id) {
+      return;
+    }
+    const float drag_start_width = drag->width;
+    const ColumnWidths& current = table->widths;
+    const auto stored = current.by_id.find(id);
+    const float final_width = std::clamp(
+        stored == current.by_id.end() ? bounds.initial : stored->second, bounds.min, bounds.max);
+    table->drag = std::nullopt;
+    if (final_width != drag_start_width) {
+      table->events.Emit<DataTableEvents::ColumnResized>(DataTableColumnResize{id, final_width});
     }
   };
   return Spacer().With(
@@ -351,11 +375,8 @@ View ResizeHandle(std::shared_ptr<const TableContext> table, std::size_t index) 
         table->drag = ColumnDrag{id, event.pointer_id, width, event.window_position.x - event.translation.x};
       })
       .On<DragEvents::Changed>(update)
-      .On<DragEvents::Ended>([update, end](const DragEvent& event) {
-        update(event);
-        end(event);
-      })
-      .On<DragEvents::Canceled>(end);
+      .On<DragEvents::Ended>(end_drag)
+      .On<DragEvents::Canceled>(cancel_drag);
 }
 
 View HeaderCell(std::shared_ptr<const TableContext> table, std::size_t index) {
@@ -368,7 +389,10 @@ View HeaderCell(std::shared_ptr<const TableContext> table, std::size_t index) {
       ? std::optional<StringVariant>(ascending ? "Sorted ascending" : "Sorted descending") : std::nullopt;
 
   View title = Row {
-    Text(column.header, TextRole::Label).With(Grow(1.0F)),
+    Text(column.header, TextRole::Label)
+        .LineLimit(1)
+        .Overflow(TextOverflow::Ellipsis)
+        .With(Grow(1.0F)),
     sorted ? Text(arrow, TextRole::Label).With(FontSize(9.0F)) : View{},
   }.With(
       Grow(1.0F),

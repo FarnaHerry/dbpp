@@ -1,7 +1,10 @@
 #pragma once
 
+#include "instance.h"
+
 #include <huxerui/app.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +36,8 @@ struct TrayRuntime : std::enable_shared_from_this<TrayRuntime> {
   bool window_visible = false;
   std::uint64_t window_generation = 0;
   std::string presentation_key;
+  std::function<void(InstanceOpenRequest)> open_request_handler;
+  std::optional<InstanceOpenRequest> pending_open_request;
 
   void ShowWindow();
   void HideWindow();
@@ -41,6 +46,9 @@ struct TrayRuntime : std::enable_shared_from_this<TrayRuntime> {
   void ToggleLightweight();
   void RefreshTray();
   void HideTray();
+  void SetOpenRequestHandler(std::function<void(InstanceOpenRequest)> handler);
+  void ClearOpenRequestHandler();
+  void DeliverOpenRequest(InstanceOpenRequest request);
 };
 
 /// Installs the desktop tray runtime as an application hook: tray lifecycle

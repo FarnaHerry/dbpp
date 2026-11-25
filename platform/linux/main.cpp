@@ -1,10 +1,16 @@
 #include <huxerui/app.h>
 
-#include <cstdlib>
+#include "../../src/cli.h"
+#include "../../src/instance.h"
 
 int main(int argc, char** argv) {
-  if (argc > 1 && argv[1] != nullptr && *argv[1] != '\0') {
-    setenv("DBPP_OPEN", argv[1], 1);
+  if (const auto exit_code = dbpp::TryRunCli(argc, argv)) {
+    return *exit_code;
   }
-  return huxerui::RunApplication();
+  if (!dbpp::AcquireSingleInstanceOrActivate(true, dbpp::PeekEnvOpenRequest())) {
+    return 0;
+  }
+  const int exit_code = huxerui::RunApplication();
+  dbpp::ReleaseSingleInstance();
+  return exit_code;
 }

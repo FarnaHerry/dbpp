@@ -117,7 +117,8 @@ std::string ResolvePackageUrl(std::string_view base_url, std::string_view url) {
     return {};
   }
   const std::string lower = LowerAscii(url);
-  if (lower.starts_with("http://") || lower.starts_with("https://")) {
+  if (lower.starts_with("http://") || lower.starts_with("https://") ||
+      lower.starts_with("file://")) {
     return std::string(url);
   }
   std::string_view base = base_url;
@@ -663,6 +664,103 @@ std::string FormatProgressText(std::string_view slug, std::uint64_t received,
            to_mb(*total) + " MB (" + std::to_string(percent) + "%)";
   }
   return "正在下载 " + std::string(slug) + ": " + to_mb(received) + " MB";
+}
+
+std::optional<std::filesystem::path> ParseFileUrlPath(std::string_view url) {
+  const std::string lower = LowerAscii(url);
+  if (!lower.starts_with("file://")) {
+    return std::nullopt;
+  }
+  std::string_view rest = url.substr(7);
+  if (LowerAscii(rest).starts_with("localhost/")) {
+    rest.remove_prefix(9);
+  }
+  const auto hex_val = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string decoded;
+  decoded.reserve(rest.size());
+  for (std::size_t i = 0; i < rest.size(); ++i) {
+    if (rest[i] == '%' && i + 2 < rest.size()) {
+      const int hi = hex_val(rest[i + 1]);
+      const int lo = hex_val(rest[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        decoded.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    decoded.push_back(rest[i]);
+  }
+#if defined(_WIN32)
+  if (decoded.size() >= 3 && decoded[0] == '/' &&
+      std::isalpha(static_cast<unsigned char>(decoded[1])) && decoded[2] == ':') {
+    decoded.erase(0, 1);
+  }
+#endif
+  if (decoded.empty()) {
+    return std::nullopt;
+  }
+  const std::u8string u8(reinterpret_cast<const char8_t*>(decoded.data()), decoded.size());
+  return std::filesystem::path(u8);
+}
+
+bool DownloadUrlToFileBlocking(std::string_view url, const std::filesystem::path& dest_path,
+                               std::string_view accept_header, int max_time_seconds,
+                               std::string& error_out) {
+  if (const auto local_path = ParseFileUrlPath(url)) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(*local_path, ec)) {
+      error_out = "本地文件不存在: " + local_path->string();
+      return false;
+    }
+    std::filesystem::copy_file(*local_path, dest_path,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+      error_out = "复制文件失败: " + ec.message();
+      return false;
+    }
+    return true;
+  }
+
+  const std::string lower = LowerAscii(url);
+  if (!lower.starts_with("http://") && !lower.starts_with("https://")) {
+    error_out = "不支持的 URL 协议: " + std::string(url);
+    return false;
+  }
+
+#if defined(_WIN32)
+  const std::string curl_bin = "curl.exe";
+#else
+  const std::string curl_bin = "curl";
+#endif
+  const ProcessResult proc = RunProcess({
+      curl_bin,
+      "-fsSL",
+      "--connect-timeout",
+      "15",
+      "--max-time",
+      std::to_string(max_time_seconds),
+      "-H",
+      "Accept: " + std::string(accept_header),
+      "-o",
+      dest_path.string(),
+      std::string(url),
+  });
+  if (!proc.spawn_error.empty()) {
+    error_out = proc.spawn_error;
+    return false;
+  }
+  if (proc.exit_code != 0) {
+    const std::string_view detail = TrimAscii(proc.output);
+    error_out = detail.empty() ? ("curl 退出码 " + std::to_string(proc.exit_code))
+                               : std::string(detail);
+    return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -1374,6 +1472,115 @@ huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
     result.error = "当前平台 (" + platform + ") 暂无可用的在线驱动";
   }
   co_return result;
+}
+
+RegistryCatalogResult FetchRegistryCatalogBlocking(std::string_view registry_url_override) {
+  RegistryCatalogResult result;
+  std::string base_url =
+      registry_url_override.empty() ? AdbcRegistryBaseUrl() : std::string(registry_url_override);
+  while (base_url.size() > 1 && base_url.back() == '/') {
+    base_url.pop_back();
+  }
+  const std::string index_url = base_url + "/index.yaml";
+
+  std::string yaml_text;
+  if (const auto local_index = ParseFileUrlPath(index_url)) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(*local_index, ec)) {
+      result.error = "驱动目录文件不存在: " + local_index->string();
+      return result;
+    }
+    std::ifstream in(*local_index, std::ios::binary);
+    if (!in) {
+      result.error = "无法读取驱动目录文件: " + local_index->string();
+      return result;
+    }
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    yaml_text = oss.str();
+  } else {
+    std::error_code ec;
+    const std::filesystem::path temp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec || temp_dir.empty()) {
+      result.error = "无法获取临时目录";
+      return result;
+    }
+    const std::filesystem::path tmp_yaml =
+        temp_dir / ("dbpp-registry-" + NextUniqueSuffix() + ".yaml");
+    ScopedFileRemoval cleanup{tmp_yaml};
+
+    std::string download_error;
+    if (!DownloadUrlToFileBlocking(index_url, tmp_yaml, "application/yaml", 30, download_error)) {
+      result.error = "获取驱动目录失败: " + download_error;
+      return result;
+    }
+    std::ifstream in(tmp_yaml, std::ios::binary);
+    if (!in) {
+      result.error = "读取驱动目录临时文件失败";
+      return result;
+    }
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    yaml_text = oss.str();
+  }
+
+  const std::string platform = CurrentPlatformTuple();
+  result.drivers = ParseRegistryIndexYaml(yaml_text, base_url, platform);
+  if (result.drivers.empty()) {
+    result.error = "当前平台 (" + platform + ") 暂无可用的在线驱动";
+  }
+  return result;
+}
+
+DriverInstallResult InstallRegistryDriverBlocking(const RegistryDriverInfo& driver,
+                                                  const std::filesystem::path& user_drivers_dir) {
+  DriverInstallResult result;
+  result.slug = driver.slug;
+
+  if (!IsValidSlug(driver.slug)) {
+    result.message = "非法的驱动标识: " + driver.slug;
+    return result;
+  }
+  if (driver.package_url.empty()) {
+    result.message = "驱动缺少下载地址";
+    return result;
+  }
+
+  const std::filesystem::path drivers_dir = ResolveUserDriversDir(user_drivers_dir);
+  if (drivers_dir.empty()) {
+    result.message = "无法确定用户 ADBC 驱动目录";
+    return result;
+  }
+
+  if (const auto local_archive = ParseFileUrlPath(driver.package_url)) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(*local_archive, ec)) {
+      result.message = "本地安装包不存在: " + local_archive->string();
+      return result;
+    }
+    return InstallDriverArchiveBlocking(driver, *local_archive, drivers_dir);
+  }
+
+  const std::filesystem::path downloads_dir = drivers_dir / ".downloads";
+  std::error_code ec;
+  std::filesystem::create_directories(downloads_dir, ec);
+  if (ec) {
+    result.message = "创建下载目录失败: " + ec.message();
+    return result;
+  }
+
+  const std::filesystem::path tmp_archive =
+      downloads_dir / (driver.slug + "-" + NextUniqueSuffix() + ".tar.gz");
+  ScopedFileRemoval archive_cleanup{tmp_archive};
+
+  std::string download_error;
+  if (!DownloadUrlToFileBlocking(driver.package_url, tmp_archive, "application/octet-stream", 300,
+                                 download_error)) {
+    result.message = "下载失败: " + download_error;
+    return result;
+  }
+
+  return InstallDriverArchiveBlocking(driver, tmp_archive, drivers_dir);
 }
 
 huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(

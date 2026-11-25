@@ -1,5 +1,6 @@
 #include "theme.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace dbpp::ui {
@@ -226,7 +227,10 @@ ThemeDefinition AppThemeDefinition(const ThemeSpec& spec) {
   menus.background = spec.colors.surface_container;
   menus.foreground = spec.colors.on_surface;
   menus.icon_tint = spec.colors.on_surface_variant;
-  menus.separator_color = spec.colors.outline;
+  menus.separator_color = WithAlpha(spec.colors.outline, 0.35F);
+  menus.separator_mode = MenuSeparatorMode::BetweenSections;
+  menus.item_padding = EdgeInsets::Symmetric(12.0F, 6.0F);
+  menus.minimum_item_height = 30.0F;
   menus.shadow = Shadow{spec.colors.outline, {}, 0.0F, 1.0F};
   menus.corner_radii = CornerRadii{6.0F};
   menus.item_indication = MonochromeIndication(spec.colors.on_surface);
@@ -236,6 +240,15 @@ ThemeDefinition AppThemeDefinition(const ThemeSpec& spec) {
   dividers.color = spec.colors.outline;
   dividers.thickness = 1.0F;
   definition.Set(dividers);
+
+  ToastStyle toasts = ToastStyle::Default();
+  toasts.background = VisualFill{spec.colors.inverse_surface};
+  toasts.text_style = TextStyle{Font::System(font_size::kChip), spec.colors.inverse_on_surface};
+  toasts.padding = EdgeInsets::Symmetric(14.0F, 10.0F);
+  toasts.corner_radii = CornerRadii{6.0F};
+  toasts.maximum_width = 560.0F;
+  toasts.shadow = Shadow{spec.colors.outline, {}, 0.0F, 1.0F};
+  definition.Set(toasts);
 
   return definition;
 }
@@ -254,6 +267,34 @@ ThemeDefinition AppThemeDefinition(const ThemeSpec& spec) {
     return Theme(std::move(definition), std::move(button));
   }
   return button;
+}
+
+[[huxerui::composable]] View TitleBarButton(std::string label, std::function<void()> on_click,
+                                            bool active) {
+  const ThemeSpec& spec = UseTheme();
+  ButtonStyle style = UseEnvironment<ButtonStyle>();
+  style.padding = EdgeInsets::Symmetric(10.0F, 4.0F);
+  style.minimum_height = 26.0F;
+  style.corner_radii = CornerRadii{6.0F};
+  if (active) {
+    style.background = VisualFill{spec.colors.primary};
+    style.label_style =
+        TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium),
+                  spec.colors.on_primary};
+    style.indication = MonochromeIndication(spec.colors.on_primary);
+  } else {
+    style.background = VisualFill{Color::Transparent()};
+    style.label_style =
+        TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium),
+                  spec.colors.on_surface};
+    style.indication = MonochromeIndication(spec.colors.on_surface);
+  }
+  ThemeDefinition definition;
+  definition.Set(style);
+  View button = Button(std::move(label))
+                    .OnClick(std::move(on_click))
+                    .With(Border{spec.colors.outline, 1.0F}, CornerRadius{6.0F});
+  return Theme(std::move(definition), std::move(button));
 }
 
 [[huxerui::composable]] View NavItem(std::string label, std::string detail, bool selected,
@@ -291,6 +332,123 @@ ThemeDefinition AppThemeDefinition(const ThemeSpec& spec) {
     return std::move(row).OnClick(std::move(on_click));
   }
   return row;
+}
+
+[[huxerui::composable]] View TreeRow(TreeRowOptions options, std::function<void()> on_click) {
+  const ThemeSpec& spec = UseTheme();
+  auto interaction = UseState(InteractionState{});
+  const InteractionState state = interaction.Get();
+  const bool hovered = state.enabled && (state.hovered || state.pressed || state.focus_visible);
+
+  const Color foreground =
+      options.selected
+          ? spec.colors.on_primary
+          : (options.muted ? WithAlpha(spec.colors.on_surface, 0.62F) : spec.colors.on_surface);
+  const Color secondary =
+      options.selected
+          ? WithAlpha(spec.colors.on_primary, 0.78F)
+          : WithAlpha(spec.colors.on_surface, options.muted ? 0.48F : 0.62F);
+  const VisualFill background =
+      options.selected ? VisualFill{spec.colors.primary} : VisualFill{Color::Transparent()};
+  const Color border_color =
+      options.selected
+          ? Color::Transparent()
+          : (hovered ? spec.colors.outline
+                     : (options.active_hint ? WithAlpha(spec.colors.outline, 0.45F)
+                                            : Color::Transparent()));
+
+  const float left_padding = 8.0F + static_cast<float>(std::max(0, options.indent_level)) * 14.0F;
+
+  Views children;
+  if (!options.prefix.empty()) {
+    children.Add(Text(options.prefix)
+                     .Style(TextStyle{Font::System(font_size::kCaption), secondary})
+                     .Align(TextAlign::Center)
+                     .LineLimit(1)
+                     .With(Frame{.width = 12.0F}));
+  }
+
+  const float font_px =
+      options.emphasize && options.indent_level > 0 ? font_size::kChip : 13.0F;
+  const Font label_font = options.emphasize
+                              ? Font::System(font_px).WithWeight(FontWeight::SemiBold)
+                              : Font::System(font_px);
+  children.Add(Text(options.label)
+                   .Style(TextStyle{label_font, foreground})
+                   .LineLimit(1)
+                   .Overflow(TextOverflow::Ellipsis)
+                   .With(Grow(1.0F)));
+
+  if (!options.trailing_text.empty()) {
+    children.Add(Text(options.trailing_text)
+                     .Style(TextStyle{Font::System(font_size::kCaption), secondary})
+                     .LineLimit(1));
+  }
+
+  View row = Row{std::move(children)}.With(
+      Frame{.min_height = 26.0F},
+      Padding{EdgeInsets{.top = 4.0F, .right = 8.0F, .bottom = 4.0F, .left = left_padding}},
+      Spacing{5.0F}, CrossAlign{CrossAxisAlignment::Center}, CornerRadius{5.0F},
+      Background{background}, Border{border_color, 1.0F}, InteractionSink{interaction});
+
+  if (on_click) {
+    return std::move(row).OnClick(std::move(on_click));
+  }
+  return row;
+}
+
+[[huxerui::composable]] View WorkspaceTabItem(WorkspaceTabItemOptions options,
+                                              std::function<void()> on_select,
+                                              std::function<void()> on_close) {
+  const ThemeSpec& spec = UseTheme();
+  auto interaction = UseState(InteractionState{});
+  const InteractionState state = interaction.Get();
+  const bool hovered = state.enabled && (state.hovered || state.pressed || state.focus_visible);
+
+  const Color foreground = options.active ? spec.colors.on_primary : spec.colors.on_surface;
+  const Color secondary =
+      options.active ? WithAlpha(spec.colors.on_primary, 0.72F)
+                     : WithAlpha(spec.colors.on_surface, 0.62F);
+  const VisualFill background =
+      options.active ? VisualFill{spec.colors.primary} : VisualFill{Color::Transparent()};
+  const Color border_color =
+      options.active ? spec.colors.outline
+                     : (hovered ? spec.colors.outline : WithAlpha(spec.colors.outline, 0.35F));
+
+  const Font label_font =
+      options.active ? Font::System(font_size::kChip).WithWeight(FontWeight::SemiBold)
+                     : Font::System(font_size::kChip).WithWeight(FontWeight::Medium);
+  const std::string display_label = (options.dirty ? "● " : "") + options.label;
+
+  Views label_parts;
+  label_parts.Add(Text(display_label)
+                      .Style(TextStyle{label_font, foreground})
+                      .LineLimit(1)
+                      .Overflow(TextOverflow::Ellipsis));
+  if (!options.sublabel.empty()) {
+    label_parts.Add(Text(options.sublabel)
+                        .Style(TextStyle{Font::System(font_size::kCaption), secondary})
+                        .LineLimit(1)
+                        .Overflow(TextOverflow::Ellipsis));
+  }
+
+  View label_area =
+      Row{std::move(label_parts)}
+          .With(Padding{EdgeInsets{.top = 4.0F, .right = 4.0F, .bottom = 4.0F, .left = 10.0F}},
+                Spacing{5.0F}, CrossAlign{CrossAxisAlignment::Center})
+          .OnClick(std::move(on_select));
+
+  View close_area =
+      Text("×")
+          .Style(TextStyle{Font::System(13.0F), secondary})
+          .With(Padding{EdgeInsets{.top = 4.0F, .right = 8.0F, .bottom = 4.0F, .left = 4.0F}},
+                CornerRadius{4.0F})
+          .OnClick(std::move(on_close));
+
+  return Row{std::move(label_area), std::move(close_area)}.With(
+      Frame{.max_width = 240.0F, .min_height = 28.0F}, Spacing{0.0F},
+      CrossAlign{CrossAxisAlignment::Center}, CornerRadius{5.0F}, Background{background},
+      Border{border_color, 1.0F}, InteractionSink{interaction});
 }
 
 View PageTitle(std::string title, View actions) {

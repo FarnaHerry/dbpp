@@ -62,6 +62,7 @@ void TrayRuntime::RequestExit() {
     return;
   }
   exit_requested = true;
+  MarkInstanceClosing();
   HideTray();
   HideWindow();
   application->Quit();
@@ -129,13 +130,34 @@ void TrayRuntime::HideTray() {
   tray_refresh_failed = false;
 }
 
+void TrayRuntime::SetOpenRequestHandler(std::function<void(InstanceOpenRequest)> handler) {
+  open_request_handler = std::move(handler);
+  if (open_request_handler && pending_open_request.has_value()) {
+    InstanceOpenRequest queued = std::move(*pending_open_request);
+    pending_open_request.reset();
+    open_request_handler(std::move(queued));
+  }
+}
+
+void TrayRuntime::ClearOpenRequestHandler() {
+  open_request_handler = nullptr;
+}
+
+void TrayRuntime::DeliverOpenRequest(InstanceOpenRequest request) {
+  if (open_request_handler) {
+    open_request_handler(std::move(request));
+  } else {
+    pending_open_request = std::move(request);
+  }
+}
+
 huxerui::WindowOptions MainWindowOptions() {
   return WindowOptions{
       .title = "db++",
       .initial_size = {1240.0F, 800.0F},
       .minimum_size = huxerui::Size{900.0F, 600.0F},
       .chrome_mode = huxerui::WindowChromeMode::Custom,
-      .title_bar_height = 32.0F,
+      .title_bar_height = 40.0F,
   };
 }
 
@@ -163,6 +185,14 @@ void InstallTrayRuntime(ApplicationContext& context) {
     for (;;) {
       if (runtime->exit_requested) {
         co_return;
+      }
+      const bool activated = ConsumeInstanceActivation();
+      auto open_req = TakePendingInstanceOpenRequest();
+      if (activated || open_req.has_value()) {
+        runtime->ShowWindow();
+        if (open_req.has_value()) {
+          runtime->DeliverOpenRequest(std::move(*open_req));
+        }
       }
       const bool enabled = runtime->settings->tray_enabled.Get();
       // The tray is the only entry point into a hidden or destroyed window.

@@ -421,6 +421,139 @@ void TestDriverInstallDiscoverLoadUninstall(const fs::path& dir, const std::stri
          "IsUserInstalledAdbcDriver should report false after uninstall");
 }
 
+void TestPostgresUriAndSqlReadDetection() {
+  Expect(dbpp::BuildPostgresqlUriWithCredentials("postgresql://127.0.0.1:5432/myapp", "dev",
+                                               "p@ss:w/ord 100%") ==
+             "postgresql://dev:p%40ss%3Aw%2Ford%20100%25@127.0.0.1:5432/myapp",
+         "BuildPostgresqlUriWithCredentials plain URI mismatch");
+
+  Expect(dbpp::BuildPostgresqlUriWithCredentials("postgres://olduser@db.local:5432/app?sslmode=disable",
+                                               "", "sec&ret") ==
+             "postgres://olduser:sec%26ret@db.local:5432/app?sslmode=disable",
+         "BuildPostgresqlUriWithCredentials existing user override mismatch");
+
+  Expect(dbpp::BuildPostgresqlUriWithCredentials("host=127.0.0.1 port=5432 dbname=app", "dev",
+                                               "a'b\\c") ==
+             "host=127.0.0.1 port=5432 dbname=app user='dev' password='a\\'b\\\\c'",
+         "BuildPostgresqlUriWithCredentials libpq conninfo mismatch");
+
+  Expect(dbpp::IsSqlReadStatement("-- comment\n/* block */\nSELECT 1"),
+         "IsSqlReadStatement should allow comments before SELECT");
+  Expect(dbpp::IsSqlReadStatement("SHOW TABLES"), "SHOW should be read statement");
+  Expect(dbpp::IsSqlReadStatement("DESCRIBE users"), "DESCRIBE should be read statement");
+  Expect(dbpp::IsSqlReadStatement("desc users"), "desc should be read statement");
+  Expect(dbpp::IsSqlReadStatement("INSERT INTO t VALUES (1) RETURNING id"),
+         "RETURNING should be treated as returning rows");
+  Expect(!dbpp::IsSqlReadStatement("DELETE FROM t WHERE id = 1"),
+         "DELETE without RETURNING should not be read statement");
+
+  const auto make_obj = [](std::string schema, std::string name, std::string table_type,
+                           bool is_view) {
+    dbpp::DbObject obj;
+    obj.db_schema = std::move(schema);
+    obj.name = std::move(name);
+    obj.table_type = std::move(table_type);
+    obj.is_view = is_view;
+    return obj;
+  };
+  Expect(dbpp::BuildDropObjectSql(dbpp::Dialect::Sqlite,
+                                  make_obj({}, "items", "TABLE", false)) ==
+             "DROP TABLE \"items\"",
+         "BuildDropObjectSql SQLite table mismatch");
+  Expect(dbpp::BuildDropObjectSql(dbpp::Dialect::Sqlite,
+                                  make_obj({}, "v_items", "VIEW", true)) ==
+             "DROP VIEW \"v_items\"",
+         "BuildDropObjectSql SQLite view mismatch");
+  Expect(dbpp::BuildDropObjectSql(dbpp::Dialect::Postgresql,
+                                  make_obj("public", "users", "BASE TABLE", false)) ==
+             "DROP TABLE \"public\".\"users\"",
+         "BuildDropObjectSql PostgreSQL table mismatch");
+  Expect(dbpp::BuildDropObjectSql(dbpp::Dialect::Postgresql,
+                                  make_obj("analytics", "daily", "MATERIALIZED VIEW", true)) ==
+             "DROP MATERIALIZED VIEW \"analytics\".\"daily\"",
+         "BuildDropObjectSql materialized view mismatch");
+  Expect(dbpp::BuildDropObjectSql(dbpp::Dialect::Postgresql,
+                                  make_obj("ext", "events", "FOREIGN TABLE", false)) ==
+             "DROP FOREIGN TABLE \"ext\".\"events\"",
+         "BuildDropObjectSql foreign table mismatch");
+  Expect(dbpp::BuildDropObjectSql(dbpp::Dialect::Mysql,
+                                  make_obj({}, "orders", "BASE TABLE", false)) ==
+             "DROP TABLE `orders`",
+         "BuildDropObjectSql MySQL table mismatch");
+}
+
+void TestDatabasePresetsAndUriComposer(const fs::path& dir) {
+  const std::vector<dbpp::DatabasePreset>& presets = dbpp::SupportedDatabasePresets();
+  Expect(!presets.empty(), "SupportedDatabasePresets must not be empty");
+
+  auto find_preset = [&](std::string_view id) -> const dbpp::DatabasePreset* {
+    for (const auto& preset : presets) {
+      Expect(!preset.id.empty() && !preset.name.empty(), "Each preset needs id and name");
+      if (preset.id == id) {
+        return &preset;
+      }
+    }
+    return nullptr;
+  };
+
+  const auto* sqlite = find_preset("sqlite");
+  const auto* pg = find_preset("postgresql");
+  const auto* mysql = find_preset("mysql");
+  const auto* mariadb = find_preset("mariadb");
+  const auto* duckdb = find_preset("duckdb");
+  const auto* mssql = find_preset("mssql");
+  const auto* clickhouse = find_preset("clickhouse");
+  const auto* flightsql = find_preset("flightsql");
+  const auto* custom = find_preset("custom");
+  Expect(sqlite && sqlite->builtin && pg && mysql && mariadb && duckdb && mssql && clickhouse &&
+             flightsql && custom,
+         "Expected core supported presets in SupportedDatabasePresets");
+
+  if (pg != nullptr) {
+    Expect(dbpp::ComposePresetUri(*pg, "::1", "5432", "app db") ==
+               "postgresql://[::1]:5432/app%20db",
+           "ComposePresetUri PostgreSQL IPv6/db encoding mismatch");
+  }
+  if (mysql != nullptr) {
+    Expect(dbpp::ComposePresetUri(*mysql, "db.local", "3306", "") == "mysql://db.local:3306",
+           "ComposePresetUri MySQL without db mismatch");
+    Expect(dbpp::ComposePresetUri(*mysql, "db.local", "3306", "shop") ==
+               "mysql://db.local:3306/shop",
+           "ComposePresetUri MySQL with db mismatch");
+  }
+  if (mssql != nullptr) {
+    Expect(dbpp::ComposePresetUri(*mssql, "10.0.0.5", "1433", "Sales DB") ==
+               "mssql://10.0.0.5:1433?database=Sales%20DB",
+           "ComposePresetUri SQL Server mismatch");
+  }
+  if (clickhouse != nullptr) {
+    Expect(dbpp::ComposePresetUri(*clickhouse, "127.0.0.1", "8123", "analytics") ==
+               "http://127.0.0.1:8123/?database=analytics",
+           "ComposePresetUri ClickHouse mismatch");
+  }
+
+  if (sqlite != nullptr) {
+    const auto matched_sqlite = dbpp::FindInstalledDriverForPreset(*sqlite, {});
+    Expect(matched_sqlite.has_value() && !matched_sqlite->path.empty(),
+           "Builtin SQLite preset must always resolve a driver");
+  }
+  if (pg != nullptr) {
+    const std::vector<dbpp::AdbcDriverInfo> fake_drivers = {
+        dbpp::AdbcDriverInfo{.name = "PostgreSQL",
+                             .path = "postgresql",
+                             .detail = "manifest · v1.13.0",
+                             .version = "1.13.0",
+                             .is_manifest = true},
+    };
+    const auto matched_pg = dbpp::FindInstalledDriverForPreset(*pg, fake_drivers);
+    Expect(matched_pg.has_value() && matched_pg->path == "postgresql",
+           "FindInstalledDriverForPreset should match manifest slug postgresql");
+    Expect(!dbpp::FindInstalledDriverForPreset(*pg, {}).has_value(),
+           "FindInstalledDriverForPreset should return nullopt when driver is absent");
+  }
+  (void)dir;
+}
+
 } // namespace
 
 int main() {
@@ -430,6 +563,8 @@ int main() {
   TestDefaultDriverAndSqliteCrud(temp.path, driver_path);
   TestSha256AndYamlParser(temp.path);
   TestDriverInstallDiscoverLoadUninstall(temp.path, driver_path);
+  TestPostgresUriAndSqlReadDetection();
+  TestDatabasePresetsAndUriComposer(temp.path);
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

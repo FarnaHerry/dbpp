@@ -162,6 +162,16 @@ struct DataTableEditRequest {
   std::string text;
 };
 
+/// @brief Final column width after a user resize gesture completes.
+struct DataTableColumnResize {
+  /// Stable ID of the resized column.
+  std::string column_id;
+  /// Final clamped column width in logical pixels.
+  float width = 0.0F;
+
+  bool operator==(const DataTableColumnResize&) const = default;
+};
+
 /// @brief Typed events bound with View::On() on the returned table View.
 ///
 /// Handlers run synchronously on the UI thread. Payload references are valid for the duration of the callback.
@@ -173,6 +183,8 @@ struct DataTableEvents {
   struct SelectionRequested : Event<void(const DataTableCellId&)> {};
   /// Delivers the cell ID and text after the editor commits its draft.
   struct EditSubmitted : Event<void(const DataTableEditRequest&)> {};
+  /// Delivers the final column ID and width when a column resize drag finishes.
+  struct ColumnResized : Event<void(const DataTableColumnResize&)> {};
 };
 
 /// @brief Display snapshot, dimensions, and controlled interaction state for one table declaration.

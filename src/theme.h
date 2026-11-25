@@ -20,8 +20,34 @@ inline constexpr float kTitle = 20.0F;
 [[nodiscard]] huxerui::ThemeDefinition AppThemeDefinition(const huxerui::ThemeSpec& spec);
 
 huxerui::View ActionButton(huxerui::View action, bool primary = false);
+huxerui::View TitleBarButton(std::string label, std::function<void()> on_click,
+                             bool active = false);
 huxerui::View NavItem(std::string label, std::string detail, bool selected,
                       std::function<void()> on_click, huxerui::View trailing = {});
+
+struct TreeRowOptions {
+  std::string prefix;
+  std::string label;
+  std::string trailing_text;
+  int indent_level = 0;
+  bool selected = false;
+  bool emphasize = false;
+  bool active_hint = false;
+  bool muted = false;
+};
+
+huxerui::View TreeRow(TreeRowOptions options, std::function<void()> on_click = {});
+
+struct WorkspaceTabItemOptions {
+  std::string label;
+  std::string sublabel;
+  bool active = false;
+  bool dirty = false;
+};
+
+huxerui::View WorkspaceTabItem(WorkspaceTabItemOptions options,
+                               std::function<void()> on_select,
+                               std::function<void()> on_close);
 huxerui::View PageTitle(std::string title, huxerui::View actions);
 huxerui::View Caption(std::string text);
 huxerui::View MutedText(std::string text);

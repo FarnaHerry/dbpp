@@ -679,6 +679,9 @@ std::filesystem::path BundledDriverDirectory() {
 #endif
 }
 
+std::string InjectSchemeUriCredentials(std::string_view uri, std::string_view username,
+                                       std::string_view password);
+
 } // namespace
 
 std::string DefaultSqliteDriverPath() {
@@ -771,13 +774,30 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
                             request.driver_path.c_str(), &error) != ADBC_STATUS_OK) {
     return fail("设置 ADBC driver");
   }
-  if (!request.uri.empty() &&
-      AdbcDatabaseSetOption(&session->database, ADBC_OPTION_URI, request.uri.c_str(),
+
+  const Dialect dialect = DetectDialect(request.driver_path, request.uri);
+  const std::string lower_uri = LowerAscii(request.uri);
+  const std::string lower_driver = LowerAscii(request.driver_path);
+  bool credentials_in_uri = false;
+  std::string effective_uri = request.uri;
+  if (dialect == Dialect::Postgresql) {
+    effective_uri =
+        BuildPostgresqlUriWithCredentials(request.uri, request.username, request.password);
+    credentials_in_uri = true;
+  } else if ((!request.username.empty() || !request.password.empty()) &&
+             (lower_uri.starts_with("mysql://") || lower_uri.starts_with("mariadb://") ||
+              lower_uri.starts_with("mssql://") || lower_uri.starts_with("sqlserver://") ||
+              (lower_driver.find("clickhouse") != std::string::npos &&
+               (lower_uri.starts_with("http://") || lower_uri.starts_with("https://"))))) {
+    effective_uri = InjectSchemeUriCredentials(request.uri, request.username, request.password);
+    credentials_in_uri = true;
+  }
+  if (!effective_uri.empty() &&
+      AdbcDatabaseSetOption(&session->database, ADBC_OPTION_URI, effective_uri.c_str(),
                             &error) != ADBC_STATUS_OK) {
     return fail("设置 URI");
   }
 
-  const Dialect dialect = DetectDialect(request.driver_path, request.uri);
   if (dialect == Dialect::Sqlite && !request.uri.empty() &&
       request.uri != ":memory:" &&
       request.uri.rfind("file:", 0) != 0 && request.uri.find("://") == std::string::npos) {
@@ -787,15 +807,17 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
       std::filesystem::create_directories(database_path.parent_path(), filesystem_error);
     }
   }
-  if (!request.username.empty() &&
-      AdbcDatabaseSetOption(&session->database, "username", request.username.c_str(),
-                            &error) != ADBC_STATUS_OK) {
-    return fail("设置用户名");
-  }
-  if (!request.password.empty() &&
-      AdbcDatabaseSetOption(&session->database, "password", request.password.c_str(),
-                            &error) != ADBC_STATUS_OK) {
-    return fail("设置密码");
+  if (!credentials_in_uri && dialect != Dialect::Sqlite) {
+    if (!request.username.empty() &&
+        AdbcDatabaseSetOption(&session->database, "username", request.username.c_str(),
+                              &error) != ADBC_STATUS_OK) {
+      return fail("设置用户名");
+    }
+    if (!request.password.empty() &&
+        AdbcDatabaseSetOption(&session->database, "password", request.password.c_str(),
+                              &error) != ADBC_STATUS_OK) {
+      return fail("设置密码");
+    }
   }
   if (AdbcDatabaseInit(&session->database, &error) != ADBC_STATUS_OK) {
     return fail("初始化数据库");
@@ -1151,6 +1173,20 @@ std::string QualifiedName(Dialect dialect, const DbObject& object) {
          QuoteIdentifier(dialect, object.name);
 }
 
+std::string BuildDropObjectSql(Dialect dialect, const DbObject& object) {
+  const std::string qualified = QualifiedName(dialect, object);
+  if (object.is_view) {
+    if (ContainsLower(object.table_type, "materialized")) {
+      return "DROP MATERIALIZED VIEW " + qualified;
+    }
+    return "DROP VIEW " + qualified;
+  }
+  if (ContainsLower(object.table_type, "foreign")) {
+    return "DROP FOREIGN TABLE " + qualified;
+  }
+  return "DROP TABLE " + qualified;
+}
+
 namespace {
 
 bool IsNumericType(std::string_view type) {
@@ -1242,7 +1278,8 @@ bool IsSqlReadStatement(std::string_view sql) {
   const auto end = text.find_first_of(" \t\r\n(");
   const std::string keyword = LowerAscii(text.substr(0, end));
   if (keyword == "select" || keyword == "pragma" || keyword == "explain" ||
-      keyword == "values" || keyword == "table" || keyword == "with") {
+      keyword == "values" || keyword == "table" || keyword == "with" ||
+      keyword == "show" || keyword == "describe" || keyword == "desc") {
     return true;
   }
   return LowerAscii(text).find(" returning ") != std::string::npos;
@@ -1250,7 +1287,377 @@ bool IsSqlReadStatement(std::string_view sql) {
 
 namespace {
 
+bool IsUnreservedUriChar(unsigned char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+         c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+std::string PercentEncodeUriComponent(std::string_view text) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(text.size());
+  for (const unsigned char c : text) {
+    if (IsUnreservedUriChar(c)) {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[(c >> 4) & 0x0F]);
+      out.push_back(kHex[c & 0x0F]);
+    }
+  }
+  return out;
+}
+
+std::string LibpqSingleQuote(std::string_view value) {
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('\'');
+  for (const char c : value) {
+    if (c == '\'' || c == '\\') {
+      out.push_back('\\');
+    }
+    out.push_back(c);
+  }
+  out.push_back('\'');
+  return out;
+}
+
+std::string_view TrimAscii(std::string_view text) {
+  while (!text.empty() &&
+         (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' ||
+          text.front() == '\n')) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() &&
+         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
+          text.back() == '\n')) {
+    text.remove_suffix(1);
+  }
+  return text;
+}
+
+bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < left.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(left[i])) !=
+        std::tolower(static_cast<unsigned char>(right[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string InjectCredentialsIntoSchemeUri(std::string_view uri, std::size_t scheme_end,
+                                           std::string_view username,
+                                           std::string_view password) {
+  const std::size_t auth_end_pos = uri.find_first_of("/?#", scheme_end);
+  const std::size_t auth_end = auth_end_pos == std::string_view::npos ? uri.size() : auth_end_pos;
+  const std::string_view authority = uri.substr(scheme_end, auth_end - scheme_end);
+  const std::size_t at_rel = authority.rfind('@');
+
+  const std::string enc_user = PercentEncodeUriComponent(username);
+  const std::string enc_pass = PercentEncodeUriComponent(password);
+
+  if (at_rel == std::string_view::npos) {
+    std::string out(uri.substr(0, scheme_end));
+    out += enc_user;
+    if (!enc_pass.empty()) {
+      out.push_back(':');
+      out += enc_pass;
+    }
+    out.push_back('@');
+    out += uri.substr(scheme_end);
+    return out;
+  }
+
+  const std::string_view existing_userinfo = authority.substr(0, at_rel);
+  const std::size_t colon = existing_userinfo.find(':');
+  const std::string_view existing_user =
+      colon == std::string_view::npos ? existing_userinfo : existing_userinfo.substr(0, colon);
+  const std::string_view existing_pass =
+      colon == std::string_view::npos ? std::string_view{} : existing_userinfo.substr(colon + 1);
+
+  const std::string final_user = !username.empty() ? enc_user : std::string(existing_user);
+  const std::string final_pass = !password.empty() ? enc_pass : std::string(existing_pass);
+
+  std::string out(uri.substr(0, scheme_end));
+  out += final_user;
+  if (!final_pass.empty()) {
+    out.push_back(':');
+    out += final_pass;
+  }
+  out.push_back('@');
+  out += uri.substr(scheme_end + at_rel + 1);
+  return out;
+}
+
+std::string InjectSchemeUriCredentials(std::string_view uri, std::string_view username,
+                                       std::string_view password) {
+  if (username.empty() && password.empty()) {
+    return std::string(uri);
+  }
+  const std::size_t scheme_pos = uri.find("://");
+  if (scheme_pos == std::string_view::npos) {
+    return std::string(uri);
+  }
+  return InjectCredentialsIntoSchemeUri(uri, scheme_pos + 3, username, password);
+}
+
 } // namespace
+
+std::string DefaultAppDataDir() {
+  if (const char* override_dir = std::getenv("DBPP_DATA_DIR");
+      override_dir != nullptr && *override_dir != '\0') {
+    return override_dir;
+  }
+#if defined(_WIN32)
+  if (const char* local_app_data = std::getenv("LOCALAPPDATA");
+      local_app_data != nullptr && *local_app_data != '\0') {
+    return (std::filesystem::path(local_app_data) / "dbpp" / "data").string();
+  }
+  return {};
+#elif defined(__APPLE__)
+  const char* home = std::getenv("HOME");
+  if (home == nullptr || *home == '\0') {
+    return {};
+  }
+  std::string identity = "dbpp";
+  const std::filesystem::path exe_dir = ExecutableDirectory();
+  if (!exe_dir.empty() && exe_dir.filename() == "MacOS") {
+    const std::filesystem::path contents_dir = exe_dir.parent_path();
+    std::error_code ec;
+    if (contents_dir.filename() == "Contents" &&
+        std::filesystem::is_regular_file(contents_dir / "Info.plist", ec)) {
+      identity = "dev.farna.dbpp";
+    }
+  }
+  return (std::filesystem::path(home) / "Library" / "Application Support" / identity).string();
+#else
+  std::filesystem::path data_base;
+  if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg != nullptr && *xdg != '\0') {
+    data_base = std::filesystem::path(xdg);
+  } else if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+    data_base = std::filesystem::path(home) / ".local" / "share";
+  }
+  if (data_base.empty()) {
+    return {};
+  }
+  return (data_base / "dbpp").string();
+#endif
+}
+
+std::string BuildPostgresqlUriWithCredentials(std::string_view uri, std::string_view username,
+                                              std::string_view password) {
+  if (username.empty() && password.empty()) {
+    return std::string(uri);
+  }
+
+  const std::string lower = LowerAscii(uri);
+  if (lower.starts_with("postgresql://")) {
+    return InjectCredentialsIntoSchemeUri(uri, 13, username, password);
+  }
+  if (lower.starts_with("postgres://")) {
+    return InjectCredentialsIntoSchemeUri(uri, 11, username, password);
+  }
+
+  std::string out(uri);
+  const auto append_kv = [&](std::string_view key, std::string_view val) {
+    if (val.empty()) {
+      return;
+    }
+    if (!out.empty() && out.back() != ' ' && out.back() != '\t') {
+      out.push_back(' ');
+    }
+    out += key;
+    out.push_back('=');
+    out += LibpqSingleQuote(val);
+  };
+  append_kv("user", username);
+  append_kv("password", password);
+  return out;
+}
+
+const std::vector<DatabasePreset>& SupportedDatabasePresets() {
+  const auto make_file = [](std::string id, std::string name, std::string subtitle,
+                            std::string slug, std::string placeholder,
+                            std::vector<std::string> extensions, bool builtin) {
+    DatabasePreset p;
+    p.id = std::move(id);
+    p.name = std::move(name);
+    p.subtitle = std::move(subtitle);
+    p.driver_slug = std::move(slug);
+    p.category = DatabaseCategory::LocalFile;
+    p.form_kind = ConnectionFormKind::File;
+    p.uri_placeholder = std::move(placeholder);
+    p.file_extensions = std::move(extensions);
+    p.builtin = builtin;
+    return p;
+  };
+  const auto make_host = [](std::string id, std::string name, std::string subtitle,
+                            std::string slug, DatabaseCategory category, std::string scheme,
+                            std::string host, std::string port, std::string db,
+                            std::string user, std::string placeholder) {
+    DatabasePreset p;
+    p.id = std::move(id);
+    p.name = std::move(name);
+    p.subtitle = std::move(subtitle);
+    p.driver_slug = std::move(slug);
+    p.category = category;
+    p.form_kind = ConnectionFormKind::HostPort;
+    p.uri_scheme = std::move(scheme);
+    p.default_host = std::move(host);
+    p.default_port = std::move(port);
+    p.default_database = std::move(db);
+    p.default_user = std::move(user);
+    p.uri_placeholder = std::move(placeholder);
+    return p;
+  };
+  const auto make_uri = [](std::string id, std::string name, std::string subtitle,
+                           std::string slug, DatabaseCategory category, ConnectionFormKind kind,
+                           std::string placeholder) {
+    DatabasePreset p;
+    p.id = std::move(id);
+    p.name = std::move(name);
+    p.subtitle = std::move(subtitle);
+    p.driver_slug = std::move(slug);
+    p.category = category;
+    p.form_kind = kind;
+    p.uri_placeholder = std::move(placeholder);
+    return p;
+  };
+
+  static const std::vector<DatabasePreset> presets = {
+      make_file("sqlite", "SQLite", "本地单文件数据库 · 内置驱动", "",
+                "/path/to/app.sqlite 或 :memory:", {"sqlite", "sqlite3", "db", "db3", "s3db"},
+                true),
+      make_host("postgresql", "PostgreSQL", "开源关系型数据库 · 端口 5432", "postgresql",
+                DatabaseCategory::Relational, "postgresql", "127.0.0.1", "5432", "postgres",
+                "postgres", "postgresql://127.0.0.1:5432/postgres"),
+      make_host("mysql", "MySQL", "关系型数据库 · 端口 3306", "mysql",
+                DatabaseCategory::Relational, "mysql", "127.0.0.1", "3306", "", "root",
+                "mysql://127.0.0.1:3306/mydb"),
+      make_host("mariadb", "MariaDB", "MySQL 兼容关系型数据库 · 端口 3306", "mariadb",
+                DatabaseCategory::Relational, "mysql", "127.0.0.1", "3306", "", "root",
+                "mysql://127.0.0.1:3306/mydb"),
+      make_file("duckdb", "DuckDB", "嵌入式列式分析数据库", "duckdb",
+                "/path/to/app.duckdb 或 :memory:", {"duckdb", "ddb", "db"}, false),
+      make_host("mssql", "SQL Server", "Microsoft SQL Server · 端口 1433", "mssql",
+                DatabaseCategory::Relational, "mssql", "127.0.0.1", "1433", "master", "sa",
+                "mssql://127.0.0.1:1433?database=master"),
+      make_host("clickhouse", "ClickHouse", "实时 OLAP 分析数据库 · HTTP 8123", "clickhouse",
+                DatabaseCategory::AnalyticsCloud, "http", "127.0.0.1", "8123", "default",
+                "default", "http://127.0.0.1:8123/?database=default"),
+      make_uri("flightsql", "Arrow Flight SQL", "高性能 Arrow 原生 SQL 协议", "flightsql",
+               DatabaseCategory::AnalyticsCloud, ConnectionFormKind::Uri,
+               "grpc+tls://host:31337"),
+      make_uri("snowflake", "Snowflake", "云数据仓库 · ADBC 驱动", "snowflake",
+               DatabaseCategory::AnalyticsCloud, ConnectionFormKind::Uri,
+               "user:password@account/database/schema"),
+      make_uri("bigquery", "BigQuery", "Google Cloud 分析型数据仓库", "bigquery",
+               DatabaseCategory::AnalyticsCloud, ConnectionFormKind::Uri,
+               "bigquery://project/dataset"),
+      make_uri("trino", "Trino", "分布式联邦 SQL 查询引擎", "trino",
+               DatabaseCategory::AnalyticsCloud, ConnectionFormKind::Uri,
+               "http://host:8080/catalog/schema"),
+      make_uri("databricks", "Databricks", "Lakehouse SQL Warehouse", "databricks",
+               DatabaseCategory::AnalyticsCloud, ConnectionFormKind::Uri,
+               "databricks://token:...@host:443/sql/1.0/warehouses/..."),
+      make_uri("redshift", "Amazon Redshift", "AWS 云数据仓库 · 端口 5439", "redshift",
+               DatabaseCategory::AnalyticsCloud, ConnectionFormKind::Uri,
+               "postgresql://host:5439/dev"),
+      make_uri("custom", "自定义 ADBC 驱动", "任意驱动短名、.toml 或共享库路径", "",
+               DatabaseCategory::Custom, ConnectionFormKind::Custom,
+               "/path/to/db.sqlite · postgresql://host/db"),
+  };
+  return presets;
+}
+
+std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host,
+                             std::string_view port, std::string_view database) {
+  std::string_view h = TrimAscii(host);
+  if (h.empty()) {
+    h = preset.default_host.empty() ? std::string_view("127.0.0.1")
+                                    : std::string_view(preset.default_host);
+  }
+  const std::string_view p = TrimAscii(port);
+  const std::string_view db = TrimAscii(database);
+
+  std::string formatted_host(h);
+  if (formatted_host.find(':') != std::string::npos &&
+      formatted_host.front() != '[' && formatted_host.back() != ']') {
+    formatted_host = "[" + formatted_host + "]";
+  }
+
+  std::string authority = formatted_host;
+  if (!p.empty()) {
+    authority.push_back(':');
+    authority.append(p);
+  }
+
+  const std::string enc_db = PercentEncodeUriComponent(db);
+  if (preset.id == "mssql") {
+    std::string uri = "mssql://" + authority;
+    if (!enc_db.empty()) {
+      uri += "?database=" + enc_db;
+    }
+    return uri;
+  }
+  if (preset.id == "clickhouse") {
+    std::string uri = "http://" + authority + "/";
+    if (!enc_db.empty()) {
+      uri += "?database=" + enc_db;
+    }
+    return uri;
+  }
+
+  const std::string_view scheme =
+      preset.uri_scheme.empty() ? std::string_view("postgresql")
+                                : std::string_view(preset.uri_scheme);
+  std::string uri = std::string(scheme) + "://" + authority;
+  if (!enc_db.empty()) {
+    uri.push_back('/');
+    uri += enc_db;
+  }
+  return uri;
+}
+
+std::optional<AdbcDriverInfo> FindInstalledDriverForPreset(
+    const DatabasePreset& preset, const std::vector<AdbcDriverInfo>& discovered) {
+  if (preset.builtin) {
+    const std::string default_path = DefaultSqliteDriverPath();
+    for (const AdbcDriverInfo& info : discovered) {
+      if (info.path == default_path ||
+          (info.is_manifest && EqualsIgnoreCase(info.path, "sqlite")) ||
+          ContainsLower(info.path, "adbc_driver_sqlite")) {
+        return info;
+      }
+    }
+    return AdbcDriverInfo{
+        .name = "SQLite",
+        .path = default_path,
+        .detail = default_path,
+        .version = {},
+        .is_manifest = false,
+    };
+  }
+  if (preset.driver_slug.empty()) {
+    return std::nullopt;
+  }
+  for (const AdbcDriverInfo& info : discovered) {
+    if (info.is_manifest && EqualsIgnoreCase(info.path, preset.driver_slug)) {
+      return info;
+    }
+  }
+  const std::string lib_token = "adbc_driver_" + LowerAscii(preset.driver_slug);
+  for (const AdbcDriverInfo& info : discovered) {
+    if (ContainsLower(info.path, lib_token) || EqualsIgnoreCase(info.name, preset.name)) {
+      return info;
+    }
+  }
+  return std::nullopt;
+}
 
 namespace {
 

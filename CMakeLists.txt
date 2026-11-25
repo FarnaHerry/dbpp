@@ -161,6 +161,7 @@ target_link_libraries(dbpp PRIVATE
 )
 target_compile_definitions(dbpp PRIVATE
         DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+        DBPP_VERSION="${PROJECT_VERSION}"
 )
 huxerui_add_runtime_dependencies(dbpp TARGETS adbc_driver_sqlite_shared)
 
@@ -307,6 +308,101 @@ if (DBPP_BUILD_TESTS)
         )
     endif ()
     add_test(NAME adbc_core COMMAND test_adbc_core)
+
+    add_executable(test_cli
+            tests/test_cli.cpp
+            src/cli.cpp
+            src/db.cpp
+            src/adbc_session.cpp
+            src/driver_installer.cpp
+    )
+    target_compile_features(test_cli PRIVATE cxx_std_20)
+    target_include_directories(test_cli PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${DBPP_ADBC_DIR}/c/include"
+    )
+    target_include_directories(test_cli SYSTEM PRIVATE
+            "${DBPP_ADBC_DIR}/c/vendor"
+    )
+    target_link_libraries(test_cli PRIVATE
+            HuxerUI::huxerui
+            HuxerUI::DataTable
+            adbc_driver_manager_shared
+            nanoarrow
+    )
+    target_compile_definitions(test_cli PRIVATE
+            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+            DBPP_VERSION="${PROJECT_VERSION}"
+    )
+    add_dependencies(test_cli adbc_driver_sqlite_shared)
+    if (MSVC)
+        target_compile_options(test_cli PRIVATE /utf-8)
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_cli PRIVATE -Wall -Wextra -Wpedantic)
+    endif ()
+    if (WIN32)
+        target_compile_definitions(test_cli PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+        add_custom_command(TARGET test_cli POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:HuxerUI::huxerui>"
+                        "$<TARGET_FILE_DIR:test_cli>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_manager_shared>"
+                        "$<TARGET_FILE_DIR:test_cli>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                        "$<TARGET_FILE_DIR:test_cli>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
+                COMMENT "Copying runtime DLLs next to test_cli.exe"
+                VERBATIM
+        )
+    endif ()
+    add_test(NAME cli COMMAND test_cli)
+
+    add_executable(test_instance
+            tests/test_instance.cpp
+            src/instance.cpp
+            src/adbc_session.cpp
+    )
+    target_compile_features(test_instance PRIVATE cxx_std_20)
+    target_include_directories(test_instance PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${DBPP_ADBC_DIR}/c/include"
+    )
+    target_include_directories(test_instance SYSTEM PRIVATE
+            "${DBPP_ADBC_DIR}/c/vendor"
+    )
+    target_link_libraries(test_instance PRIVATE
+            HuxerUI::huxerui
+            HuxerUI::DataTable
+            adbc_driver_manager_shared
+            nanoarrow
+    )
+    target_compile_definitions(test_instance PRIVATE
+            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+    )
+    add_dependencies(test_instance adbc_driver_sqlite_shared)
+    if (MSVC)
+        target_compile_options(test_instance PRIVATE /utf-8)
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_instance PRIVATE -Wall -Wextra -Wpedantic)
+    endif ()
+    if (WIN32)
+        target_compile_definitions(test_instance PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+        add_custom_command(TARGET test_instance POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:HuxerUI::huxerui>"
+                        "$<TARGET_FILE_DIR:test_instance>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_manager_shared>"
+                        "$<TARGET_FILE_DIR:test_instance>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                        "$<TARGET_FILE_DIR:test_instance>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
+                COMMENT "Copying runtime DLLs next to test_instance.exe"
+                VERBATIM
+        )
+    endif ()
+    add_test(NAME instance COMMAND test_instance)
 endif ()
 
 add_custom_target(dbpp-run
