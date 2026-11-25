@@ -32,7 +32,7 @@
 #endif
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.2.0"
+#define DBPP_VERSION "0.2.1"
 #endif
 
 namespace dbpp {
