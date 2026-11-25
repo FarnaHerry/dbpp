@@ -297,6 +297,37 @@ std::optional<std::filesystem::path> ResolveManifestPath(std::string_view driver
   return std::nullopt;
 }
 
+std::string_view TrimAscii(std::string_view text) {
+  while (!text.empty() &&
+         (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' ||
+          text.front() == '\n')) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() &&
+         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
+          text.back() == '\n')) {
+    text.remove_suffix(1);
+  }
+  return text;
+}
+
+Dialect DetectDialectFromScheme(std::string_view uri) {
+  const std::string lower = LowerAscii(TrimAscii(uri));
+  if (lower.starts_with("redis://") || lower.starts_with("rediss://")) {
+    return Dialect::Redis;
+  }
+  if (lower.starts_with("postgresql://") || lower.starts_with("postgres://")) {
+    return Dialect::Postgresql;
+  }
+  if (lower.starts_with("mysql://") || lower.starts_with("mariadb://")) {
+    return Dialect::Mysql;
+  }
+  if (lower.starts_with("duckdb:")) {
+    return Dialect::Duckdb;
+  }
+  return Dialect::Generic;
+}
+
 Dialect DetectDialectFromText(std::string_view text) {
   const std::string key = LowerAscii(text);
   if (key.find("sqlite") != std::string::npos) {
@@ -318,10 +349,17 @@ Dialect DetectDialectFromText(std::string_view text) {
 }
 
 Dialect DetectDialect(std::string_view driver_path, std::string_view uri) {
-  const Dialect direct =
-      DetectDialectFromText(std::string(driver_path) + " " + std::string(uri));
-  if (direct != Dialect::Generic) {
-    return direct;
+  const Dialect by_scheme = DetectDialectFromScheme(uri);
+  if (by_scheme != Dialect::Generic) {
+    return by_scheme;
+  }
+  const Dialect by_driver = DetectDialectFromText(driver_path);
+  if (by_driver != Dialect::Generic) {
+    return by_driver;
+  }
+  const Dialect by_uri = DetectDialectFromText(uri);
+  if (by_uri != Dialect::Generic) {
+    return by_uri;
   }
   if (const auto manifest_path = ResolveManifestPath(driver_path)) {
     if (const auto parsed = ParseDriverManifest(*manifest_path)) {
@@ -1398,18 +1436,29 @@ std::string LibpqSingleQuote(std::string_view value) {
   return out;
 }
 
-std::string_view TrimAscii(std::string_view text) {
-  while (!text.empty() &&
-         (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' ||
-          text.front() == '\n')) {
-    text.remove_prefix(1);
+int HexDigitValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+std::string PercentDecodeUriComponent(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '%' && i + 2 < text.size()) {
+      const int hi = HexDigitValue(text[i + 1]);
+      const int lo = HexDigitValue(text[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(text[i]);
   }
-  while (!text.empty() &&
-         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
-          text.back() == '\n')) {
-    text.remove_suffix(1);
-  }
-  return text;
+  return out;
 }
 
 bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
@@ -1482,6 +1531,48 @@ std::string InjectSchemeUriCredentials(std::string_view uri, std::string_view us
 }
 
 } // namespace
+
+SanitizedUriResult SanitizeUriCredentials(std::string_view uri) {
+  const std::string_view trimmed = TrimAscii(uri);
+  SanitizedUriResult res;
+  res.uri = std::string(trimmed);
+
+  const std::size_t scheme_pos = trimmed.find("://");
+  if (scheme_pos == std::string_view::npos) {
+    return res;
+  }
+  const std::string scheme = LowerAscii(trimmed.substr(0, scheme_pos));
+  const std::size_t auth_start = scheme_pos + 3;
+  const std::size_t auth_end_pos = trimmed.find_first_of("/?#", auth_start);
+  const std::size_t auth_end =
+      auth_end_pos == std::string_view::npos ? trimmed.size() : auth_end_pos;
+  const std::string_view authority = trimmed.substr(auth_start, auth_end - auth_start);
+  const std::size_t at = authority.rfind('@');
+  if (at == std::string_view::npos) {
+    return res;
+  }
+
+  const std::string_view userinfo = authority.substr(0, at);
+  const std::string_view host_and_rest = trimmed.substr(auth_start + at + 1);
+  const std::size_t colon = userinfo.find(':');
+  if (colon != std::string_view::npos) {
+    res.username = PercentDecodeUriComponent(userinfo.substr(0, colon));
+    res.password = PercentDecodeUriComponent(userinfo.substr(colon + 1));
+    res.stripped_password = !res.password.empty();
+    res.uri = std::string(trimmed.substr(0, auth_start)) + std::string(host_and_rest);
+    return res;
+  }
+
+  if (scheme == "redis" || scheme == "rediss") {
+    res.password = PercentDecodeUriComponent(userinfo);
+    res.stripped_password = !res.password.empty();
+    res.uri = std::string(trimmed.substr(0, auth_start)) + std::string(host_and_rest);
+    return res;
+  }
+
+  res.username = PercentDecodeUriComponent(userinfo);
+  return res;
+}
 
 std::string DefaultAppDataDir() {
   if (const char* override_dir = std::getenv("DBPP_DATA_DIR");
@@ -1661,6 +1752,9 @@ const std::vector<DatabasePreset>& SupportedDatabasePresets() {
 std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host,
                              std::string_view port, std::string_view database) {
   std::string_view h = TrimAscii(host);
+  if (h.find("://") != std::string_view::npos) {
+    return std::string(h);
+  }
   if (h.empty()) {
     h = preset.default_host.empty() ? std::string_view("127.0.0.1")
                                     : std::string_view(preset.default_host);
@@ -1669,13 +1763,26 @@ std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host
   const std::string_view db = TrimAscii(database);
 
   std::string formatted_host(h);
-  if (formatted_host.find(':') != std::string::npos &&
-      formatted_host.front() != '[' && formatted_host.back() != ']') {
+  const std::size_t first_colon = formatted_host.find(':');
+  const std::size_t last_colon = formatted_host.rfind(':');
+  const bool already_bracketed = !formatted_host.empty() && formatted_host.front() == '[';
+  const bool has_multiple_colons =
+      first_colon != std::string::npos && first_colon != last_colon;
+  if (!already_bracketed && has_multiple_colons) {
     formatted_host = "[" + formatted_host + "]";
   }
 
+  bool host_includes_port = false;
+  if (already_bracketed) {
+    const std::size_t close = formatted_host.find(']');
+    host_includes_port = close != std::string::npos && close + 1 < formatted_host.size() &&
+                         formatted_host[close + 1] == ':';
+  } else if (first_colon != std::string::npos && first_colon == last_colon) {
+    host_includes_port = true;
+  }
+
   std::string authority = formatted_host;
-  if (!p.empty()) {
+  if (!host_includes_port && !p.empty()) {
     authority.push_back(':');
     authority.append(p);
   }

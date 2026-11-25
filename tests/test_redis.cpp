@@ -173,6 +173,9 @@ public:
   ~MockRedisServer() { Stop(); }
 
   [[nodiscard]] std::uint16_t Port() const { return port_; }
+  void SetLegacyAuthOnly(bool value) { legacy_auth_only_.store(value); }
+  void SetDisableInfo(bool value) { disable_info_.store(value); }
+  void SetDropOnConfig(bool value) { drop_on_config_.store(value); }
 
 private:
   static void CloseSock(Sock s) {
@@ -368,6 +371,10 @@ private:
               args.push_back(el.ToDisplayString());
             }
           }
+          if (!args.empty() && UpperAscii(args[0]) == "CONFIG" && drop_on_config_.load()) {
+            drop = true;
+            break;
+          }
           const std::string reply = DispatchCommand(args, c.authed, c.cur_db);
           if (!SendAll(c.fd, reply)) {
             drop = true;
@@ -398,6 +405,9 @@ private:
           return Simple("OK");
         }
       } else if (args.size() == 3) {
+        if (legacy_auth_only_.load()) {
+          return Error("ERR wrong number of arguments for 'auth' command");
+        }
         if (args[1] == (required_user_.empty() ? "default" : required_user_) &&
             args[2] == required_password_) {
           authed = true;
@@ -431,6 +441,9 @@ private:
       return "*2\r\n" + Bulk("databases") + Bulk("16");
     }
     if (cmd == "INFO") {
+      if (disable_info_.load()) {
+        return Error("NOPERM User has no permissions to run the 'info' command");
+      }
       const std::string sec = args.size() > 1 ? UpperAscii(args[1]) : std::string("ALL");
       std::ostringstream oss;
       if (sec == "ALL" || sec == "SERVER") {
@@ -641,6 +654,9 @@ private:
 
   std::string required_password_;
   std::string required_user_;
+  std::atomic<bool> legacy_auth_only_{false};
+  std::atomic<bool> disable_info_{false};
+  std::atomic<bool> drop_on_config_{false};
   Sock listen_sock_ = kBadSock;
   std::uint16_t port_ = 0;
   std::atomic<bool> stop_{false};
@@ -693,10 +709,67 @@ void TestUriAndParsingHelpers() {
   const auto script = dbpp::SplitRedisScript("# comment\nSET a \"line1\nline2\"\n\nGET a\n");
   Expect(script.size() == 2 && script[1] == "GET a", "SplitRedisScript mismatch");
 
+  const auto p_db_prefix = dbpp::ParseRedisUri("redis://127.0.0.1:6379/db2");
+  Expect(p_db_prefix.error.empty() && p_db_prefix.endpoint.db == 2,
+         "ParseRedisUri must accept /db2");
+
+  const auto p_query_db_prefix = dbpp::ParseRedisUri("redis://127.0.0.1:6379/?db=db3");
+  Expect(p_query_db_prefix.error.empty() && p_query_db_prefix.endpoint.db == 3,
+         "ParseRedisUri must accept ?db=db3");
+
+  const dbpp::DatabasePreset* redis_preset = nullptr;
+  for (const auto& preset : dbpp::SupportedDatabasePresets()) {
+    if (preset.id == "redis") {
+      redis_preset = &preset;
+      break;
+    }
+  }
+  Expect(redis_preset != nullptr, "redis preset must exist");
+  if (redis_preset != nullptr) {
+    Expect(dbpp::ComposePresetUri(*redis_preset, "redis://10.0.0.1:6379/2", "6379", "0") ==
+               "redis://10.0.0.1:6379/2",
+           "ComposePresetUri must keep full pasted URI");
+    Expect(dbpp::ComposePresetUri(*redis_preset, "127.0.0.1:6380", "6379", "0") ==
+               "redis://127.0.0.1:6380/0",
+           "ComposePresetUri must not bracket host:port as IPv6");
+    Expect(dbpp::ComposePresetUri(*redis_preset, "::1", "6379", "0") == "redis://[::1]:6379/0",
+           "ComposePresetUri must bracket raw IPv6 host");
+  }
+
+  {
+    const auto s1 = dbpp::SanitizeUriCredentials("redis://:secret@127.0.0.1:6379/0");
+    Expect(s1.uri == "redis://127.0.0.1:6379/0" && s1.username.empty() &&
+               s1.password == "secret" && s1.stripped_password,
+           "SanitizeUriCredentials redis://:secret@ mismatch");
+
+    const auto s2 = dbpp::SanitizeUriCredentials("redis://alice:secret@127.0.0.1:6379/1");
+    Expect(s2.uri == "redis://127.0.0.1:6379/1" && s2.username == "alice" &&
+               s2.password == "secret" && s2.stripped_password,
+           "SanitizeUriCredentials redis://alice:secret@ mismatch");
+
+    const auto s3 = dbpp::SanitizeUriCredentials("redis://legacy_pass@127.0.0.1:6379/0");
+    Expect(s3.uri == "redis://127.0.0.1:6379/0" && s3.password == "legacy_pass" &&
+               s3.stripped_password,
+           "SanitizeUriCredentials legacy single-token pass mismatch");
+
+    const auto s4 = dbpp::SanitizeUriCredentials("postgresql://bob:pw@127.0.0.1:5432/app");
+    Expect(s4.uri == "postgresql://127.0.0.1:5432/app" && s4.username == "bob" &&
+               s4.password == "pw" && s4.stripped_password,
+           "SanitizeUriCredentials postgresql:// mismatch");
+
+    const auto s5 = dbpp::SanitizeUriCredentials("/tmp/a@b.sqlite");
+    Expect(s5.uri == "/tmp/a@b.sqlite" && !s5.stripped_password,
+           "SanitizeUriCredentials must preserve local file path");
+  }
+
   Expect(dbpp::IsRedisReadCommand("INFO server"), "INFO must be read-only");
   Expect(dbpp::IsRedisReadCommand("CONFIG GET databases"), "CONFIG GET must be read-only");
   Expect(!dbpp::IsRedisReadCommand("CONFIG SET save \"\""), "CONFIG SET must not be read-only");
   Expect(!dbpp::IsRedisReadCommand("SET foo bar"), "SET must not be read-only");
+  Expect(!dbpp::IsRedisReadCommand("PING\nSET x 1"),
+         "Mixed read+write script must not be read-only");
+  Expect(dbpp::IsRedisReadCommand("# comment\nPING\nDBSIZE"),
+         "Comment + read-only lines must be read-only");
 }
 
 void TestRedisSessionCrudAndCli(const fs::path& dir) {
@@ -857,6 +930,72 @@ void TestRedisSessionCrudAndCli(const fs::path& dir) {
     Expect(use_prof.code == 0 && use_prof.out.find("xyz") != std::string::npos,
            "CLI query -p myredis --password-env failed: " + use_prof.err + " / " + use_prof.out);
   }
+
+  // Multi-line & comment console execution.
+  const dbpp::AdbcQueryResult comment_ping =
+      dbpp::ExecuteBlocking(*opened.session, "# comment\nPING", true, 50);
+  Expect(comment_ping.error.empty() && !comment_ping.rows.empty() &&
+             comment_ping.rows[0].values[0].text == "PONG",
+         "ExecuteBlocking # comment + PING failed: " + comment_ping.error);
+
+  const dbpp::AdbcQueryResult multi_exec =
+      dbpp::ExecuteBlocking(*opened.session, "SET multi:k hello\nGET multi:k", true, 50);
+  Expect(multi_exec.error.empty() && !multi_exec.rows.empty() &&
+             multi_exec.rows[0].values[0].text == "hello",
+         "ExecuteBlocking multi-line script failed: " + multi_exec.error);
+}
+
+void TestRedisAuditRegressions() {
+  // 1. DetectDialect must prioritize redis:// scheme over default SQLite driver path.
+  MockRedisServer basic_server("secret123", "alice");
+  const std::string auth_uri =
+      "redis://alice:secret123@127.0.0.1:" + std::to_string(basic_server.Port()) + "/0";
+  const dbpp::AdbcOpenResult via_sqlite_driver = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = dbpp::DefaultSqliteDriverPath(),
+      .uri = auth_uri,
+      .username = {},
+      .password = {},
+      .title = "scheme-priority",
+  });
+  Expect(via_sqlite_driver.error.empty() && via_sqlite_driver.session != nullptr &&
+             via_sqlite_driver.session->dialect == dbpp::Dialect::Redis,
+         "redis:// URI with default SQLite driver path must still dispatch to Redis: " +
+             via_sqlite_driver.error);
+
+  // 2. Legacy Redis < 6.0 server rejects 3-arg AUTH; client must fall back to 2-arg AUTH.
+  MockRedisServer legacy_server("secret5", "");
+  legacy_server.SetLegacyAuthOnly(true);
+  const dbpp::AdbcOpenResult legacy_open = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = "redis://127.0.0.1:" + std::to_string(legacy_server.Port()) + "/0",
+      .username = "admin",
+      .password = "secret5",
+      .title = "legacy-auth",
+  });
+  Expect(legacy_open.error.empty() && legacy_open.session != nullptr &&
+             legacy_open.session->dialect == dbpp::Dialect::Redis,
+         "Legacy 2-arg AUTH fallback failed: " + legacy_open.error);
+
+  // 3. Restricted cloud/proxy where INFO returns NOPERM and CONFIG closes socket.
+  MockRedisServer restricted_server;
+  restricted_server.SetDisableInfo(true);
+  restricted_server.SetDropOnConfig(true);
+  const dbpp::AdbcOpenResult restricted_open = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = "redis://127.0.0.1:" + std::to_string(restricted_server.Port()) + "/0",
+      .username = {},
+      .password = {},
+      .title = "restricted-cloud",
+  });
+  Expect(restricted_open.error.empty() && restricted_open.session != nullptr,
+         "Connect to restricted Redis failed: " + restricted_open.error);
+  if (restricted_open.session) {
+    const dbpp::AdbcObjectsResult objs = dbpp::LoadObjectsBlocking(*restricted_open.session);
+    Expect(objs.error.empty() && objs.objects.size() == 16 &&
+               objs.objects[0].name == "db0" && objs.objects[0].item_count == 5,
+           "LoadObjectsBlocking must tolerate NOPERM INFO + CONFIG drop and fall back to DBSIZE: " +
+               objs.error);
+  }
 }
 
 } // namespace
@@ -865,6 +1004,7 @@ int main() {
   ScopedTempDir temp;
   TestUriAndParsingHelpers();
   TestRedisSessionCrudAndCli(temp.path);
+  TestRedisAuditRegressions();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " Redis test assertion(s) failed\n";

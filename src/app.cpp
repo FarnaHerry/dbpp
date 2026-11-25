@@ -191,6 +191,19 @@ bool ContainsIgnoreCaseAscii(std::string_view haystack, std::string_view needle)
   return it != haystack.end();
 }
 
+bool StartsWithIgnoreCaseAscii(std::string_view text, std::string_view prefix) {
+  if (text.size() < prefix.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(text[i])) !=
+        std::tolower(static_cast<unsigned char>(prefix[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string_view StripLeadingV(std::string_view text) {
   if (!text.empty() && (text.front() == 'v' || text.front() == 'V')) {
     text.remove_prefix(1);
@@ -335,7 +348,7 @@ View TableEmptyState(const std::string& text) {
          CrossAlign{CrossAxisAlignment::Center});
 }
 
-[[huxerui::composable]] View BigEmptyState(std::function<void()> open_picker, std::function<void()> open_new) {
+[[huxerui::composable]] View BigEmptyState(std::function<void()> open_new) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   return Column{
@@ -351,22 +364,21 @@ View TableEmptyState(const std::string& text) {
                           .min_height = 3.5F, .max_height = 3.5F},
                     CornerRadius{2.0F}, Background{semantic.accent_gradient}),
       MutedText("ADBC 数据管理器"),
-      Row{
-          ActionButton(Button("打开数据库…").OnClick(std::move(open_picker)),
-                       ButtonTone::Primary),
-          ActionButton(Button("新建连接…").OnClick(std::move(open_new))),
-      }.With(Spacing{8.0F}, MainAlign{MainAxisAlignment::Center}),
+      ActionButton(Button("新建连接…").OnClick(std::move(open_new)), ButtonTone::Primary),
   }.With(Grow(1.0F), MainAlign{MainAxisAlignment::Center},
          CrossAlign{CrossAxisAlignment::Center}, Spacing{12.0F},
          Background{semantic.hero_glow});
 }
 
 bool ProfileNeedsPasswordPrompt(const ConnectionProfile& profile) {
-  if (ContainsIgnoreCaseAscii(profile.driver_path, "sqlite") ||
-      ContainsIgnoreCaseAscii(profile.driver_path, "duckdb")) {
+  const std::string_view uri = profile.uri;
+  const bool is_redis_scheme =
+      StartsWithIgnoreCaseAscii(uri, "redis://") || StartsWithIgnoreCaseAscii(uri, "rediss://");
+  if (!is_redis_scheme &&
+      (ContainsIgnoreCaseAscii(profile.driver_path, "sqlite") ||
+       ContainsIgnoreCaseAscii(profile.driver_path, "duckdb"))) {
     return false;
   }
-  const std::string_view uri = profile.uri;
   const std::size_t scheme_pos = uri.find("://");
   if (scheme_pos != std::string_view::npos) {
     const std::size_t auth_start = scheme_pos + 3;
@@ -443,7 +455,8 @@ std::optional<std::size_t> FindMatchingSessionIndex(const ConnectionProfile& pro
           .Label("用户名")
           .Variant(TextFieldVariant::Outlined)
           .LineLimits(TextFieldLineLimits::SingleLine())
-          .OnChanged([username](const TextEditingValue& value) { username = value; }),
+          .OnChanged([username](const TextEditingValue& value) { username = value; })
+          .OnSubmitted([connect] { connect(); }),
       TextField(password)
           .Label("密码（不保存，留空则无密码连接）")
           .Variant(TextFieldVariant::Outlined)
@@ -1491,11 +1504,14 @@ struct SidebarConnectionEntry {
       }
       return false;
     }
+    const SanitizedUriResult sanitized = SanitizeUriCredentials(uri_text);
+    const std::string effective_user =
+        username.Get().text.empty() ? sanitized.username : username.Get().text;
     ConnectionProfile profile{
-        .name = name.Get().text.empty() ? UriDisplayName(uri_text) : name.Get().text,
+        .name = name.Get().text.empty() ? UriDisplayName(sanitized.uri) : name.Get().text,
         .driver_path = driver_path,
-        .uri = uri_text,
-        .username = username.Get().text,
+        .uri = sanitized.uri,
+        .username = effective_user,
     };
     std::vector<ConnectionProfile> list = profiles.Get();
     int index = selected.Get();
@@ -1547,12 +1563,13 @@ struct SidebarConnectionEntry {
     if (!save_profile()) {
       return;
     }
+    const SanitizedUriResult sanitized = SanitizeUriCredentials(uri.Get().text);
     ConnectionRequest request{
         .driver_path = driver.Get().text,
-        .uri = uri.Get().text,
-        .username = username.Get().text,
-        .password = password.Get().text,
-        .title = name.Get().text.empty() ? UriDisplayName(uri.Get().text) : name.Get().text,
+        .uri = sanitized.uri,
+        .username = username.Get().text.empty() ? sanitized.username : username.Get().text,
+        .password = password.Get().text.empty() ? sanitized.password : password.Get().text,
+        .title = name.Get().text.empty() ? UriDisplayName(sanitized.uri) : name.Get().text,
     };
     OpenConnection(context.app, context.workspace, context.tasks, std::move(request),
                    context.notify);
@@ -2118,13 +2135,14 @@ struct SidebarConnectionEntry {
         (active_preset.form_kind == ConnectionFormKind::HostPort && input_mode.Get() == 0)
             ? ComposePresetUri(active_preset, host.Get().text, port.Get().text, database.Get().text)
             : uri.Get().text;
+    const SanitizedUriResult sanitized = SanitizeUriCredentials(effective_uri);
 
     ConnectionRequest request;
     request.driver_path = driver.Get().text;
-    request.uri = effective_uri;
-    request.username = username.Get().text;
-    request.password = password.Get().text;
-    request.title = title.Get().text.empty() ? UriDisplayName(effective_uri) : title.Get().text;
+    request.uri = sanitized.uri;
+    request.username = username.Get().text.empty() ? sanitized.username : username.Get().text;
+    request.password = password.Get().text.empty() ? sanitized.password : password.Get().text;
+    request.title = title.Get().text.empty() ? UriDisplayName(sanitized.uri) : title.Get().text;
 
     if (request.driver_path.empty() || request.uri.empty()) {
       if (context.notify) {
@@ -3446,36 +3464,6 @@ struct SidebarConnectionEntry {
     return [tray_runtime] { tray_runtime->ClearOpenRequestHandler(); };
   });
 
-  const auto open_picker = [picker, tasks, app, workspace, notify]() mutable {
-    if (!picker->CanOpenFiles()) {
-      notify("当前平台不支持系统文件选择器");
-      return;
-    }
-    tasks.Launch([picker, app, workspace, tasks, notify]() -> Task<void> {
-      FilePickerFilter filter;
-      filter.name = "SQLite 数据库";
-      filter.extensions = {"sqlite", "sqlite3", "db", "db3", "s3db"};
-      auto file_reference = co_await picker->OpenFileAsync(std::move(filter));
-      if (!file_reference) {
-        co_return;
-      }
-      auto file = file_reference->AsFile();
-      if (!file) {
-        notify("所选文件没有本地路径");
-        co_return;
-      }
-      OpenConnection(app, workspace, tasks,
-                     ConnectionRequest{
-                         .driver_path = DefaultSqliteDriverPath(),
-                         .uri = file->Path(),
-                         .username = {},
-                         .password = {},
-                         .title = file->Name(),
-                     },
-                     notify);
-    });
-  };
-
   const auto open_manager = [dialogs, app, workspace, profiles, tasks, http, profiles_path,
                              default_file, notify, theme_config,
                              system_dark](std::size_t initial_tab, std::string initial_filter) {
@@ -3621,7 +3609,7 @@ struct SidebarConnectionEntry {
 
   View main_content;
   if (model.sessions.empty() && ws.tabs.empty()) {
-    main_content = BigEmptyState(open_picker, open_new);
+    main_content = BigEmptyState(open_new);
   } else {
     Views tab_items;
     tab_items.Reserve(ws.tabs.size());

@@ -1242,6 +1242,23 @@ std::string RedisValue::ToDisplayString() const {
   return {};
 }
 
+std::optional<int> ParseRedisDbName(std::string_view name) {
+  name = TrimAscii(name);
+  if (name.empty()) {
+    return std::nullopt;
+  }
+  const std::string lower = LowerAscii(name);
+  std::string_view digits = lower;
+  if (digits.starts_with("db")) {
+    digits.remove_prefix(2);
+  }
+  const auto parsed = ParseStrictInt64(digits);
+  if (!parsed.has_value() || *parsed < 0 || *parsed > 1000000) {
+    return std::nullopt;
+  }
+  return static_cast<int>(*parsed);
+}
+
 RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view username_override,
                                   std::string_view password_override) {
   RedisParseUriResult res;
@@ -1355,12 +1372,12 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
     if (const std::size_t extra_slash = path.find('/'); extra_slash != std::string_view::npos) {
       path = path.substr(0, extra_slash);
     }
-    const auto db_num = ParseStrictInt64(path);
-    if (!db_num.has_value() || *db_num < 0 || *db_num > 1000000) {
+    const auto db_num = ParseRedisDbName(path);
+    if (!db_num.has_value()) {
       res.error = "无效的 Redis 数据库编号: " + std::string(path);
       return res;
     }
-    res.endpoint.db = static_cast<int>(*db_num);
+    res.endpoint.db = *db_num;
   }
 
   std::size_t qpos = 0;
@@ -1376,12 +1393,12 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
     const std::string k = LowerAscii(kv.substr(0, eq));
     const std::string v = PercentDecode(kv.substr(eq + 1));
     if (k == "db" && !v.empty()) {
-      const auto db_num = ParseStrictInt64(v);
-      if (!db_num.has_value() || *db_num < 0 || *db_num > 1000000) {
+      const auto db_num = ParseRedisDbName(v);
+      if (!db_num.has_value()) {
         res.error = "无效的 Redis db 参数: " + v;
         return res;
       }
-      res.endpoint.db = static_cast<int>(*db_num);
+      res.endpoint.db = *db_num;
     }
   }
 
@@ -1402,23 +1419,6 @@ std::string FormatRedisDisplayName(std::string_view uri) {
   }
   return host + ":" + std::to_string(parsed.endpoint.port) + "/" +
          std::to_string(parsed.endpoint.db);
-}
-
-std::optional<int> ParseRedisDbName(std::string_view name) {
-  name = TrimAscii(name);
-  if (name.empty()) {
-    return std::nullopt;
-  }
-  const std::string lower = LowerAscii(name);
-  std::string_view digits = lower;
-  if (digits.starts_with("db")) {
-    digits.remove_prefix(2);
-  }
-  const auto parsed = ParseStrictInt64(digits);
-  if (!parsed.has_value() || *parsed < 0 || *parsed > 1000000) {
-    return std::nullopt;
-  }
-  return static_cast<int>(*parsed);
 }
 
 std::string EncodeRespCommand(const std::vector<std::string>& args) {
@@ -1597,12 +1597,6 @@ bool IsRedisReadCommand(std::string_view command_text) {
   if (lines.empty()) {
     return false;
   }
-  const RedisCommandParseResult parsed = ParseRedisCommandLine(lines.front());
-  if (!parsed.error.empty() || parsed.args.empty()) {
-    return false;
-  }
-  const std::string cmd = UpperAscii(parsed.args[0]);
-  const std::string sub = parsed.args.size() > 1 ? UpperAscii(parsed.args[1]) : std::string{};
 
   static const std::unordered_set<std::string_view> kReadCommands = {
       "PING",       "ECHO",       "GET",       "MGET",       "STRLEN",     "GETRANGE",
@@ -1619,24 +1613,38 @@ bool IsRedisReadCommand(std::string_view command_text) {
       "PFCOUNT",    "GEOPOS",     "GEODIST",   "GEOHASH",    "GEOSEARCH",  "GEORADIUS_RO",
       "COMMAND",    "ROLE",       "LASTSAVE",  "HELLO",      "SELECT",
   };
-  if (kReadCommands.contains(cmd)) {
-    return true;
+  for (const std::string& line : lines) {
+    const RedisCommandParseResult parsed = ParseRedisCommandLine(line);
+    if (!parsed.error.empty() || parsed.args.empty()) {
+      return false;
+    }
+    const std::string cmd = UpperAscii(parsed.args[0]);
+    const std::string sub = parsed.args.size() > 1 ? UpperAscii(parsed.args[1]) : std::string{};
+    bool line_is_read = kReadCommands.contains(cmd);
+    if (!line_is_read) {
+      if (cmd == "CONFIG" && sub == "GET") line_is_read = true;
+      else if (cmd == "CLIENT" &&
+               (sub == "LIST" || sub == "INFO" || sub == "ID" || sub == "GETNAME")) {
+        line_is_read = true;
+      } else if (cmd == "MEMORY" && (sub == "USAGE" || sub == "STATS" || sub == "DOCTOR")) {
+        line_is_read = true;
+      } else if (cmd == "OBJECT" &&
+                 (sub == "ENCODING" || sub == "IDLETIME" || sub == "FREQ" || sub == "REFCOUNT")) {
+        line_is_read = true;
+      } else if (cmd == "ACL" &&
+                 (sub == "LIST" || sub == "USERS" || sub == "WHOAMI" || sub == "CAT")) {
+        line_is_read = true;
+      } else if (cmd == "CLUSTER" && (sub == "INFO" || sub == "NODES" || sub == "SLOTS")) {
+        line_is_read = true;
+      } else if (cmd == "XINFO" && (sub == "STREAM" || sub == "GROUPS" || sub == "CONSUMERS")) {
+        line_is_read = true;
+      }
+    }
+    if (!line_is_read) {
+      return false;
+    }
   }
-  if (cmd == "CONFIG" && sub == "GET") return true;
-  if (cmd == "CLIENT" && (sub == "LIST" || sub == "INFO" || sub == "ID" || sub == "GETNAME")) {
-    return true;
-  }
-  if (cmd == "MEMORY" && (sub == "USAGE" || sub == "STATS" || sub == "DOCTOR")) return true;
-  if (cmd == "OBJECT" &&
-      (sub == "ENCODING" || sub == "IDLETIME" || sub == "FREQ" || sub == "REFCOUNT")) {
-    return true;
-  }
-  if (cmd == "ACL" && (sub == "LIST" || sub == "USERS" || sub == "WHOAMI" || sub == "CAT")) {
-    return true;
-  }
-  if (cmd == "CLUSTER" && (sub == "INFO" || sub == "NODES" || sub == "SLOTS")) return true;
-  if (cmd == "XINFO" && (sub == "STREAM" || sub == "GROUPS" || sub == "CONSUMERS")) return true;
-  return false;
+  return true;
 }
 
 // ---- RedisClient Transport & Execution -------------------------------------
@@ -1744,14 +1752,16 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
     return true;
   };
 
-  if (!endpoint_.password.empty()) {
+  const bool has_custom_user =
+      !endpoint_.username.empty() && !EqualsIgnoreCase(endpoint_.username, "default");
+  if (!endpoint_.password.empty() || has_custom_user) {
     RedisValue auth_reply;
     if (!endpoint_.username.empty()) {
       if (!run_direct({"AUTH", endpoint_.username, endpoint_.password}, auth_reply)) {
         Disconnect();
         return false;
       }
-      if (auth_reply.IsError() && EqualsIgnoreCase(endpoint_.username, "default") &&
+      if (auth_reply.IsError() && !endpoint_.password.empty() &&
           LowerAscii(auth_reply.str).find("wrong number of arguments") != std::string::npos) {
         if (!run_direct({"AUTH", endpoint_.password}, auth_reply)) {
           Disconnect();
@@ -1991,25 +2001,47 @@ std::vector<ColumnMeta> RedisKeySchema() {
 
 AdbcObjectsResult LoadRedisObjectsBlocking(RedisClient& client) {
   AdbcObjectsResult result;
-  std::vector<RedisValue> replies;
-  std::string err;
-  if (!client.Pipeline({{"INFO", "keyspace"}, {"CONFIG", "GET", "databases"}}, replies, err)) {
-    result.error = err;
-    return result;
-  }
+  RedisValue info_reply;
+  std::string info_err;
+  const bool info_ok = client.Command({"INFO", "keyspace"}, info_reply, info_err);
 
   std::map<int, std::int64_t> counts;
   bool has_keyspace = false;
-  if (!replies.empty() && !replies[0].IsError() && !replies[0].IsNull()) {
-    counts = ParseInfoKeyspace(replies[0].ToDisplayString());
+  if (info_ok && !info_reply.IsError() && !info_reply.IsNull()) {
+    counts = ParseInfoKeyspace(info_reply.ToDisplayString());
     has_keyspace = true;
   }
 
   int db_limit = 16;
-  if (replies.size() > 1 && replies[1].kind == RedisValueKind::Array &&
-      replies[1].elements.size() >= 2) {
-    if (const auto parsed = ParseStrictInt64(replies[1].elements[1].ToDisplayString())) {
+  RedisValue cfg_reply;
+  std::string cfg_err;
+  const bool cfg_ok = client.Command({"CONFIG", "GET", "databases"}, cfg_reply, cfg_err);
+  if (cfg_ok && cfg_reply.kind == RedisValueKind::Array && cfg_reply.elements.size() >= 2) {
+    if (const auto parsed = ParseStrictInt64(cfg_reply.elements[1].ToDisplayString())) {
       db_limit = std::clamp<int>(static_cast<int>(*parsed), 1, 16);
+    }
+  }
+
+  bool dbsize_ok = false;
+  if (!has_keyspace) {
+    RedisValue dbsize_reply;
+    std::string dbsize_err;
+    dbsize_ok = client.Command({"DBSIZE"}, dbsize_reply, dbsize_err);
+    if (dbsize_ok && dbsize_reply.kind == RedisValueKind::Integer) {
+      counts[client.CurrentDb()] = dbsize_reply.integer;
+      has_keyspace = true;
+    }
+  }
+
+  const bool any_cmd_succeeded = info_ok || cfg_ok || dbsize_ok;
+  if (!any_cmd_succeeded && !client.IsConnected()) {
+    RedisValue ping_reply;
+    std::string ping_err;
+    if (!client.Command({"PING"}, ping_reply, ping_err) || ping_reply.IsError()) {
+      result.error = !ping_err.empty()
+                         ? ping_err
+                         : (!ping_reply.str.empty() ? ping_reply.str : "无法连接 Redis 服务器");
+      return result;
     }
   }
 
@@ -2022,16 +2054,6 @@ AdbcObjectsResult LoadRedisObjectsBlocking(RedisClient& client) {
     db_indices.insert(k);
   }
   db_indices.insert(client.CurrentDb());
-
-  if (!has_keyspace) {
-    RedisValue dbsize_reply;
-    std::string dbsize_err;
-    if (client.Command({"DBSIZE"}, dbsize_reply, dbsize_err) &&
-        dbsize_reply.kind == RedisValueKind::Integer) {
-      counts[client.CurrentDb()] = dbsize_reply.integer;
-      has_keyspace = true;
-    }
-  }
 
   const std::vector<ColumnMeta> schema = RedisKeySchema();
   for (const int idx : db_indices) {
@@ -2352,8 +2374,11 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
   return model;
 }
 
-AdbcQueryResult ExecuteRedisCommandBlocking(RedisClient& client, std::string_view command_text,
-                                            std::size_t max_rows) {
+namespace {
+
+AdbcQueryResult ExecuteSingleRedisCommandBlocking(RedisClient& client,
+                                                  std::string_view command_text,
+                                                  std::size_t max_rows) {
   AdbcQueryResult result;
   const RedisCommandParseResult parsed = ParseRedisCommandLine(command_text);
   if (!parsed.error.empty()) {
@@ -2477,6 +2502,32 @@ AdbcQueryResult ExecuteRedisCommandBlocking(RedisClient& client, std::string_vie
   result.rows.push_back(GridRow{.values = {ReplyToCell(reply)}, .key_values = {}, .rowid = std::nullopt});
   result.affected = reply.kind == RedisValueKind::Integer ? reply.integer : 1;
   return result;
+}
+
+} // namespace
+
+AdbcQueryResult ExecuteRedisCommandBlocking(RedisClient& client, std::string_view command_text,
+                                            std::size_t max_rows) {
+  const std::vector<std::string> lines = SplitRedisScript(command_text);
+  if (lines.empty()) {
+    AdbcQueryResult result;
+    const RedisCommandParseResult syntax_check = ParseRedisCommandLine(command_text);
+    result.error = !syntax_check.error.empty() ? syntax_check.error : "Redis 命令不能为空";
+    return result;
+  }
+  if (lines.size() == 1) {
+    return ExecuteSingleRedisCommandBlocking(client, lines.front(), max_rows);
+  }
+  AdbcQueryResult last_result;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    AdbcQueryResult step = ExecuteSingleRedisCommandBlocking(client, lines[i], max_rows);
+    if (!step.error.empty()) {
+      step.error = "第 " + std::to_string(i + 1) + " 条命令失败: " + step.error;
+      return step;
+    }
+    last_result = std::move(step);
+  }
+  return last_result;
 }
 
 AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& model,
