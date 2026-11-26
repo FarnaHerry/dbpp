@@ -1022,20 +1022,23 @@ void TestMcpSettingsPersistence(const fs::path& dir) {
              !loaded.mcp_read_only,
          "LoadTraySettings MCP roundtrip mismatch");
 
-  Expect(dbpp::TryParsePageSize("250") == std::optional<std::int64_t>{250},
+  Expect(dbpp::TryParsePageSize("250") == std::optional<std::int64_t>{250} &&
+             dbpp::TryParsePageSize("100001") == std::optional<std::int64_t>{100001} &&
+             dbpp::TryParsePageSize("1000000") == std::optional<std::int64_t>{1000000},
          "TryParsePageSize valid input mismatch");
   Expect(!dbpp::TryParsePageSize("0").has_value() &&
-             !dbpp::TryParsePageSize("100001").has_value() &&
+             !dbpp::TryParsePageSize("-5").has_value() &&
+             !dbpp::TryParsePageSize("9223372036854775807").has_value() &&
              !dbpp::TryParsePageSize("abc").has_value(),
-         "TryParsePageSize should reject out-of-range or non-numeric values");
+         "TryParsePageSize should reject non-positive, overflowing, or non-numeric values");
   Expect(dbpp::ParsePageSize("bad", 200) == 200, "ParsePageSize fallback mismatch");
 
   dbpp::TraySettings page_saved = loaded;
-  page_saved.default_page_size = 250;
+  page_saved.default_page_size = 250000;
   Expect(dbpp::SaveTraySettings(cfg_db.string(), page_saved),
          "SaveTraySettings default_page_size failed");
   const dbpp::TraySettings page_loaded = dbpp::LoadTraySettings(cfg_db.string());
-  Expect(page_loaded.default_page_size == 250, "LoadTraySettings default_page_size mismatch");
+  Expect(page_loaded.default_page_size == 250000, "LoadTraySettings default_page_size mismatch");
 }
 
 void TestSqlDatabaseContextHelpers() {
@@ -1112,6 +1115,11 @@ void TestImplicitSqlLimitAndExecution(const fs::path& dir, const std::string& dr
     const auto r = dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items", 100);
     Expect(r.applied && r.effective_limit == 100 && r.sql == "SELECT * FROM items\nLIMIT 101",
            "Bare SELECT implicit LIMIT rewrite mismatch");
+  }
+  {
+    const auto r = dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items", 500000);
+    Expect(r.applied && r.effective_limit == 500000 && r.sql == "SELECT * FROM items\nLIMIT 500001",
+           "Large integer implicit LIMIT rewrite mismatch");
   }
   {
     const auto r = dbpp::ApplyImplicitSqlLimit(
@@ -1201,11 +1209,39 @@ void TestImplicitSqlLimitAndExecution(const fs::path& dir, const std::string& dr
 
   const auto limited =
       dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 5);
-  Expect(limited.applied, "Expected implicit LIMIT 5 to apply");
+  Expect(limited.applied && limited.effective_offset == 0 &&
+             limited.sql == "SELECT * FROM items ORDER BY id\nLIMIT 6",
+         "Expected implicit LIMIT 5 on page 0");
   const dbpp::AdbcQueryResult five =
       dbpp::ExecuteBlocking(*opened.session, limited.sql, true, 5);
-  Expect(five.error.empty() && five.rows.size() == 5 && five.truncated,
-         "Expected 5 rows with truncated=true under implicit LIMIT 5");
+  Expect(five.error.empty() && five.rows.size() == 5 && five.truncated &&
+             five.rows.front().values.front().text == "1" &&
+             five.rows.back().values.front().text == "5",
+         "Expected 5 rows (1..5) with truncated=true under implicit LIMIT 5 page 0");
+
+  const auto page1 =
+      dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 5, 1);
+  Expect(page1.applied && page1.effective_offset == 5 &&
+             page1.sql == "SELECT * FROM items ORDER BY id\nLIMIT 6 OFFSET 5",
+         "Expected implicit LIMIT 5 OFFSET 5 on page 1");
+  const dbpp::AdbcQueryResult five_p1 =
+      dbpp::ExecuteBlocking(*opened.session, page1.sql, true, 5);
+  Expect(five_p1.error.empty() && five_p1.rows.size() == 5 && five_p1.truncated &&
+             five_p1.rows.front().values.front().text == "6" &&
+             five_p1.rows.back().values.front().text == "10",
+         "Expected 5 rows (6..10) with truncated=true under implicit LIMIT 5 page 1");
+
+  const auto page2 =
+      dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 5, 2);
+  Expect(page2.applied && page2.effective_offset == 10 &&
+             page2.sql == "SELECT * FROM items ORDER BY id\nLIMIT 6 OFFSET 10",
+         "Expected implicit LIMIT 5 OFFSET 10 on page 2");
+  const dbpp::AdbcQueryResult five_p2 =
+      dbpp::ExecuteBlocking(*opened.session, page2.sql, true, 5);
+  Expect(five_p2.error.empty() && five_p2.rows.size() == 5 && !five_p2.truncated &&
+             five_p2.rows.front().values.front().text == "11" &&
+             five_p2.rows.back().values.front().text == "15",
+         "Expected 5 rows (11..15) with truncated=false under implicit LIMIT 5 page 2");
 
   const auto larger =
       dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 20);

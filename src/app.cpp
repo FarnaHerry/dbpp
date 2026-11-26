@@ -28,7 +28,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.3.4"
+#define DBPP_VERSION "0.3.5"
 #endif
 
 #include "theme_palette.h"
@@ -4333,7 +4333,8 @@ struct SidebarConnectionEntry {
           });
 
   const std::int64_t page_count =
-      std::max<std::int64_t>(1, (model.total + model.page_size - 1) / model.page_size);
+      model.total <= 0 ? 1
+                       : ((model.total - 1) / std::max<std::int64_t>(1, model.page_size) + 1);
   const std::string status_text =
       !model.pending_inserts.empty()
           ? UseString(app::strings::table_pending_hint, model.pending_inserts.size())
@@ -4638,21 +4639,33 @@ struct SidebarConnectionEntry {
                         ? tab->session_name + " (" + offline_tag + ")"
                         : loc.Get(app::strings::sql_select_connection)));
 
-  const auto run = [app, workspace, settings, tab_id, tasks, notify, loc] {
+  const auto execute_query = [app, workspace, settings, tab_id, tasks, notify,
+                              loc](std::int64_t requested_page, bool from_editor,
+                                   std::int64_t override_page_size) {
     const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
     if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
       return;
     }
-    const std::string text = TrimmedSql(cur_tab->sql.editor.text);
+    if (!from_editor && !cur_tab->sql.paginated) {
+      return;
+    }
+    const std::string text =
+        TrimmedSql(from_editor ? cur_tab->sql.editor.text : cur_tab->sql.last_sql);
     if (text.empty()) {
       return;
     }
+    const std::int64_t clamped_page =
+        from_editor ? 0 : std::max<std::int64_t>(0, requested_page);
     const std::uint64_t session_id = cur_tab->session_id;
     std::shared_ptr<AdbcSession> adbc;
     bool session_found = false;
     bool session_is_redis = false;
     Dialect session_dialect = Dialect::Generic;
-    std::string target_database = TrimmedSql(cur_tab->sql.target_database);
+    std::string target_database = TrimmedSql(
+        from_editor
+            ? cur_tab->sql.target_database
+            : (cur_tab->sql.last_database.empty() ? cur_tab->sql.target_database
+                                                  : cur_tab->sql.last_database));
     for (const DbSession& open : app.Get().sessions) {
       if (open.id == session_id) {
         session_found = true;
@@ -4677,7 +4690,9 @@ struct SidebarConnectionEntry {
     const std::int64_t configured_limit =
         settings ? settings->default_page_size.Get() : kDefaultPageSize;
     const std::int64_t active_limit =
-        cur_tab->sql.page_size > 0 ? cur_tab->sql.page_size : configured_limit;
+        override_page_size > 0
+            ? std::clamp(override_page_size, kMinPageSize, kMaxPageSize)
+            : (cur_tab->sql.page_size > 0 ? cur_tab->sql.page_size : configured_limit);
 
     const std::string running_status = loc.Get(app::strings::sql_running);
     workspace.Update([tab_id, running_status](WorkspaceModel& ws) {
@@ -4689,11 +4704,13 @@ struct SidebarConnectionEntry {
     });
 
     tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_dialect,
-                  session_is_redis, text, target_database, active_limit, loc]() -> Task<void> {
+                  session_is_redis, text, target_database, active_limit, clamped_page,
+                  from_editor, loc]() -> Task<void> {
       if (session_is_redis || IsSqlReadStatement(text)) {
         const SqlLimitRewriteResult rewritten =
-            session_is_redis ? SqlLimitRewriteResult{}
-                             : ApplyImplicitSqlLimit(session_dialect, text, active_limit);
+            session_is_redis
+                ? SqlLimitRewriteResult{}
+                : ApplyImplicitSqlLimit(session_dialect, text, active_limit, clamped_page);
         const std::string exec_sql = rewritten.applied ? rewritten.sql : text;
         const std::size_t max_rows =
             session_is_redis
@@ -4745,9 +4762,10 @@ struct SidebarConnectionEntry {
         }
         const std::size_t rows = query->snapshot->rows.size();
         const std::string returned_status =
-            (rewritten.applied && query->truncated)
-                ? loc.Fmt(app::strings::sql_returned_rows_limited, rows,
-                          rewritten.effective_limit)
+            rewritten.applied
+                ? loc.Fmt(query->truncated ? app::strings::sql_returned_rows_page_more
+                                           : app::strings::sql_returned_rows_page,
+                          rows, clamped_page + 1)
                 : loc.Fmt(query->truncated ? app::strings::sql_returned_rows_truncated
                                            : app::strings::sql_returned_rows,
                           rows);
@@ -4755,12 +4773,22 @@ struct SidebarConnectionEntry {
             (session_is_redis && adbc && adbc->redis)
                 ? ("db" + std::to_string(adbc->redis->CurrentDb()))
                 : std::string{};
-        workspace.Update([tab_id, query, returned_status, redis_current_db,
+        workspace.Update([tab_id, query, returned_status, redis_current_db, rewritten, clamped_page,
+                          from_editor, text, target_database,
                           auto_widths = std::move(auto_widths)](WorkspaceModel& ws) mutable {
           if (WorkspaceTab* target = ws.FindTab(tab_id)) {
             query->id = target->sql.next_result_id++;
+            const bool keep_widths = !from_editor && target->sql.result &&
+                                     target->sql.result->columns == query->columns;
             target->sql.result = query;
-            target->sql.column_widths = std::move(auto_widths);
+            if (!keep_widths) {
+              target->sql.column_widths = std::move(auto_widths);
+            }
+            target->sql.page = rewritten.applied ? clamped_page : 0;
+            target->sql.paginated = rewritten.applied;
+            target->sql.has_next_page = rewritten.applied && query->truncated;
+            target->sql.last_sql = rewritten.applied ? text : std::string{};
+            target->sql.last_database = rewritten.applied ? target_database : std::string{};
             target->sql.running = false;
             target->sql.error.clear();
             target->sql.status = returned_status;
@@ -4812,6 +4840,11 @@ struct SidebarConnectionEntry {
         if (WorkspaceTab* target = ws.FindTab(tab_id)) {
           target->sql.result.reset();
           target->sql.column_widths.clear();
+          target->sql.page = 0;
+          target->sql.paginated = false;
+          target->sql.has_next_page = false;
+          target->sql.last_sql.clear();
+          target->sql.last_database.clear();
           target->sql.running = false;
           target->sql.error.clear();
           target->sql.status = done_status;
@@ -4823,6 +4856,7 @@ struct SidebarConnectionEntry {
       }
     });
   };
+  const auto run = [execute_query] { execute_query(0, true, 0); };
 
   View result_view;
   if (sql_model.running && !sql_model.result) {
@@ -5072,27 +5106,38 @@ struct SidebarConnectionEntry {
   if (!is_redis) {
     sql_limit_selector =
         Row{
-            Text(UseString(app::strings::sql_auto_limit_label, effective_page_size))
+            Text(UseString(app::strings::table_page_size_label, effective_page_size))
                 .Style(TextStyle{Font::System(font_size::kCaption).WithWeight(FontWeight::Medium),
                                  spec.colors.on_surface}),
             TintedIcon(app::images::chevron_down, spec.colors.on_surface_variant, 13.0F),
         }
-            .With(Padding{EdgeInsets::Symmetric(8.0F, 4.0F)}, Spacing{6.0F},
+            .With(Padding{EdgeInsets::Symmetric(10.0F, 5.0F)}, Spacing{6.0F},
                   CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
                   Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
                   limit_anchor, Enabled{!sql_model.running})
-            .OnClick([limit_popup, limit_anchor, workspace, tab_id, settings,
-                      effective_page_size, theme_config, language_mode, system_dark] {
-              const auto apply_limit = [workspace, tab_id, settings](std::int64_t next_size) {
+            .OnClick([limit_popup, limit_anchor, workspace, tab_id, settings, execute_query,
+                      effective_page_size, session_connected, theme_config, language_mode,
+                      system_dark] {
+              const auto apply_limit = [workspace, tab_id, settings, execute_query,
+                                        effective_page_size,
+                                        session_connected](std::int64_t next_size) {
                 const std::int64_t clamped = std::clamp(next_size, kMinPageSize, kMaxPageSize);
-                workspace.Update([tab_id, clamped](WorkspaceModel& ws) {
+                bool should_reload = false;
+                workspace.Update([tab_id, clamped, effective_page_size,
+                                  &should_reload](WorkspaceModel& ws) {
                   if (WorkspaceTab* target = ws.FindTab(tab_id);
                       target != nullptr && target->kind == WorkspaceTabKind::Sql) {
                     target->sql.page_size = clamped;
+                    should_reload = target->sql.paginated && !target->sql.last_sql.empty() &&
+                                    !target->sql.running &&
+                                    (effective_page_size != clamped || target->sql.page != 0);
                   }
                 });
                 if (settings) {
                   (void)settings->SetDefaultPageSize(clamped);
+                }
+                if (should_reload && session_connected) {
+                  execute_query(0, false, clamped);
                 }
               };
               limit_popup.Show(
@@ -5104,7 +5149,7 @@ struct SidebarConnectionEntry {
                         PageSizePopup(popup, effective_page_size, apply_limit));
                   },
                   PopupOptions{
-                      .placement = {.side = AnchorSide::Below, .alignment = AnchorAlignment::End},
+                      .placement = {.side = AnchorSide::Above, .alignment = AnchorAlignment::End},
                       .gap = 4.0F,
                       .viewport_margin = 8.0F,
                       .offset = {},
@@ -5116,6 +5161,34 @@ struct SidebarConnectionEntry {
                   });
             });
   }
+
+  View sql_footer =
+      !is_redis
+          ? Row{
+                MutedText(status_display),
+                Spacer(),
+                std::move(sql_limit_selector),
+                ActionButton(Button(app::strings::table_prev_page)
+                                 .OnClick([execute_query, sql_model] {
+                                   if (sql_model.paginated && sql_model.page > 0) {
+                                     execute_query(sql_model.page - 1, false, 0);
+                                   }
+                                 }))
+                    .With(Enabled{!sql_model.running && session_connected &&
+                                  sql_model.paginated && sql_model.page > 0}),
+                ActionButton(Button(app::strings::table_next_page)
+                                 .OnClick([execute_query, sql_model] {
+                                   if (sql_model.paginated && sql_model.has_next_page) {
+                                     execute_query(sql_model.page + 1, false, 0);
+                                   }
+                                 }))
+                    .With(Enabled{!sql_model.running && session_connected &&
+                                  sql_model.paginated && sql_model.has_next_page}),
+            }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F})
+          : Row{
+                MutedText(status_display),
+                Spacer(),
+            }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
 
   return Column{
       Row{
@@ -5145,14 +5218,9 @@ struct SidebarConnectionEntry {
                 });
               })
               .With(Frame{.min_height = 140.0F})),
-      Row{
-          MutedText(status_display),
-          Spacer(),
-          std::move(sql_limit_selector),
-          MutedText(UseString(is_redis ? app::strings::sql_hint_redis
-                                       : app::strings::sql_hint_sql)),
-      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{10.0F}),
+      MutedText(UseString(is_redis ? app::strings::sql_hint_redis : app::strings::sql_hint_sql)),
       std::move(result_view),
+      std::move(sql_footer),
   }.With(Grow(1.0F), Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 }
 

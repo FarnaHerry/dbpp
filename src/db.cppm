@@ -87,11 +87,13 @@ struct SqlLimitRewriteResult {
   std::string sql;
   bool applied = false;
   std::int64_t effective_limit = 0;
+  std::int64_t effective_offset = 0;
 };
 
 [[nodiscard]] SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect,
                                                           std::string_view sql,
-                                                          std::int64_t page_size);
+                                                          std::int64_t page_size,
+                                                          std::int64_t page = 0);
 [[nodiscard]] std::string SingleLineCellPreview(std::string_view text);
 [[nodiscard]] float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
                                            const GridSnapshot* snapshot);

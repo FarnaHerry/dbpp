@@ -2432,8 +2432,12 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
   model.filter = filter;
 
   const std::int64_t req_page = std::max<std::int64_t>(0, page);
-  RedisPageResult page_res = LoadRedisKeysPageBlocking(
-      client, object, req_page * model.page_size, model.page_size, sort, filter);
+  const std::int64_t req_offset =
+      (req_page > 0 && model.page_size > std::numeric_limits<std::int64_t>::max() / req_page)
+          ? std::numeric_limits<std::int64_t>::max()
+          : req_page * model.page_size;
+  RedisPageResult page_res =
+      LoadRedisKeysPageBlocking(client, object, req_offset, model.page_size, sort, filter);
   if (!page_res.error.empty()) {
     model.error = page_res.error;
     model.connection_lost = !client.IsConnected();
@@ -2442,11 +2446,16 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
 
   model.total = page_res.total;
   const std::int64_t page_count =
-      std::max<std::int64_t>(1, (model.total + model.page_size - 1) / model.page_size);
+      model.total <= 0 ? 1 : ((model.total - 1) / model.page_size + 1);
   const std::int64_t clamped_page = std::clamp<std::int64_t>(req_page, 0, page_count - 1);
   if (clamped_page != req_page) {
-    page_res = LoadRedisKeysPageBlocking(client, object, clamped_page * model.page_size,
-                                         model.page_size, sort, filter);
+    const std::int64_t clamped_offset =
+        (clamped_page > 0 &&
+         model.page_size > std::numeric_limits<std::int64_t>::max() / clamped_page)
+            ? std::numeric_limits<std::int64_t>::max()
+            : clamped_page * model.page_size;
+    page_res =
+        LoadRedisKeysPageBlocking(client, object, clamped_offset, model.page_size, sort, filter);
     if (!page_res.error.empty()) {
       model.error = page_res.error;
       model.connection_lost = !client.IsConnected();

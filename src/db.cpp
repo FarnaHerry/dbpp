@@ -361,9 +361,12 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   model.total = ParseInt64(count.rows.front().values.front().text);
 
   const std::int64_t page_count =
-      std::max<std::int64_t>(1, (model.total + model.page_size - 1) / model.page_size);
+      model.total <= 0 ? 1 : ((model.total - 1) / model.page_size + 1);
   model.page = std::clamp<std::int64_t>(model.page, 0, page_count - 1);
-  const std::int64_t offset = model.page * model.page_size;
+  const std::int64_t offset =
+      model.page > std::numeric_limits<std::int64_t>::max() / model.page_size
+          ? std::numeric_limits<std::int64_t>::max()
+          : model.page * model.page_size;
 
   std::string select_list;
   if (model.uses_rowid) {
@@ -1531,6 +1534,11 @@ bool SwitchSqlTabSession(const State<AppModel>& app, const State<WorkspaceModel>
     target->session_name = target_name;
     target->session_uri = target_uri;
     target->sql.target_database = target_db;
+    target->sql.page = 0;
+    target->sql.paginated = false;
+    target->sql.has_next_page = false;
+    target->sql.last_sql.clear();
+    target->sql.last_database.clear();
     target->sql.error.clear();
     target->sql.status.clear();
     const std::string trimmed = TrimAsciiCopy(target->sql.editor.text);
@@ -1566,6 +1574,11 @@ bool SwitchSqlTabDatabase(const State<AppModel>& app, const State<WorkspaceModel
       return;
     }
     target->sql.target_database = std::move(next_db);
+    target->sql.page = 0;
+    target->sql.paginated = false;
+    target->sql.has_next_page = false;
+    target->sql.last_sql.clear();
+    target->sql.last_database.clear();
     target->sql.error.clear();
     switched = true;
   });
@@ -2392,9 +2405,9 @@ std::vector<std::string> ReorderConnectionKeys(const std::vector<std::string>& n
 }
 
 SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect, std::string_view sql,
-                                            std::int64_t page_size) {
+                                            std::int64_t page_size, std::int64_t page) {
   if (dialect == Dialect::Redis || page_size <= 0) {
-    return {std::string(sql), false, 0};
+    return {std::string(sql), false, 0, 0};
   }
 
   struct Depth0Token {
@@ -2633,17 +2646,27 @@ SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect, std::string_view sq
   }
 
   const std::int64_t limit = std::clamp(page_size, kMinPageSize, kMaxPageSize);
+  const std::int64_t clamped_page = std::max<std::int64_t>(0, page);
+  const std::int64_t offset =
+      (clamped_page > 0 && limit > std::numeric_limits<std::int64_t>::max() / clamped_page)
+          ? std::numeric_limits<std::int64_t>::max()
+          : clamped_page * limit;
   std::string_view body = sql.substr(0, body_end);
   while (!body.empty() && std::isspace(static_cast<unsigned char>(body.back())) != 0) {
     body.remove_suffix(1);
   }
   if (body.empty()) {
-    return {std::string(sql), false, 0};
+    return {std::string(sql), false, 0, 0};
+  }
+  std::string rewritten_sql = std::string(body) + "\nLIMIT " + std::to_string(limit + 1);
+  if (offset > 0) {
+    rewritten_sql += " OFFSET " + std::to_string(offset);
   }
   return SqlLimitRewriteResult{
-      .sql = std::string(body) + "\nLIMIT " + std::to_string(limit + 1),
+      .sql = std::move(rewritten_sql),
       .applied = true,
       .effective_limit = limit,
+      .effective_offset = offset,
   };
 }
 

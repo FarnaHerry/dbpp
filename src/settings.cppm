@@ -21,7 +21,8 @@ inline constexpr std::string_view kSettingDefaultPageSize = "query.page_size";
 inline constexpr std::uint16_t kDefaultMcpPort = 18765;
 inline constexpr std::int64_t kDefaultPageSize = 100;
 inline constexpr std::int64_t kMinPageSize = 1;
-inline constexpr std::int64_t kMaxPageSize = 100000;
+// Leave headroom of 1 so `limit + 1` lookahead in ApplyImplicitSqlLimit never overflows int64_t.
+inline constexpr std::int64_t kMaxPageSize = std::numeric_limits<std::int64_t>::max() - 1;
 
 enum class ThemeMode {
   System = 0,
