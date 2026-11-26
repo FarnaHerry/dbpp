@@ -103,7 +103,8 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
 
 huxerui::Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
                                                  std::string sql, bool want_rows,
-                                                 std::size_t max_rows);
+                                                 std::size_t max_rows,
+                                                 std::string target_database = {});
 huxerui::Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session,
                                                TableModel model, std::size_t row_index,
                                                std::size_t column_index, std::string text);
@@ -135,7 +136,17 @@ void SelectObject(const huxerui::State<AppModel>& app,
 std::uint64_t OpenSqlTab(const huxerui::State<AppModel>& app,
                          const huxerui::State<WorkspaceModel>& workspace,
                          std::uint64_t session_id, std::string initial_sql = {},
-                         std::string custom_title = {});
+                         std::string custom_title = {}, std::string initial_database = {});
+[[nodiscard]] std::vector<std::string> ListSessionDatabases(const DbSession& session);
+[[nodiscard]] std::string DefaultSessionDatabase(const DbSession& session);
+[[nodiscard]] std::string BuildSwitchDatabaseSql(Dialect dialect,
+                                                 std::string_view target_database);
+bool SwitchSqlTabSession(const huxerui::State<AppModel>& app,
+                         const huxerui::State<WorkspaceModel>& workspace,
+                         std::uint64_t tab_id, std::uint64_t session_id);
+bool SwitchSqlTabDatabase(const huxerui::State<AppModel>& app,
+                          const huxerui::State<WorkspaceModel>& workspace,
+                          std::uint64_t tab_id, std::string database);
 std::uint64_t OpenSettingsTab(const huxerui::State<AppModel>& app,
                               const huxerui::State<WorkspaceModel>& workspace);
 void ActivateWorkspaceTab(const huxerui::State<AppModel>& app,
@@ -147,7 +158,8 @@ void CloseWorkspaceTabs(const huxerui::State<AppModel>& app,
 void OpenConnection(const huxerui::State<AppModel>& app,
                     const huxerui::State<WorkspaceModel>& workspace,
                     const huxerui::TaskScope& tasks, ConnectionRequest request,
-                    NotifyFn notify);
+                    NotifyFn notify,
+                    std::function<void(std::uint64_t)> on_opened = {});
 void CloseSession(const huxerui::State<AppModel>& app,
                   const huxerui::State<WorkspaceModel>& workspace,
                   const huxerui::TaskScope& tasks, std::uint64_t session_id,

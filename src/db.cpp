@@ -35,6 +35,96 @@ std::string TrimAsciiCopy(std::string_view text) {
   return std::string(text);
 }
 
+std::string LowerAsciiCopy(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char ch : text) {
+    out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return out;
+}
+
+bool ContainsIgnoreCaseCopy(std::string_view haystack, std::string_view needle) {
+  return LowerAsciiCopy(haystack).find(LowerAsciiCopy(needle)) != std::string::npos;
+}
+
+std::optional<int> ParseRedisTargetDbIndex(std::string_view text) {
+  std::string trimmed = TrimAsciiCopy(text);
+  if (trimmed.size() >= 2 &&
+      (trimmed[0] == 'd' || trimmed[0] == 'D') &&
+      (trimmed[1] == 'b' || trimmed[1] == 'B')) {
+    trimmed.erase(0, 2);
+  }
+  if (trimmed.empty()) {
+    return std::nullopt;
+  }
+  int value = 0;
+  const char* begin = trimmed.data();
+  const char* end = begin + trimmed.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, value);
+  if (ec != std::errc{} || ptr != end || value < 0) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+bool SessionHasMultipleCatalogsCopy(const DbSession& session) {
+  std::string first_catalog;
+  for (const DbObject& object : session.objects) {
+    if (object.catalog.empty()) {
+      continue;
+    }
+    const std::string lower = LowerAsciiCopy(object.catalog);
+    if (lower == "def" || lower == "main") {
+      continue;
+    }
+    if (first_catalog.empty()) {
+      first_catalog = lower;
+    } else if (lower != first_catalog) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string SessionObjectBucketCopy(const DbSession& session, const DbObject& object,
+                                    bool multi_catalog) {
+  if (session.dialect == Dialect::Redis) {
+    return {};
+  }
+  if (session.dialect == Dialect::Mysql) {
+    return ObjectDatabaseName(Dialect::Mysql, object);
+  }
+  if (session.dialect == Dialect::Sqlite) {
+    if (!object.db_schema.empty()) {
+      return object.db_schema;
+    }
+    if (!object.catalog.empty()) {
+      return object.catalog;
+    }
+    return "main";
+  }
+  if (session.dialect == Dialect::Duckdb) {
+    const std::string name = ObjectDatabaseName(Dialect::Duckdb, object);
+    if (!name.empty()) {
+      return name;
+    }
+    if (!object.catalog.empty()) {
+      return object.catalog;
+    }
+    return "main";
+  }
+  if (multi_catalog && !object.catalog.empty() &&
+      !ContainsIgnoreCaseCopy(object.catalog, "def") &&
+      !ContainsIgnoreCaseCopy(object.catalog, "main")) {
+    if (!object.db_schema.empty() && object.db_schema != object.catalog) {
+      return object.catalog + "." + object.db_schema;
+    }
+    return object.catalog;
+  }
+  return ObjectDatabaseName(session.dialect, object);
+}
+
 const DbSession* FindSession(const AppModel& model, std::uint64_t id) {
   for (const auto& session : model.sessions) {
     if (session.id == id) {
@@ -449,7 +539,8 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
 void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                         const TaskScope& tasks, AdbcOpenResult opened,
                         ConnectionRequest request, AdbcObjectsResult objects,
-                        NotifyFn notify) {
+                        NotifyFn notify,
+                        std::function<void(std::uint64_t)> on_opened = {}) {
   if (!opened.session) {
     const std::string message =
         TrFmt("Connection failed: {0}", "连接失败: {0}", {opened.error});
@@ -562,7 +653,9 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
     });
   }
 
-  if (duplicated) {
+  if (on_opened) {
+    on_opened(target_session_id);
+  } else if (duplicated) {
     std::uint64_t existing_tab_id = 0;
     for (const WorkspaceTab& tab : workspace.Get().tabs) {
       if (tab.session_id == target_session_id) {
@@ -626,7 +719,8 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
 
 Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
                                         std::string sql, bool want_rows,
-                                        std::size_t max_rows) {
+                                        std::size_t max_rows,
+                                        std::string target_database) {
   if (!session || session->IsClosed()) {
     AdbcQueryResult result;
     result.connection_lost = true;
@@ -634,7 +728,35 @@ Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
     co_return result;
   }
   co_return co_await session->sequence.Run(
-      [session, sql = std::move(sql), want_rows, max_rows](std::stop_token) mutable {
+      [session, sql = std::move(sql), want_rows, max_rows,
+       target_database = std::move(target_database)](std::stop_token) mutable {
+        const std::string trimmed_db = TrimAsciiCopy(target_database);
+        if (!trimmed_db.empty()) {
+          if (session->dialect == Dialect::Redis && session->redis) {
+            if (const auto db_idx = ParseRedisTargetDbIndex(trimmed_db)) {
+              std::string err;
+              if (!session->redis->EnsureDb(*db_idx, err)) {
+                AdbcQueryResult result;
+                result.connection_lost = !session->redis->IsConnected();
+                result.error = std::move(err);
+                return result;
+              }
+            }
+          } else {
+            const std::string switch_sql =
+                BuildSwitchDatabaseSql(session->dialect, trimmed_db);
+            if (!switch_sql.empty()) {
+              AdbcQueryResult sw = ExecuteBlocking(*session, switch_sql, false, 0);
+              if (sw.connection_lost) {
+                return sw;
+              }
+              if (!sw.error.empty() &&
+                  !(session->dialect == Dialect::Generic && trimmed_db == "default")) {
+                return sw;
+              }
+            }
+          }
+        }
         return ExecuteBlocking(*session, std::move(sql), want_rows, max_rows);
       });
 }
@@ -1197,12 +1319,153 @@ void CloseWorkspaceTabs(const State<AppModel>& app, const State<WorkspaceModel>&
   app.Update([&ws_now](AppModel& model) { SyncAppFromActiveTab(model, ws_now); });
 }
 
+std::vector<std::string> ListSessionDatabases(const DbSession& session) {
+  std::vector<std::string> databases;
+  if (session.dialect == Dialect::Redis) {
+    for (const DbObject& object : session.objects) {
+      if (!object.name.empty() &&
+          std::ranges::find(databases, object.name) == databases.end()) {
+        databases.push_back(object.name);
+      }
+    }
+    if (session.session && session.session->redis) {
+      const std::string current = "db" + std::to_string(session.session->redis->CurrentDb());
+      if (std::ranges::find(databases, current) == databases.end()) {
+        databases.insert(databases.begin(), current);
+      }
+    }
+    if (databases.empty()) {
+      databases.emplace_back("db0");
+    }
+    return databases;
+  }
+
+  const bool multi_catalog = SessionHasMultipleCatalogsCopy(session);
+  const DatabasePreset& preset = ResolvePresetForProfile(session.driver_path, session.uri);
+  const std::string uri_db = TrimAsciiCopy(DecomposePresetUri(preset, session.uri).database);
+
+  const auto add_unique = [&databases](std::string name) {
+    name = TrimAsciiCopy(name);
+    if (name.empty()) {
+      return;
+    }
+    const std::string lower = LowerAsciiCopy(name);
+    for (const std::string& existing : databases) {
+      if (LowerAsciiCopy(existing) == lower) {
+        return;
+      }
+    }
+    databases.push_back(std::move(name));
+  };
+
+  for (const DbObject& object : session.objects) {
+    add_unique(SessionObjectBucketCopy(session, object, multi_catalog));
+  }
+
+  if ((session.dialect == Dialect::Mysql || session.dialect == Dialect::Generic) &&
+      !uri_db.empty()) {
+    add_unique(uri_db);
+  }
+  if ((session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb) &&
+      databases.empty()) {
+    databases.emplace_back("main");
+  }
+  if (session.dialect == Dialect::Postgresql && databases.empty()) {
+    databases.emplace_back("public");
+  }
+
+  std::string target_lower = LowerAsciiCopy(uri_db);
+  if (target_lower.empty() &&
+      (session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb)) {
+    target_lower = "main";
+  } else if (session.dialect == Dialect::Postgresql) {
+    const bool matches_uri_db =
+        !target_lower.empty() &&
+        std::ranges::any_of(databases, [&target_lower](const std::string& db) {
+          return LowerAsciiCopy(db) == target_lower;
+        });
+    if (!matches_uri_db) {
+      target_lower = "public";
+    }
+  }
+
+  std::ranges::sort(databases, [&target_lower](const std::string& a, const std::string& b) {
+    const std::string la = LowerAsciiCopy(a);
+    const std::string lb = LowerAsciiCopy(b);
+    const bool a_target = !target_lower.empty() && la == target_lower;
+    const bool b_target = !target_lower.empty() && lb == target_lower;
+    if (a_target != b_target) {
+      return a_target;
+    }
+    const bool a_sys = IsSystemDatabaseOrSchema(a);
+    const bool b_sys = IsSystemDatabaseOrSchema(b);
+    if (a_sys != b_sys) {
+      return !a_sys;
+    }
+    return a < b;
+  });
+  return databases;
+}
+
+std::string DefaultSessionDatabase(const DbSession& session) {
+  if (session.dialect == Dialect::Redis && session.session && session.session->redis) {
+    return "db" + std::to_string(session.session->redis->CurrentDb());
+  }
+  const std::vector<std::string> databases = ListSessionDatabases(session);
+  return databases.empty() ? std::string{} : databases.front();
+}
+
+std::string BuildSwitchDatabaseSql(Dialect dialect, std::string_view target_database) {
+  const std::string trimmed = TrimAsciiCopy(target_database);
+  if (trimmed.empty() || dialect == Dialect::Sqlite || dialect == Dialect::Redis) {
+    return {};
+  }
+  if (dialect == Dialect::Mysql) {
+    return "USE " + QuoteIdentifier(Dialect::Mysql, trimmed);
+  }
+  if (dialect == Dialect::Postgresql) {
+    const std::size_t dot = trimmed.rfind('.');
+    const std::string_view schema =
+        (dot != std::string_view::npos && dot + 1 < trimmed.size())
+            ? std::string_view(trimmed).substr(dot + 1)
+            : std::string_view(trimmed);
+    return "SET search_path TO " + QuoteIdentifier(Dialect::Postgresql, schema);
+  }
+  std::string joined;
+  std::size_t pos = 0;
+  while (pos < trimmed.size()) {
+    const std::size_t next = trimmed.find('.', pos);
+    const std::string_view part =
+        next == std::string_view::npos
+            ? std::string_view(trimmed).substr(pos)
+            : std::string_view(trimmed).substr(pos, next - pos);
+    if (!part.empty()) {
+      if (!joined.empty()) {
+        joined.push_back('.');
+      }
+      joined += QuoteIdentifier(dialect, part);
+    }
+    if (next == std::string_view::npos) {
+      break;
+    }
+    pos = next + 1;
+  }
+  if (joined.empty()) {
+    return {};
+  }
+  return "USE " + joined;
+}
+
 std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                          std::uint64_t session_id, std::string initial_sql,
-                         std::string custom_title) {
+                         std::string custom_title, std::string initial_database) {
   const DbSession* session = FindSession(app.Get(), session_id);
   if (session == nullptr) {
     return 0;
+  }
+  std::string resolved_db = TrimAsciiCopy(initial_database);
+  if (resolved_db.empty()) {
+    resolved_db = DefaultSessionDatabase(*session);
   }
   std::uint64_t created_id = 0;
   workspace.Update([&](WorkspaceModel& ws) {
@@ -1221,6 +1484,7 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
     tab.sql.editor = TextEditingValue::FromText(
         initial_sql.empty() ? std::string{is_redis ? "PING" : "SELECT 1;"}
                             : std::move(initial_sql));
+    tab.sql.target_database = std::move(resolved_db);
     ws.tabs.push_back(std::move(tab));
     ws.active_tab_id = created_id;
   });
@@ -1230,6 +1494,73 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
     model.active_is_view = false;
   });
   return created_id;
+}
+
+bool SwitchSqlTabSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                         std::uint64_t tab_id, std::uint64_t session_id) {
+  const DbSession* session = FindSession(app.Get(), session_id);
+  if (session == nullptr || !session->session || session->session->IsClosed()) {
+    return false;
+  }
+  const std::string target_name = session->name;
+  const std::string target_uri = session->uri;
+  const bool target_is_redis = session->dialect == Dialect::Redis;
+  const std::string target_db = DefaultSessionDatabase(*session);
+
+  bool switched = false;
+  bool sync_app = false;
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab* target = ws.FindTab(tab_id);
+    if (target == nullptr || target->kind != WorkspaceTabKind::Sql || target->sql.running) {
+      return;
+    }
+    if (target->session_id == session_id && target->session_name == target_name &&
+        target->session_uri == target_uri) {
+      return;
+    }
+    target->session_id = session_id;
+    target->session_name = target_name;
+    target->session_uri = target_uri;
+    target->sql.target_database = target_db;
+    target->sql.error.clear();
+    target->sql.status.clear();
+    const std::string trimmed = TrimAsciiCopy(target->sql.editor.text);
+    if (target_is_redis && trimmed == "SELECT 1;") {
+      target->sql.editor = TextEditingValue::FromText("PING");
+    } else if (!target_is_redis && trimmed == "PING") {
+      target->sql.editor = TextEditingValue::FromText("SELECT 1;");
+    }
+    switched = true;
+    sync_app = (ws.active_tab_id == tab_id);
+  });
+  if (switched && sync_app) {
+    app.Update([session_id](AppModel& model) {
+      model.active_session = session_id;
+      model.active_object.clear();
+      model.active_is_view = false;
+    });
+  }
+  return switched;
+}
+
+bool SwitchSqlTabDatabase(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                          std::uint64_t tab_id, std::string database) {
+  (void)app;
+  std::string next_db = TrimAsciiCopy(database);
+  bool switched = false;
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab* target = ws.FindTab(tab_id);
+    if (target == nullptr || target->kind != WorkspaceTabKind::Sql || target->sql.running) {
+      return;
+    }
+    if (target->sql.target_database == next_db) {
+      return;
+    }
+    target->sql.target_database = std::move(next_db);
+    target->sql.error.clear();
+    switched = true;
+  });
+  return switched;
 }
 
 std::uint64_t OpenSettingsTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace) {
@@ -1297,7 +1628,8 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
 }
 
 void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                    const TaskScope& tasks, ConnectionRequest request, NotifyFn notify) {
+                    const TaskScope& tasks, ConnectionRequest request, NotifyFn notify,
+                    std::function<void(std::uint64_t)> on_opened) {
   app.Update([&](AppModel& model) {
     model.error.clear();
     model.status =
@@ -1305,7 +1637,8 @@ void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& wor
               {DisplayNameFromUri(request.uri, Tr("Database", "数据库"))});
   });
   tasks.Launch([app, workspace, tasks, request = std::move(request),
-                notify = std::move(notify)]() mutable -> Task<void> {
+                notify = std::move(notify),
+                on_opened = std::move(on_opened)]() mutable -> Task<void> {
     AdbcOpenResult opened =
         co_await RunWorker([request] { return OpenAdbcBlocking(request); });
     if (!opened.session) {
@@ -1326,7 +1659,7 @@ void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& wor
           return LoadObjectsBlocking(*session);
         });
     ApplyOpenedSession(app, workspace, tasks, std::move(opened), std::move(request),
-                       std::move(objects), std::move(notify));
+                       std::move(objects), std::move(notify), std::move(on_opened));
   });
 }
 

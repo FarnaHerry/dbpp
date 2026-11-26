@@ -28,7 +28,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.3.2"
+#define DBPP_VERSION "0.3.3"
 #endif
 
 #include "theme_palette.h"
@@ -2548,7 +2548,8 @@ struct SidebarConnectionEntry {
                                     display_label] {
                                      (void)OpenSqlTab(app, workspace, session_id,
                                                       "SELECT " + redis_db_index,
-                                                      "Redis · " + display_label);
+                                                      "Redis · " + display_label,
+                                                      "db" + redis_db_index);
                                    }),
                           MenuItem(loc.Get(app::strings::sidebar_ctx_view_fields),
                                    open_schema_dialog),
@@ -4517,27 +4518,52 @@ struct SidebarConnectionEntry {
 // ---------------------------------------------------------------------------
 
 [[huxerui::composable]] View SqlPage(State<AppModel> app, State<WorkspaceModel> workspace,
+                                     State<std::vector<ConnectionProfile>> profiles,
                                      std::uint64_t tab_id, TaskScope tasks, NotifyFn notify) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
+  const auto menu = UseMenu();
+  const auto conn_anchor = UseViewHandle();
+  const auto db_anchor = UseViewHandle();
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Sql) {
     return TableEmptyState(app::strings::sql_tab_closed);
   }
   const SqlModel& sql_model = tab->sql;
+  const std::vector<DbSession>& all_sessions = app.Get().sessions;
   const DbSession* session = nullptr;
-  for (const DbSession& open : app.Get().sessions) {
+  bool has_live_session = false;
+  for (const DbSession& open : all_sessions) {
+    if (open.session && !open.session->IsClosed()) {
+      has_live_session = true;
+    }
     if (open.id == tab->session_id) {
       session = &open;
-      break;
     }
   }
 
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
+  const bool session_connected =
+      session != nullptr && session->session && !session->session->IsClosed();
+  if (!session_connected && !has_live_session && profiles.Get().empty()) {
     return TableEmptyState(app::strings::sql_conn_disconnected);
   }
-  const bool is_redis = session->dialect == Dialect::Redis;
+  const bool is_redis = session != nullptr && session->dialect == Dialect::Redis;
+  const DatabaseBrand current_brand =
+      session != nullptr
+          ? DetectDatabaseBrand(session->driver_path, session->uri, session->dialect)
+          : (!tab->session_uri.empty()
+                 ? DetectDatabaseBrand({}, tab->session_uri, Dialect::Generic)
+                 : DatabaseBrand::Custom);
+  const std::string offline_tag = loc.Get(app::strings::sql_conn_offline_tag);
+  const std::string selector_label =
+      session_connected
+          ? session->name
+          : (session != nullptr
+                 ? session->name + " (" + offline_tag + ")"
+                 : (!tab->session_name.empty()
+                        ? tab->session_name + " (" + offline_tag + ")"
+                        : loc.Get(app::strings::sql_select_connection)));
 
   const auto run = [app, workspace, tab_id, tasks, notify, loc] {
     const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
@@ -4552,11 +4578,15 @@ struct SidebarConnectionEntry {
     std::shared_ptr<AdbcSession> adbc;
     bool session_found = false;
     bool session_is_redis = false;
+    std::string target_database = TrimmedSql(cur_tab->sql.target_database);
     for (const DbSession& open : app.Get().sessions) {
       if (open.id == session_id) {
         session_found = true;
         adbc = open.session;
         session_is_redis = (open.dialect == Dialect::Redis);
+        if (target_database.empty()) {
+          target_database = DefaultSessionDatabase(open);
+        }
         break;
       }
     }
@@ -4579,10 +4609,10 @@ struct SidebarConnectionEntry {
     });
 
     tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_is_redis,
-                  text, loc]() -> Task<void> {
+                  text, target_database, loc]() -> Task<void> {
       if (session_is_redis || IsSqlReadStatement(text)) {
         AdbcQueryResult result =
-            co_await ExecuteQueryAsync(adbc, text, true, kMaxQueryRows);
+            co_await ExecuteQueryAsync(adbc, text, true, kMaxQueryRows, target_database);
         if (result.connection_lost) {
           const std::string message = result.error;
           workspace.Update([tab_id](WorkspaceModel& ws) {
@@ -4627,7 +4657,11 @@ struct SidebarConnectionEntry {
             query->truncated ? app::strings::sql_returned_rows_truncated
                              : app::strings::sql_returned_rows,
             rows);
-        workspace.Update([tab_id, query, returned_status,
+        const std::string redis_current_db =
+            (session_is_redis && adbc && adbc->redis)
+                ? ("db" + std::to_string(adbc->redis->CurrentDb()))
+                : std::string{};
+        workspace.Update([tab_id, query, returned_status, redis_current_db,
                           auto_widths = std::move(auto_widths)](WorkspaceModel& ws) mutable {
           if (WorkspaceTab* target = ws.FindTab(tab_id)) {
             query->id = target->sql.next_result_id++;
@@ -4636,6 +4670,9 @@ struct SidebarConnectionEntry {
             target->sql.running = false;
             target->sql.error.clear();
             target->sql.status = returned_status;
+            if (!redis_current_db.empty()) {
+              target->sql.target_database = redis_current_db;
+            }
           }
         });
         if (session_is_redis && !IsReadStatement(Dialect::Redis, text)) {
@@ -4645,7 +4682,7 @@ struct SidebarConnectionEntry {
       }
 
       AdbcQueryResult executed =
-          co_await ExecuteQueryAsync(adbc, text, false, 0);
+          co_await ExecuteQueryAsync(adbc, text, false, 0, target_database);
       if (executed.connection_lost) {
         const std::string message = executed.error;
         workspace.Update([tab_id](WorkspaceModel& ws) {
@@ -4736,17 +4773,214 @@ struct SidebarConnectionEntry {
                       .With(Grow(1.0F));
   }
 
+  const std::uint64_t cur_session_id = tab->session_id;
+  View connection_selector =
+      Row{
+          DatabaseIcon(current_brand, 15.0F),
+          Text(selector_label)
+              .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium),
+                               session_connected ? spec.colors.on_surface
+                                                 : spec.colors.on_surface_variant})
+              .LineLimit(1)
+              .Overflow(TextOverflow::Ellipsis)
+              .With(Frame{.max_width = 220.0F}),
+          TintedIcon(app::images::chevron_down, spec.colors.on_surface_variant, 13.0F),
+      }
+          .With(Frame{.min_height = 30.0F}, Padding{EdgeInsets::Symmetric(10.0F, 5.0F)},
+                Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+                Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
+                conn_anchor, Enabled{!sql_model.running})
+          .OnClick([menu, conn_anchor, app, workspace, profiles, tasks, notify, loc, tab_id,
+                    cur_session_id] {
+            const std::vector<DbSession>& live_pool = app.Get().sessions;
+            std::unordered_map<std::string, int> name_counts;
+            std::vector<bool> claimed(live_pool.size(), false);
+            bool any_live = false;
+            for (std::size_t i = 0; i < live_pool.size(); ++i) {
+              const DbSession& s = live_pool[i];
+              if (!s.session || s.session->IsClosed()) {
+                claimed[i] = true;
+                continue;
+              }
+              any_live = true;
+              ++name_counts[s.name];
+            }
+
+            std::vector<MenuEntry> entries;
+            for (const DbSession& s : live_pool) {
+              if (!s.session || s.session->IsClosed()) {
+                continue;
+              }
+              std::string item_label = s.name;
+              if (name_counts[s.name] > 1) {
+                const std::string uri_name = UriDisplayName(s.uri);
+                if (!uri_name.empty()) {
+                  item_label += " (" + uri_name + ")";
+                }
+              }
+              const std::uint64_t sid = s.id;
+              entries.emplace_back(
+                  MenuItem(std::move(item_label),
+                           [app, workspace, tab_id, sid] {
+                             (void)SwitchSqlTabSession(app, workspace, tab_id, sid);
+                           })
+                      .Checked(sid == cur_session_id));
+            }
+
+            const std::vector<ConnectionProfile>& saved_profiles = profiles.Get();
+            const std::string offline = loc.Get(app::strings::sql_conn_offline_tag);
+            bool added_section = false;
+            for (const ConnectionProfile& profile : saved_profiles) {
+              if (const auto match = FindMatchingSessionIndex(profile, live_pool, claimed)) {
+                claimed[*match] = true;
+                continue;
+              }
+              if (any_live && !added_section) {
+                entries.emplace_back(MenuSection{});
+                added_section = true;
+              }
+              const SanitizedUriResult sanitized = SanitizeUriCredentials(profile.uri);
+              const std::string display =
+                  profile.name.empty() ? UriDisplayName(sanitized.uri) : profile.name;
+              entries.emplace_back(MenuItem(
+                  display + " (" + offline + ")",
+                  [app, workspace, tasks, notify, tab_id, profile, sanitized, display] {
+                    ConnectionRequest request{
+                        .driver_path = profile.driver_path,
+                        .uri = sanitized.uri,
+                        .username = profile.username.empty() ? sanitized.username : profile.username,
+                        .password = profile.password.empty() ? sanitized.password : profile.password,
+                        .title = display,
+                    };
+                    OpenConnection(
+                        app, workspace, tasks, std::move(request), notify,
+                        [app, workspace, tab_id](std::uint64_t sid) {
+                          (void)SwitchSqlTabSession(app, workspace, tab_id, sid);
+                        });
+                  }));
+            }
+
+            if (entries.empty()) {
+              return;
+            }
+            menu.Show(conn_anchor, std::move(entries),
+                      MenuOptions{
+                          .placement = {.side = AnchorSide::Below,
+                                        .alignment = AnchorAlignment::End},
+                          .gap = 4.0F,
+                          .viewport_margin = 8.0F,
+                          .offset = {},
+                          .width = std::nullopt,
+                          .dismiss_on_outside_press = true,
+                          .dismiss_on_cancel = true,
+                          .on_dismiss_request = {},
+                      });
+          });
+
+  const std::vector<std::string> session_dbs =
+      session_connected ? ListSessionDatabases(*session) : std::vector<std::string>{};
+  const std::string active_db =
+      !sql_model.target_database.empty()
+          ? sql_model.target_database
+          : (session_connected ? DefaultSessionDatabase(*session) : std::string{});
+  const std::string db_selector_label =
+      active_db.empty() ? loc.Get(app::strings::sql_select_database) : active_db;
+  View database_selector =
+      Row{
+          TintedIcon(app::images::database,
+                     session_connected ? spec.colors.primary : spec.colors.on_surface_variant,
+                     14.0F),
+          Text(db_selector_label)
+              .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium),
+                               session_connected && !active_db.empty()
+                                   ? spec.colors.on_surface
+                                   : spec.colors.on_surface_variant})
+              .LineLimit(1)
+              .Overflow(TextOverflow::Ellipsis)
+              .With(Frame{.max_width = 180.0F}),
+          TintedIcon(app::images::chevron_down, spec.colors.on_surface_variant, 13.0F),
+      }
+          .With(Frame{.min_height = 30.0F}, Padding{EdgeInsets::Symmetric(10.0F, 5.0F)},
+                Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+                Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
+                db_anchor, Enabled{!sql_model.running && session_connected && !session_dbs.empty()})
+          .OnClick([menu, db_anchor, app, workspace, tab_id] {
+            const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
+            if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
+              return;
+            }
+            const DbSession* live_session = nullptr;
+            for (const DbSession& open : app.Get().sessions) {
+              if (open.id == cur_tab->session_id && open.session && !open.session->IsClosed()) {
+                live_session = &open;
+                break;
+              }
+            }
+            if (live_session == nullptr) {
+              return;
+            }
+            const std::vector<std::string> dbs = ListSessionDatabases(*live_session);
+            if (dbs.empty()) {
+              return;
+            }
+            const std::string current_db = !cur_tab->sql.target_database.empty()
+                                               ? cur_tab->sql.target_database
+                                               : DefaultSessionDatabase(*live_session);
+            const bool is_redis_sess = live_session->dialect == Dialect::Redis;
+            bool has_non_sys = false;
+            if (!is_redis_sess) {
+              for (const std::string& db : dbs) {
+                if (!IsSystemDatabaseOrSchema(db)) {
+                  has_non_sys = true;
+                  break;
+                }
+              }
+            }
+            std::vector<MenuEntry> entries;
+            bool inserted_sys_sep = false;
+            for (const std::string& db : dbs) {
+              if (!is_redis_sess && has_non_sys && !inserted_sys_sep &&
+                  IsSystemDatabaseOrSchema(db)) {
+                entries.emplace_back(MenuSection{});
+                inserted_sys_sep = true;
+              }
+              entries.emplace_back(
+                  MenuItem(db,
+                           [app, workspace, tab_id, db] {
+                             (void)SwitchSqlTabDatabase(app, workspace, tab_id, db);
+                           })
+                      .Checked(db == current_db));
+            }
+            menu.Show(db_anchor, std::move(entries),
+                      MenuOptions{
+                          .placement = {.side = AnchorSide::Below,
+                                        .alignment = AnchorAlignment::End},
+                          .gap = 4.0F,
+                          .viewport_margin = 8.0F,
+                          .offset = {},
+                          .width = std::nullopt,
+                          .dismiss_on_outside_press = true,
+                          .dismiss_on_cancel = true,
+                          .on_dismiss_request = {},
+                      });
+          });
+
+  const std::string status_display =
+      (!session_connected && sql_model.status.empty())
+          ? UseString(app::strings::sql_conn_disconnected)
+          : sql_model.status;
+
   return Column{
       Row{
-          DatabaseIcon(DetectDatabaseBrand(session->driver_path, session->uri, session->dialect),
-                       20.0F),
+          DatabaseIcon(current_brand, 20.0F),
           Text(is_redis ? app::strings::sql_title_redis : app::strings::sql_title_sql,
                TextRole::Title),
-          MutedText(session->name),
           Spacer(),
+          std::move(connection_selector),
+          std::move(database_selector),
           ActionButton(Button(sql_model.running ? app::strings::sql_running : app::strings::sql_run)
                            .OnClick(run)
-                           .With(Enabled{!sql_model.running}),
+                           .With(Enabled{!sql_model.running && session_connected}),
                        ButtonTone::Primary),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
       MonospaceField(
@@ -4765,7 +4999,7 @@ struct SidebarConnectionEntry {
               })
               .With(Frame{.min_height = 140.0F})),
       Row{
-          MutedText(sql_model.status),
+          MutedText(status_display),
           Spacer(),
           MutedText(UseString(is_redis ? app::strings::sql_hint_redis
                                        : app::strings::sql_hint_sql)),
@@ -5653,7 +5887,7 @@ struct SidebarConnectionEntry {
                                      theme_config, language_mode, system_dark)
                         .Key("tab-body-" + std::to_string(active_tab->id));
     } else {
-      active_body = SqlPage(app, workspace, active_tab->id, tasks, notify)
+      active_body = SqlPage(app, workspace, profiles, active_tab->id, tasks, notify)
                         .Key("tab-body-" + std::to_string(active_tab->id));
     }
 

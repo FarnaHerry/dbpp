@@ -1023,6 +1023,75 @@ void TestMcpSettingsPersistence(const fs::path& dir) {
          "LoadTraySettings MCP roundtrip mismatch");
 }
 
+void TestSqlDatabaseContextHelpers() {
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Mysql, "app_db") == "USE `app_db`",
+         "MySQL switch DB SQL mismatch");
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Postgresql, "analytics") ==
+             "SET search_path TO \"analytics\"",
+         "PostgreSQL switch schema SQL mismatch");
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Postgresql, "prod.analytics") ==
+             "SET search_path TO \"analytics\"",
+         "PostgreSQL catalog.schema switch SQL mismatch");
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Duckdb, "main") == "USE \"main\"",
+         "DuckDB switch DB SQL mismatch");
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Generic, "cat.sch") ==
+             "USE \"cat\".\"sch\"",
+         "Generic multi-part switch DB SQL mismatch");
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Sqlite, "main").empty(),
+         "SQLite switch DB SQL should be empty");
+  Expect(dbpp::BuildSwitchDatabaseSql(dbpp::Dialect::Redis, "db0").empty(),
+         "Redis switch DB SQL should be empty");
+
+  const auto make_obj = [](std::string name, std::string catalog, std::string schema) {
+    dbpp::DbObject obj;
+    obj.name = std::move(name);
+    obj.catalog = std::move(catalog);
+    obj.db_schema = std::move(schema);
+    return obj;
+  };
+
+  dbpp::DbSession sqlite_empty;
+  sqlite_empty.dialect = dbpp::Dialect::Sqlite;
+  sqlite_empty.uri = "sample.sqlite3";
+  Expect(dbpp::ListSessionDatabases(sqlite_empty) == std::vector<std::string>{"main"} &&
+             dbpp::DefaultSessionDatabase(sqlite_empty) == "main",
+         "Empty SQLite session database list/default mismatch");
+
+  dbpp::DbSession mysql_session;
+  mysql_session.dialect = dbpp::Dialect::Mysql;
+  mysql_session.uri = "mysql://127.0.0.1:3306/orders";
+  mysql_session.objects = {
+      make_obj("user", "def", "mysql"),
+      make_obj("metrics", "def", "analytics"),
+      make_obj("line_items", "def", "orders"),
+  };
+  const auto mysql_dbs = dbpp::ListSessionDatabases(mysql_session);
+  Expect(mysql_dbs == std::vector<std::string>{"orders", "analytics", "mysql"} &&
+             dbpp::DefaultSessionDatabase(mysql_session) == "orders",
+         "MySQL session database ordering/default mismatch");
+
+  dbpp::DbSession pg_session;
+  pg_session.dialect = dbpp::Dialect::Postgresql;
+  pg_session.uri = "postgresql://127.0.0.1:5432/appdb";
+  pg_session.objects = {
+      make_obj("pg_class", "appdb", "pg_catalog"),
+      make_obj("events", "appdb", "app"),
+      make_obj("users", "appdb", "public"),
+  };
+  Expect(dbpp::DefaultSessionDatabase(pg_session) == "public",
+         "PostgreSQL session default schema should prefer public");
+
+  dbpp::DbSession redis_session;
+  redis_session.dialect = dbpp::Dialect::Redis;
+  redis_session.objects = {
+      make_obj("db0", "", ""),
+      make_obj("db1", "", ""),
+  };
+  Expect(dbpp::ListSessionDatabases(redis_session) == std::vector<std::string>{"db0", "db1"} &&
+             dbpp::DefaultSessionDatabase(redis_session) == "db0",
+         "Redis session database list/default mismatch");
+}
+
 } // namespace
 
 int main() {
@@ -1042,6 +1111,7 @@ int main() {
   TestSqlFilterNormalizationAndFiltering(temp.path, driver_path);
   TestEditTableDdlGenerationAndExecution(temp.path, driver_path);
   TestMcpSettingsPersistence(temp.path);
+  TestSqlDatabaseContextHelpers();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

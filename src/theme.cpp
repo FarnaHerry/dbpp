@@ -9,6 +9,7 @@ import dbpp.adbc;
 #include "theme.h"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 namespace dbpp::ui {
@@ -516,6 +517,40 @@ View PageTitle(std::string title, View actions) {
                               Padding{EdgeInsets::Symmetric(20.0F, 18.0F)});
 }
 
+namespace detail {
+
+bool UseDelayedLoading(bool loading, int delay_ms) {
+  auto visible = UseState(delay_ms <= 0 && loading);
+  auto tasks = UseTaskScope();
+  Lifecycle(
+      [loading, delay_ms, visible, tasks]() mutable -> std::function<void()> {
+        if (!loading) {
+          if (visible.Get()) {
+            visible = false;
+          }
+          return [] {};
+        }
+        if (delay_ms <= 0) {
+          if (!visible.Get()) {
+            visible = true;
+          }
+          return [] {};
+        }
+        if (visible.Get()) {
+          visible = false;
+        }
+        TaskHandle timer = tasks.Launch([delay_ms, visible]() mutable -> Task<void> {
+          co_await Delay(std::chrono::milliseconds{delay_ms});
+          visible = true;
+        });
+        return [timer] { timer.Cancel(); };
+      },
+      loading, delay_ms);
+  return loading && visible.Get();
+}
+
+} // namespace detail
+
 namespace {
 
 Views LoadingIndicatorItems(const std::string& resolved_label) {
@@ -529,20 +564,26 @@ Views LoadingIndicatorItems(const std::string& resolved_label) {
 
 } // namespace
 
-[[huxerui::composable]] View LoadingState(StringVariant label) {
+[[huxerui::composable]] View LoadingState(StringVariant label, int delay_ms) {
+  const bool show_spinner = detail::UseDelayedLoading(true, delay_ms);
   const std::string resolved = UseString(std::move(label));
+  if (!show_spinner) {
+    return Column{}.With(Grow(1.0F));
+  }
   return Column{LoadingIndicatorItems(resolved)}.With(
       Grow(1.0F), MainAlign{MainAxisAlignment::Center}, CrossAlign{CrossAxisAlignment::Center},
       Spacing{10.0F});
 }
 
-[[huxerui::composable]] View LoadingOverlay(View content, bool loading, StringVariant label) {
+[[huxerui::composable]] View LoadingOverlay(View content, bool loading, StringVariant label,
+                                            int delay_ms) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const bool show_spinner = detail::UseDelayedLoading(loading, delay_ms);
   const std::string resolved = UseString(std::move(label));
   Views layers;
   layers.Add(std::move(content));
-  if (loading) {
+  if (show_spinner) {
     View badge = Column{LoadingIndicatorItems(resolved)}.With(
         Padding{EdgeInsets::Symmetric(20.0F, 14.0F)}, Spacing{10.0F},
         CrossAlign{CrossAxisAlignment::Center}, CornerRadius{10.0F},

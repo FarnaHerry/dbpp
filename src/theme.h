@@ -67,8 +67,11 @@ huxerui::View PasswordField(huxerui::State<huxerui::TextEditingValue> value,
                             huxerui::StringVariant label,
                             std::function<void()> on_submitted = {});
 huxerui::View DialogCard(huxerui::View content);
-huxerui::View LoadingState(huxerui::StringVariant label = {});
+inline constexpr int kDefaultLoadingDelayMs = 200;
+huxerui::View LoadingState(huxerui::StringVariant label = {},
+                           int delay_ms = kDefaultLoadingDelayMs);
 huxerui::View LoadingOverlay(huxerui::View content, bool loading,
-                             huxerui::StringVariant label = {});
+                             huxerui::StringVariant label = {},
+                             int delay_ms = kDefaultLoadingDelayMs);
 
 } // namespace dbpp::ui
