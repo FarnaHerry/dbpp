@@ -95,10 +95,10 @@ struct InstallerPalette {
   Color press_fill;
   Color success;
   Color on_primary_button;
-  VisualFill accent_gradient;
-  VisualFill primary_button_fill;
+  VisualFill accent_gradient{Color::Transparent()};
+  VisualFill primary_button_fill{Color::Transparent()};
   Color brand_bg;
-  VisualFill brand_glow;
+  VisualFill brand_glow{Color::Transparent()};
   Color brand_eyebrow;
   Color brand_text;
   Color brand_secondary;
