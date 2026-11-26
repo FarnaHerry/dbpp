@@ -323,6 +323,47 @@ int CurrentSocketError() {
 }
 #endif
 
+class UniqueSocket {
+public:
+  UniqueSocket() = default;
+  explicit UniqueSocket(SocketHandle fd) noexcept : fd_(fd) {}
+  UniqueSocket(const UniqueSocket&) = delete;
+  UniqueSocket& operator=(const UniqueSocket&) = delete;
+  ~UniqueSocket() { Reset(); }
+
+  [[nodiscard]] SocketHandle Get() const noexcept { return fd_; }
+  [[nodiscard]] bool Valid() const noexcept { return fd_ != kInvalidSocket; }
+
+  SocketHandle Release() noexcept {
+    const SocketHandle out = fd_;
+    fd_ = kInvalidSocket;
+    return out;
+  }
+
+  void Reset(SocketHandle next = kInvalidSocket) noexcept {
+    if (fd_ != kInvalidSocket) {
+      CloseSocketHandle(fd_);
+    }
+    fd_ = next;
+  }
+
+private:
+  SocketHandle fd_ = kInvalidSocket;
+};
+
+struct AddrInfoGuard {
+  struct addrinfo* ptr = nullptr;
+  AddrInfoGuard() = default;
+  AddrInfoGuard(const AddrInfoGuard&) = delete;
+  AddrInfoGuard& operator=(const AddrInfoGuard&) = delete;
+  ~AddrInfoGuard() {
+    if (ptr != nullptr) {
+      freeaddrinfo(ptr);
+      ptr = nullptr;
+    }
+  }
+};
+
 // ---- RESP2 / RESP3 Wire Helpers -------------------------------------------
 
 bool FindCrLf(std::string_view buffer, std::size_t pos, std::size_t& line_end) {
@@ -1723,52 +1764,48 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
   hints.ai_protocol = IPPROTO_TCP;
 
   const std::string port_str = std::to_string(endpoint_.port);
-  struct addrinfo* res = nullptr;
-  const int gai = getaddrinfo(endpoint_.host.c_str(), port_str.c_str(), &hints, &res);
-  if (gai != 0 || res == nullptr) {
+  AddrInfoGuard res;
+  const int gai = getaddrinfo(endpoint_.host.c_str(), port_str.c_str(), &hints, &res.ptr);
+  if (gai != 0 || res.ptr == nullptr) {
     error_out = TrFmt("Failed to resolve host ({0}): {1}", "解析主机失败 ({0}): {1}",
                       {endpoint_.host, GaiErrorText(gai)});
     return false;
   }
 
-  SocketHandle connected = kInvalidSocket;
+  UniqueSocket connected;
   std::string last_err(Tr("Unable to connect to Redis server", "无法连接到 Redis 服务器"));
-  for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
-    const SocketHandle fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (fd == kInvalidSocket) {
+  for (struct addrinfo* p = res.ptr; p != nullptr; p = p->ai_next) {
+    UniqueSocket fd(socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+    if (!fd.Valid()) {
       last_err = LastSocketErrorText();
       continue;
     }
 
-    (void)SetNonBlocking(fd, true);
-    const int rc = ::connect(fd, p->ai_addr, static_cast<int>(p->ai_addrlen));
+    (void)SetNonBlocking(fd.Get(), true);
+    const int rc = ::connect(fd.Get(), p->ai_addr, static_cast<int>(p->ai_addrlen));
     if (rc != 0) {
       const int err_code = CurrentSocketError();
       if (!IsWouldBlockError(err_code)) {
         last_err = LastSocketErrorText(err_code);
-        CloseSocketHandle(fd);
         continue;
       }
       std::string wait_err;
-      if (!WaitConnectReady(fd, kConnectTimeoutMs, wait_err)) {
+      if (!WaitConnectReady(fd.Get(), kConnectTimeoutMs, wait_err)) {
         last_err = wait_err;
-        CloseSocketHandle(fd);
         continue;
       }
     }
 
-    if (!SetNonBlocking(fd, false)) {
+    if (!SetNonBlocking(fd.Get(), false)) {
       last_err = LastSocketErrorText();
-      CloseSocketHandle(fd);
       continue;
     }
-    ApplySocketTimeouts(fd, kSocketIoTimeoutMs);
-    connected = fd;
+    ApplySocketTimeouts(fd.Get(), kSocketIoTimeoutMs);
+    connected.Reset(fd.Release());
     break;
   }
-  freeaddrinfo(res);
 
-  if (connected == kInvalidSocket) {
+  if (!connected.Valid()) {
     error_out = TrFmt("Failed to connect to Redis ({0}:{1}): {2}",
                       "连接 Redis 失败 ({0}:{1}): {2}",
                       {endpoint_.host, port_str, last_err});
@@ -1776,9 +1813,9 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
   }
 
 #if defined(_WIN32)
-  sock_ = static_cast<std::uintptr_t>(connected);
+  sock_ = static_cast<std::uintptr_t>(connected.Release());
 #else
-  sock_ = connected;
+  sock_ = connected.Release();
 #endif
 
   const auto run_direct = [&](const std::vector<std::string>& cmd, RedisValue& out) -> bool {
@@ -2399,6 +2436,7 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
       client, object, req_page * model.page_size, model.page_size, sort, filter);
   if (!page_res.error.empty()) {
     model.error = page_res.error;
+    model.connection_lost = !client.IsConnected();
     return model;
   }
 
@@ -2411,6 +2449,7 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
                                          model.page_size, sort, filter);
     if (!page_res.error.empty()) {
       model.error = page_res.error;
+      model.connection_lost = !client.IsConnected();
       return model;
     }
     model.total = page_res.total;
@@ -2455,6 +2494,7 @@ AdbcQueryResult ExecuteSingleRedisCommandBlocking(RedisClient& client,
       return result;
     }
     if (!client.EnsureDb(static_cast<int>(*db_num), result.error)) {
+      result.connection_lost = !client.IsConnected();
       return result;
     }
     result.columns = {"result"};
@@ -2467,6 +2507,7 @@ AdbcQueryResult ExecuteSingleRedisCommandBlocking(RedisClient& client,
 
   RedisValue reply;
   if (!client.Command(parsed.args, reply, result.error)) {
+    result.connection_lost = !client.IsConnected();
     return result;
   }
   if (reply.IsError()) {
@@ -2602,6 +2643,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     return result;
   }
   if (!client.EnsureDb(*db, result.error)) {
+    result.connection_lost = !client.IsConnected();
     return result;
   }
 
@@ -2623,6 +2665,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     }
     RedisValue reply;
     if (!client.Command({"RENAMENX", key, text}, reply, result.error)) {
+      result.connection_lost = !client.IsConnected();
       return result;
     }
     if (reply.IsError()) {
@@ -2649,6 +2692,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     if (trimmed.empty() || trimmed == "-1" || EqualsIgnoreCase(trimmed, "NULL")) {
       RedisValue reply;
       if (!client.Command({"PERSIST", key}, reply, result.error)) {
+        result.connection_lost = !client.IsConnected();
         return result;
       }
       if (reply.IsError()) {
@@ -2666,6 +2710,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     }
     RedisValue reply;
     if (!client.Command({"EXPIRE", key, std::to_string(*ttl_val)}, reply, result.error)) {
+      result.connection_lost = !client.IsConnected();
       return result;
     }
     if (reply.IsError()) {
@@ -2692,10 +2737,15 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
       pttl_reply.kind == RedisValueKind::Integer && pttl_reply.integer > 0) {
     preserve_pttl = pttl_reply.integer;
   } else {
+    if (!client.IsConnected()) {
+      result.connection_lost = true;
+      return result;
+    }
     result.error.clear();
   }
   if (!WriteTypedRedisKey(client, key, type, write_args, std::nullopt, type != "string",
                           preserve_pttl, result.error)) {
+    result.connection_lost = !client.IsConnected();
     return result;
   }
   result.affected = 1;
@@ -2717,11 +2767,13 @@ AdbcQueryResult DeleteRedisKeyBlocking(RedisClient& client, const TableModel& mo
     return result;
   }
   if (!client.EnsureDb(*db, result.error)) {
+    result.connection_lost = !client.IsConnected();
     return result;
   }
   const std::string& key = model.snapshot->rows[row_index].values[0].text;
   RedisValue reply;
   if (!client.Command({"DEL", key}, reply, result.error)) {
+    result.connection_lost = !client.IsConnected();
     return result;
   }
   if (reply.IsError()) {
@@ -2800,7 +2852,10 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
 
   std::string err;
   if (!client.EnsureDb(*db, err)) {
-    return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = err};
+    return BatchInsertResult{.inserted = 0,
+                             .rolled_back = true,
+                             .connection_lost = !client.IsConnected(),
+                             .error = err};
   }
 
   std::vector<std::vector<std::string>> exists_cmds;
@@ -2810,7 +2865,10 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
   }
   std::vector<RedisValue> exists_replies;
   if (!client.Pipeline(exists_cmds, exists_replies, err)) {
-    return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = err};
+    return BatchInsertResult{.inserted = 0,
+                             .rolled_back = true,
+                             .connection_lost = !client.IsConnected(),
+                             .error = err};
   }
   for (std::size_t i = 0; i < specs.size() && i < exists_replies.size(); ++i) {
     if (exists_replies[i].kind == RedisValueKind::Integer && exists_replies[i].integer > 0) {
@@ -2827,6 +2885,7 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
                             std::nullopt, err)) {
       return BatchInsertResult{.inserted = inserted,
                                .rolled_back = (inserted == 0),
+                               .connection_lost = !client.IsConnected(),
                                .error = TrFmt("Failed to write {0}: {1}", "写入 {0} 失败: {1}",
                                               {spec.key, err})};
     }

@@ -13,6 +13,11 @@ inline constexpr std::string_view kSettingLightweight = "tray.lightweight";
 inline constexpr std::string_view kSettingThemeMode = "theme.mode";
 inline constexpr std::string_view kSettingThemePreset = "theme.preset";
 inline constexpr std::string_view kSettingUiLanguage = "ui.language";
+inline constexpr std::string_view kSettingMcpEnabled = "mcp.enabled";
+inline constexpr std::string_view kSettingMcpHost = "mcp.host";
+inline constexpr std::string_view kSettingMcpPort = "mcp.port";
+inline constexpr std::string_view kSettingMcpReadOnly = "mcp.read_only";
+inline constexpr std::uint16_t kDefaultMcpPort = 18765;
 
 enum class ThemeMode {
   System = 0,
@@ -48,7 +53,7 @@ struct AppThemeConfig {
 [[nodiscard]] std::string_view LanguageModeKey(LanguageMode mode);
 [[nodiscard]] LanguageMode LanguageModeFromKey(std::string_view key);
 
-/// Persisted tray, theme, and language preferences. Stored as key/value rows in SQLite
+/// Persisted tray, theme, language, and MCP server preferences. Stored as key/value rows in SQLite
 /// (`dbpp.sqlite3` `settings` table, automatically migrating legacy `settings.tsv`).
 struct TraySettings {
   bool tray_enabled = true;
@@ -56,6 +61,10 @@ struct TraySettings {
   ThemeMode theme_mode = ThemeMode::System;
   ThemePreset theme_preset = ThemePreset::GeminiSpark;
   LanguageMode language = LanguageMode::System;
+  bool mcp_enabled = false;
+  std::string mcp_host = "127.0.0.1";
+  std::uint16_t mcp_port = kDefaultMcpPort;
+  bool mcp_read_only = true;
 
   bool operator==(const TraySettings&) const = default;
 };
@@ -80,6 +89,10 @@ struct SettingsModel {
   huxerui::State<ThemeMode> theme_mode{ThemeMode::System};
   huxerui::State<ThemePreset> theme_preset{ThemePreset::GeminiSpark};
   huxerui::State<LanguageMode> language{LanguageMode::System};
+  huxerui::State<bool> mcp_enabled{false};
+  huxerui::State<std::string> mcp_host{"127.0.0.1"};
+  huxerui::State<std::uint16_t> mcp_port{kDefaultMcpPort};
+  huxerui::State<bool> mcp_read_only{true};
   std::string path;
   std::function<void(std::string, std::string)> persist_setting;
 
@@ -89,9 +102,17 @@ struct SettingsModel {
   bool SetThemeMode(ThemeMode mode);
   bool SetThemePreset(ThemePreset preset);
   bool SetLanguage(LanguageMode mode);
+  bool SetMcpEnabled(bool enabled);
+  bool SetMcpHost(std::string host);
+  bool SetMcpPort(std::uint16_t port);
+  bool SetMcpReadOnly(bool read_only);
 
   [[nodiscard]] TraySettings Snapshot() const;
   [[nodiscard]] AppThemeConfig ThemeConfig() const;
 };
+
+[[nodiscard]] std::uint16_t ParseMcpPort(std::string_view text,
+                                         std::uint16_t fallback = kDefaultMcpPort) noexcept;
+[[nodiscard]] std::string NormalizeMcpHost(std::string_view host);
 
 } // namespace dbpp

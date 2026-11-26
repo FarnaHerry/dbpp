@@ -20,6 +20,16 @@ std::string LowerAsciiCopy(std::string_view text) {
   return out;
 }
 
+std::string TrimAsciiCopy(std::string_view text) {
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+    text.remove_suffix(1);
+  }
+  return std::string(text);
+}
+
 std::string_view FlagText(bool value) {
   return value ? "true" : "false";
 }
@@ -413,6 +423,26 @@ LanguageMode LanguageModeFromKey(std::string_view key) {
   return LanguageMode::System;
 }
 
+std::uint16_t ParseMcpPort(std::string_view text, std::uint16_t fallback) noexcept {
+  const std::string trimmed = TrimAsciiCopy(text);
+  if (trimmed.empty()) {
+    return fallback;
+  }
+  unsigned int value = 0;
+  const char* begin = trimmed.data();
+  const char* end_ptr = trimmed.data() + trimmed.size();
+  const auto [end, ec] = std::from_chars(begin, end_ptr, value);
+  if (ec != std::errc{} || end != end_ptr || value == 0 || value > 65535U) {
+    return fallback;
+  }
+  return static_cast<std::uint16_t>(value);
+}
+
+std::string NormalizeMcpHost(std::string_view host) {
+  const std::string trimmed = TrimAsciiCopy(host);
+  return trimmed.empty() ? std::string("127.0.0.1") : trimmed;
+}
+
 TraySettings LoadTraySettings(const std::string& path) {
   TraySettings settings;
   if (path.empty()) {
@@ -430,6 +460,14 @@ TraySettings LoadTraySettings(const std::string& path) {
       settings.theme_preset = ThemePresetFromKey(value);
     } else if (key == kSettingUiLanguage) {
       settings.language = LanguageModeFromKey(value);
+    } else if (key == kSettingMcpEnabled) {
+      settings.mcp_enabled = value == "true";
+    } else if (key == kSettingMcpHost) {
+      settings.mcp_host = NormalizeMcpHost(value);
+    } else if (key == kSettingMcpPort) {
+      settings.mcp_port = ParseMcpPort(value);
+    } else if (key == kSettingMcpReadOnly) {
+      settings.mcp_read_only = value != "false";
     }
   };
 
@@ -462,7 +500,7 @@ TraySettings LoadTraySettings(const std::string& path) {
           conn.db,
           "SELECT key, value FROM settings "
           "WHERE key IN ('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', "
-          "'ui.language');",
+          "'ui.language', 'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only');",
           -1, &stmt.stmt, nullptr) != SQLITE_OK) {
     return settings;
   }
@@ -501,7 +539,11 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
              << kSettingLightweight << '\t' << FlagText(settings.lightweight) << '\n'
              << kSettingThemeMode << '\t' << ThemeModeKey(settings.theme_mode) << '\n'
              << kSettingThemePreset << '\t' << ThemePresetKey(settings.theme_preset) << '\n'
-             << kSettingUiLanguage << '\t' << LanguageModeKey(settings.language) << '\n';
+             << kSettingUiLanguage << '\t' << LanguageModeKey(settings.language) << '\n'
+             << kSettingMcpEnabled << '\t' << FlagText(settings.mcp_enabled) << '\n'
+             << kSettingMcpHost << '\t' << NormalizeMcpHost(settings.mcp_host) << '\n'
+             << kSettingMcpPort << '\t' << settings.mcp_port << '\n'
+             << kSettingMcpReadOnly << '\t' << FlagText(settings.mcp_read_only) << '\n';
       stream.flush();
       if (!stream) {
         std::error_code cleanup_error;
@@ -544,6 +586,10 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
       {kSettingThemeMode, std::string(ThemeModeKey(settings.theme_mode))},
       {kSettingThemePreset, std::string(ThemePresetKey(settings.theme_preset))},
       {kSettingUiLanguage, std::string(LanguageModeKey(settings.language))},
+      {kSettingMcpEnabled, std::string(FlagText(settings.mcp_enabled))},
+      {kSettingMcpHost, NormalizeMcpHost(settings.mcp_host)},
+      {kSettingMcpPort, std::to_string(settings.mcp_port)},
+      {kSettingMcpReadOnly, std::string(FlagText(settings.mcp_read_only))},
   };
 
   StmtGuard upsert;
@@ -581,6 +627,10 @@ void SettingsModel::Load() {
   theme_mode = settings.theme_mode;
   theme_preset = settings.theme_preset;
   language = settings.language;
+  mcp_enabled = settings.mcp_enabled;
+  mcp_host = NormalizeMcpHost(settings.mcp_host);
+  mcp_port = settings.mcp_port;
+  mcp_read_only = settings.mcp_read_only;
 }
 
 TraySettings SettingsModel::Snapshot() const {
@@ -590,6 +640,10 @@ TraySettings SettingsModel::Snapshot() const {
       .theme_mode = theme_mode.Get(),
       .theme_preset = theme_preset.Get(),
       .language = language.Get(),
+      .mcp_enabled = mcp_enabled.Get(),
+      .mcp_host = NormalizeMcpHost(mcp_host.Get()),
+      .mcp_port = mcp_port.Get(),
+      .mcp_read_only = mcp_read_only.Get(),
   };
 }
 
@@ -640,6 +694,44 @@ bool SettingsModel::SetLanguage(LanguageMode mode) {
   language = mode;
   if (persist_setting) {
     persist_setting(std::string(kSettingUiLanguage), std::string(LanguageModeKey(mode)));
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetMcpEnabled(bool enabled) {
+  mcp_enabled = enabled;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingMcpEnabled), std::string(FlagText(enabled)));
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetMcpHost(std::string host) {
+  const std::string normalized = NormalizeMcpHost(host);
+  mcp_host = normalized;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingMcpHost), normalized);
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetMcpPort(std::uint16_t port) {
+  const std::uint16_t effective = port == 0 ? kDefaultMcpPort : port;
+  mcp_port = effective;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingMcpPort), std::to_string(effective));
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetMcpReadOnly(bool read_only) {
+  mcp_read_only = read_only;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingMcpReadOnly), std::string(FlagText(read_only)));
     return true;
   }
   return SaveTraySettings(path, Snapshot());

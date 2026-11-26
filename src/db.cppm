@@ -135,6 +135,8 @@ std::uint64_t OpenSqlTab(const huxerui::State<AppModel>& app,
                          const huxerui::State<WorkspaceModel>& workspace,
                          std::uint64_t session_id, std::string initial_sql = {},
                          std::string custom_title = {});
+std::uint64_t OpenSettingsTab(const huxerui::State<AppModel>& app,
+                              const huxerui::State<WorkspaceModel>& workspace);
 void ActivateWorkspaceTab(const huxerui::State<AppModel>& app,
                           const huxerui::State<WorkspaceModel>& workspace,
                           std::uint64_t tab_id);
@@ -153,5 +155,13 @@ void RefreshSessionObjects(const huxerui::State<AppModel>& app,
                            const huxerui::State<WorkspaceModel>& workspace,
                            const huxerui::TaskScope& tasks, std::uint64_t session_id,
                            NotifyFn notify, bool notify_success = true);
+void HandleSessionDisconnected(const huxerui::State<AppModel>& app,
+                                const huxerui::State<WorkspaceModel>& workspace,
+                                const huxerui::TaskScope& tasks, std::uint64_t session_id,
+                                std::string reason, NotifyFn notify);
+void ScheduleSessionHealthCheck(const huxerui::State<AppModel>& app,
+                                const huxerui::State<WorkspaceModel>& workspace,
+                                const huxerui::TaskScope& tasks, NotifyFn notify);
+void CloseAllSessions(const huxerui::State<AppModel>& app, const huxerui::TaskScope& tasks);
 
 } // namespace dbpp

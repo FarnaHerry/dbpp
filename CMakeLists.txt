@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.3.0 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.3.1 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -159,6 +159,7 @@ if (WIN32)
     if (HUXERUI_WINDOWS_RESOURCE)
         target_sources(dbpp PRIVATE "${HUXERUI_WINDOWS_RESOURCE}")
     endif ()
+    target_link_libraries(dbpp PRIVATE shell32)
     target_compile_definitions(dbpp PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif ()
 
@@ -191,6 +192,7 @@ add_library(dbpp_core STATIC
         src/driver_installer.cpp
         src/instance.cpp
         src/db.cpp
+        src/mcp_server.cpp
         src/config_db.cpp
         src/cli.cpp
         src/theme_palette.cpp
@@ -207,6 +209,7 @@ target_sources(dbpp_core PUBLIC
             src/driver_installer.cppm
             src/instance.cppm
             src/db.cppm
+            src/mcp_server.cppm
             src/config_db.cppm
             src/cli.cppm
 )
@@ -402,6 +405,7 @@ if (DBPP_BUILD_TESTS)
     dbpp_add_module_test(test_cli cli tests/test_cli.cpp)
     dbpp_add_module_test(test_instance instance tests/test_instance.cpp)
     dbpp_add_module_test(test_redis redis tests/test_redis.cpp)
+    dbpp_add_module_test(test_mcp mcp tests/test_mcp.cpp)
 endif ()
 
 add_custom_target(dbpp-run

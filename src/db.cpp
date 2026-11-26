@@ -21,6 +21,20 @@ using namespace huxerui;
 
 namespace {
 
+std::string TrimAsciiCopy(std::string_view text) {
+  while (!text.empty() &&
+         (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' ||
+          text.front() == '\n')) {
+    text.remove_prefix(1);
+  }
+  while (!text.empty() &&
+         (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' ||
+          text.back() == '\n')) {
+    text.remove_suffix(1);
+  }
+  return std::string(text);
+}
+
 const DbSession* FindSession(const AppModel& model, std::uint64_t id) {
   for (const auto& session : model.sessions) {
     if (session.id == id) {
@@ -76,6 +90,11 @@ std::string FormatTabTitle(const DbSession& session, std::string_view object,
 void SyncAppFromActiveTab(AppModel& model, const WorkspaceModel& ws) {
   const WorkspaceTab* active = ws.ActiveTab();
   if (active == nullptr) {
+    model.active_object.clear();
+    model.active_is_view = false;
+    return;
+  }
+  if (active->kind == WorkspaceTabKind::Settings) {
     model.active_object.clear();
     model.active_is_view = false;
     return;
@@ -147,14 +166,32 @@ std::string BuildWhere(const Dialect dialect, const TableModel& model, const Gri
   return where;
 }
 
+void CloseSessionAsync(std::shared_ptr<AdbcSession> adbc, const TaskScope& tasks) {
+  if (!adbc) {
+    return;
+  }
+  adbc->MarkClosed();
+  tasks.Launch([adbc = std::move(adbc)]() mutable -> Task<void> {
+    co_await adbc->sequence.Run([adbc](std::stop_token) { adbc->ReleaseResourcesBlocking(); });
+  });
+}
+
 } // namespace
 
 TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
                              DbObject object, std::int64_t page, std::int64_t page_size,
                              std::optional<DataTableSort> sort, std::string filter) {
+  if (session.IsClosed()) {
+    TableModel model;
+    model.session_id = session_id;
+    model.object = object.name;
+    model.connection_lost = true;
+    model.error = Tr("Connection is closed", "连接已关闭");
+    return model;
+  }
   if (session.dialect == Dialect::Redis && session.redis) {
     return LoadRedisTableBlocking(*session.redis, session_id, object, page, page_size,
-                                  std::move(sort), std::move(filter));
+                                  std::move(sort), TrimAsciiCopy(filter));
   }
   TableModel model;
   model.session_id = session_id;
@@ -165,9 +202,14 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   model.page = std::max<std::int64_t>(0, page);
   model.page_size = std::max<std::int64_t>(1, page_size);
   model.sort = std::move(sort);
-  model.filter = std::move(filter);
+  model.filter = NormalizeSqlFilter(filter);
 
   AdbcSchemaResult schema = LoadSchemaBlocking(session, object);
+  if (schema.connection_lost) {
+    model.connection_lost = true;
+    model.error = schema.error;
+    return model;
+  }
   model.columns = schema.columns;
   if (model.columns.empty()) {
     if (!schema.error.empty()) {
@@ -178,6 +220,7 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
                                   "SELECT * FROM " + model.qualified_name + " LIMIT 0",
                                   true, 0);
     if (!header.error.empty()) {
+      model.connection_lost = header.connection_lost;
       model.error = header.error;
       return model;
     }
@@ -210,6 +253,7 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   const AdbcQueryResult count = ExecuteBlocking(
       session, "SELECT COUNT(*) FROM " + model.qualified_name + where, true, 1);
   if (!count.error.empty() || count.rows.empty() || count.rows.front().values.empty()) {
+    model.connection_lost = count.connection_lost;
     model.error = count.error.empty()
                       ? std::string(Tr("COUNT query returned no result", "COUNT 查询没有返回结果"))
                       : count.error;
@@ -269,6 +313,7 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   AdbcQueryResult data = ExecuteBlocking(session, data_sql, true,
                                          static_cast<std::size_t>(model.page_size));
   if (!data.error.empty() && data.rows.empty()) {
+    model.connection_lost = data.connection_lost;
     model.error = data.error;
     return model;
   }
@@ -431,48 +476,91 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
   session->objects = std::move(objects.objects);
 
   bool duplicated = false;
+  bool reconnected = false;
+  std::shared_ptr<AdbcSession> stale_or_redundant;
   std::uint64_t target_session_id = 0;
   std::string first_object;
   std::string first_schema;
   bool first_is_view = false;
+  std::vector<std::uint64_t> open_session_ids;
+
+  const auto pick_first_object = [](const DbSession& s, std::string& obj_out,
+                                    std::string& schema_out, bool& is_view_out) {
+    if (s.objects.empty()) {
+      return;
+    }
+    std::size_t first_idx = 0;
+    if (s.dialect == Dialect::Redis && s.session && s.session->redis) {
+      const std::string target_db = "db" + std::to_string(s.session->redis->CurrentDb());
+      for (std::size_t idx = 0; idx < s.objects.size(); ++idx) {
+        if (s.objects[idx].name == target_db) {
+          first_idx = idx;
+          break;
+        }
+      }
+    }
+    obj_out = s.objects[first_idx].name;
+    schema_out = s.objects[first_idx].db_schema;
+    is_view_out = s.objects[first_idx].is_view;
+  };
 
   app.Update([&](AppModel& model) {
-    for (const auto& existing : model.sessions) {
+    for (DbSession& existing : model.sessions) {
       if (existing.uri == session->uri && existing.dialect == session->dialect) {
         model.active_session = existing.id;
         model.status.clear();
         model.error.clear();
-        duplicated = true;
         target_session_id = existing.id;
-        return;
+        if (!existing.session || !existing.session->IsAlive()) {
+          stale_or_redundant = std::move(existing.session);
+          existing.name = session->name;
+          existing.driver_path = session->driver_path;
+          existing.session = session->session;
+          existing.objects = std::move(session->objects);
+          ++model.revision;
+          reconnected = true;
+          pick_first_object(existing, first_object, first_schema, first_is_view);
+        } else {
+          stale_or_redundant = std::move(session->session);
+          duplicated = true;
+        }
+        break;
       }
     }
-    session->id = model.next_session_id++;
-    target_session_id = session->id;
-    if (!session->objects.empty()) {
-      std::size_t first_idx = 0;
-      if (session->dialect == Dialect::Redis && session->session && session->session->redis) {
-        const std::string target_db =
-            "db" + std::to_string(session->session->redis->CurrentDb());
-        for (std::size_t idx = 0; idx < session->objects.size(); ++idx) {
-          if (session->objects[idx].name == target_db) {
-            first_idx = idx;
-            break;
-          }
+    if (!duplicated && !reconnected) {
+      session->id = model.next_session_id++;
+      target_session_id = session->id;
+      pick_first_object(*session, first_object, first_schema, first_is_view);
+      model.sessions.push_back(*session);
+      model.active_session = target_session_id;
+      model.active_object.clear();
+      model.active_is_view = false;
+      model.status.clear();
+      model.error.clear();
+      ++model.revision;
+    }
+    open_session_ids.reserve(model.sessions.size());
+    for (const DbSession& open : model.sessions) {
+      open_session_ids.push_back(open.id);
+    }
+  });
+
+  if (stale_or_redundant) {
+    CloseSessionAsync(std::move(stale_or_redundant), tasks);
+  }
+
+  if (!duplicated) {
+    workspace.Update([&](WorkspaceModel& ws) {
+      for (WorkspaceTab& tab : ws.tabs) {
+        const bool is_live = std::ranges::find(open_session_ids, tab.session_id) !=
+                             open_session_ids.end();
+        if (!is_live && tab.session_uri == session->uri) {
+          tab.session_id = target_session_id;
+          tab.session_name = session->name;
         }
       }
-      first_object = session->objects[first_idx].name;
-      first_schema = session->objects[first_idx].db_schema;
-      first_is_view = session->objects[first_idx].is_view;
-    }
-    model.sessions.push_back(*session);
-    model.active_session = target_session_id;
-    model.active_object.clear();
-    model.active_is_view = false;
-    model.status.clear();
-    model.error.clear();
-    ++model.revision;
-  });
+    });
+  }
 
   if (duplicated) {
     std::uint64_t existing_tab_id = 0;
@@ -489,6 +577,33 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
         model.active_object.clear();
         model.active_is_view = false;
       });
+    }
+  } else if (reconnected) {
+    bool has_session_tab = false;
+    std::uint64_t reload_tab_id = 0;
+    std::int64_t reload_page = 0;
+    std::optional<DataTableSort> reload_sort;
+    std::string reload_filter;
+    const WorkspaceModel& ws_now = workspace.Get();
+    for (const WorkspaceTab& tab : ws_now.tabs) {
+      if (tab.session_id == target_session_id) {
+        has_session_tab = true;
+      }
+    }
+    if (const WorkspaceTab* active = ws_now.ActiveTab();
+        active != nullptr && active->session_id == target_session_id &&
+        active->kind == WorkspaceTabKind::Table && active->table.pending_inserts.empty()) {
+      reload_tab_id = active->id;
+      reload_page = active->table.page;
+      reload_sort = active->table.sort;
+      reload_filter = active->table.filter;
+    }
+    if (reload_tab_id != 0) {
+      RequestLoadTable(app, workspace, tasks, reload_tab_id, reload_page, reload_sort,
+                       std::move(reload_filter), true, notify);
+    } else if (!has_session_tab && !first_object.empty()) {
+      SelectObject(app, workspace, tasks, target_session_id, first_object, first_schema,
+                   first_is_view, notify);
     }
   } else if (!first_object.empty()) {
     SelectObject(app, workspace, tasks, target_session_id, first_object, first_schema,
@@ -512,8 +627,9 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
 Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
                                         std::string sql, bool want_rows,
                                         std::size_t max_rows) {
-  if (!session) {
+  if (!session || session->IsClosed()) {
     AdbcQueryResult result;
+    result.connection_lost = true;
     result.error = Tr("Connection is closed", "连接已关闭");
     co_return result;
   }
@@ -526,33 +642,53 @@ Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
 Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session, TableModel model,
                                       std::size_t row_index, std::size_t column_index,
                                       std::string text) {
-  if (!session) {
+  if (!session || session->IsClosed()) {
     AdbcQueryResult result;
+    result.connection_lost = true;
     result.error = Tr("Connection is closed", "连接已关闭");
     co_return result;
   }
   co_return co_await session->sequence.Run(
       [session, model = std::move(model), row_index, column_index, text = std::move(text)](
           std::stop_token) mutable {
+        if (session->IsClosed()) {
+          AdbcQueryResult res;
+          res.connection_lost = true;
+          res.error = Tr("Connection is closed", "连接已关闭");
+          return res;
+        }
         return UpdateCellBlocking(*session, model, row_index, column_index, text);
       });
 }
 
 Task<AdbcQueryResult> DeleteRowAsync(std::shared_ptr<AdbcSession> session, TableModel model,
                                      std::size_t row_index) {
-  if (!session) {
+  if (!session || session->IsClosed()) {
     AdbcQueryResult result;
+    result.connection_lost = true;
     result.error = Tr("Connection is closed", "连接已关闭");
     co_return result;
   }
   co_return co_await session->sequence.Run(
       [session, model = std::move(model), row_index](std::stop_token) mutable {
+        if (session->IsClosed()) {
+          AdbcQueryResult res;
+          res.connection_lost = true;
+          res.error = Tr("Connection is closed", "连接已关闭");
+          return res;
+        }
         return DeleteRowBlocking(*session, model, row_index);
       });
 }
 
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows) {
+  if (session.IsClosed()) {
+    return BatchInsertResult{.inserted = 0,
+                             .rolled_back = true,
+                             .connection_lost = true,
+                             .error = std::string(Tr("Connection is closed", "连接已关闭"))};
+  }
   if (session.dialect == Dialect::Redis && session.redis) {
     return InsertRedisRowsBlocking(*session.redis, model, rows);
   }
@@ -562,7 +698,10 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
   if (rows.size() == 1) {
     AdbcQueryResult result = InsertRowBlocking(session, model, rows[0].values);
     if (!result.error.empty()) {
-      return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = result.error};
+      return BatchInsertResult{.inserted = 0,
+                               .rolled_back = true,
+                               .connection_lost = result.connection_lost,
+                               .error = result.error};
     }
     return BatchInsertResult{.inserted = 1, .rolled_back = false, .error = {}};
   }
@@ -572,8 +711,17 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
                            session.dialect == Dialect::Mysql ||
                            session.dialect == Dialect::Duckdb;
   bool in_tx = false;
-  if (supports_tx && ExecuteBlocking(session, "BEGIN", false, 0).error.empty()) {
-    in_tx = true;
+  if (supports_tx) {
+    const AdbcQueryResult begin_res = ExecuteBlocking(session, "BEGIN", false, 0);
+    if (begin_res.connection_lost) {
+      return BatchInsertResult{.inserted = 0,
+                               .rolled_back = true,
+                               .connection_lost = true,
+                               .error = begin_res.error};
+    }
+    if (begin_res.error.empty()) {
+      in_tx = true;
+    }
   }
 
   for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -581,21 +729,30 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
     if (!result.error.empty()) {
       const std::string msg = TrFmt("Row {0} insert failed: {1}", "第 {0} 行插入失败: {1}",
                                     {std::to_string(i + 1), result.error});
-      if (in_tx) {
+      if (in_tx && !result.connection_lost) {
         (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
-        return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = msg};
+        return BatchInsertResult{.inserted = 0,
+                                 .rolled_back = true,
+                                 .connection_lost = false,
+                                 .error = msg};
       }
-      return BatchInsertResult{.inserted = i, .rolled_back = false, .error = msg};
+      return BatchInsertResult{.inserted = result.connection_lost && in_tx ? 0 : i,
+                               .rolled_back = result.connection_lost && in_tx,
+                               .connection_lost = result.connection_lost,
+                               .error = msg};
     }
   }
 
   if (in_tx) {
     AdbcQueryResult committed = ExecuteBlocking(session, "COMMIT", false, 0);
     if (!committed.error.empty()) {
-      (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
+      if (!committed.connection_lost) {
+        (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
+      }
       return BatchInsertResult{
           .inserted = 0,
           .rolled_back = true,
+          .connection_lost = committed.connection_lost,
           .error = TrFmt("Failed to commit transaction: {0}", "提交事务失败: {0}",
                          {committed.error})};
     }
@@ -620,9 +777,22 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
 
   const AppModel& model = app.Get();
   const DbSession* session = FindSession(model, session_id);
-  const DbObject* object =
-      session != nullptr ? FindObject(*session, object_name, object_schema) : nullptr;
-  if (session == nullptr || object == nullptr || !session->session) {
+  if (session == nullptr || !session->session || session->session->IsClosed()) {
+    if (session != nullptr) {
+      HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
+      return;
+    }
+    workspace.Update([&](WorkspaceModel& ws) {
+      WorkspaceTab* target = ws.FindTab(tab_id);
+      if (target != nullptr && target->kind == WorkspaceTabKind::Table) {
+        target->table = TableModel{};
+        target->selected_cell = std::nullopt;
+      }
+    });
+    return;
+  }
+  const DbObject* object = FindObject(*session, object_name, object_schema);
+  if (object == nullptr) {
     workspace.Update([&](WorkspaceModel& ws) {
       WorkspaceTab* target = ws.FindTab(tab_id);
       if (target != nullptr && target->kind == WorkspaceTabKind::Table) {
@@ -648,7 +818,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
   auto adbc_session = session->session;
   DbObject object_copy = *object;
 
-  tasks.Launch([app, workspace, notify = std::move(notify), adbc_session, tab_id, session_id,
+  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session, tab_id, session_id,
                 object_copy = std::move(object_copy), object_name, object_schema, page, sort,
                 filter]() mutable -> Task<void> {
     TableModel result = co_await adbc_session->sequence.Run(
@@ -658,8 +828,19 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
                                    kPageSize, sort, filter);
         });
 
+    const bool load_lost = result.connection_lost;
     const std::string load_error = result.error;
     const bool has_snapshot = result.snapshot != nullptr;
+    if (load_lost) {
+      workspace.Update([&](WorkspaceModel& ws) {
+        if (WorkspaceTab* target = ws.FindTab(tab_id);
+            target != nullptr && target->kind == WorkspaceTabKind::Table) {
+          target->table.loading = false;
+        }
+      });
+      HandleSessionDisconnected(app, workspace, tasks, session_id, load_error, notify);
+      co_return;
+    }
     bool tab_matches = false;
     workspace.Update([&](WorkspaceModel& ws) {
       WorkspaceTab* target = ws.FindTab(tab_id);
@@ -678,9 +859,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
           return;
         }
         target->table.loading = false;
-        if (target->table.snapshot == nullptr) {
-          target->table.error = load_error;
-        }
+        target->table.error = load_error;
         return;
       }
       result.pending_inserts = std::move(target->table.pending_inserts);
@@ -697,6 +876,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
       if (!result.error.empty()) {
         result.error.clear();
       }
+      result.snapshot_version = target->table.snapshot_version + 1;
       target->table = std::move(result);
       target->selected_cell = std::nullopt;
     });
@@ -727,7 +907,10 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
     return;
   }
   const DbSession* session = FindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session) {
+  if (session == nullptr || !session->session || session->session->IsClosed()) {
+    if (session != nullptr) {
+      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
+    }
     return;
   }
   TableModel table_value = tab->table;
@@ -765,6 +948,10 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
                 row_index, column_index, text = edit.text]() mutable -> Task<void> {
     AdbcQueryResult result =
         co_await UpdateCellAsync(adbc_session, table_value, row_index, column_index, text);
+    if (result.connection_lost) {
+      HandleSessionDisconnected(app, workspace, tasks, session_id, result.error, notify);
+      co_return;
+    }
     if (!result.error.empty()) {
       const std::string message = result.error;
       if (notify) {
@@ -792,7 +979,10 @@ void RequestDeleteSelected(const State<AppModel>& app, const State<WorkspaceMode
     return;
   }
   const DbSession* session = FindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session) {
+  if (session == nullptr || !session->session || session->session->IsClosed()) {
+    if (session != nullptr) {
+      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
+    }
     return;
   }
   TableModel table_value = tab->table;
@@ -813,6 +1003,10 @@ void RequestDeleteSelected(const State<AppModel>& app, const State<WorkspaceMode
                 table_value = std::move(table_value), tab_id, session_id, object_name,
                 row_index, page, remaining]() mutable -> Task<void> {
     AdbcQueryResult result = co_await DeleteRowAsync(adbc_session, table_value, row_index);
+    if (result.connection_lost) {
+      HandleSessionDisconnected(app, workspace, tasks, session_id, result.error, notify);
+      co_return;
+    }
     if (!result.error.empty()) {
       const std::string message = result.error;
       if (notify) {
@@ -844,8 +1038,10 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
     return;
   }
   const DbSession* session = FindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session) {
-    if (notify) {
+  if (session == nullptr || !session->session || session->session->IsClosed()) {
+    if (session != nullptr) {
+      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
+    } else if (notify) {
       notify(std::string(Tr("Connection is closed", "连接已关闭")));
     }
     return;
@@ -870,6 +1066,17 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
     BatchInsertResult res = co_await adbc->sequence.Run(
         [adbc, table_copy = std::move(table_copy), rows = std::move(rows)](
             std::stop_token) mutable { return InsertRowsBlocking(*adbc, table_copy, rows); });
+
+    if (res.connection_lost) {
+      workspace.Update([&](WorkspaceModel& ws) {
+        if (WorkspaceTab* target = ws.FindTab(tab_id);
+            target != nullptr && target->kind == WorkspaceTabKind::Table) {
+          target->table.committing = false;
+        }
+      });
+      HandleSessionDisconnected(app, workspace, tasks, session_id, res.error, notify);
+      co_return;
+    }
 
     if (!res.error.empty()) {
       bool partial_reload = false;
@@ -1022,6 +1229,32 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
   return created_id;
 }
 
+std::uint64_t OpenSettingsTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace) {
+  if (const WorkspaceTab* existing = workspace.Get().FindSettingsTab()) {
+    ActivateWorkspaceTab(app, workspace, existing->id);
+    return existing->id;
+  }
+  std::uint64_t created_id = 0;
+  workspace.Update([&](WorkspaceModel& ws) {
+    if (const WorkspaceTab* existing = ws.FindSettingsTab()) {
+      created_id = existing->id;
+      ws.active_tab_id = created_id;
+      return;
+    }
+    WorkspaceTab tab;
+    tab.id = ws.next_tab_id++;
+    created_id = tab.id;
+    tab.kind = WorkspaceTabKind::Settings;
+    tab.session_id = 0;
+    tab.title = std::string(Tr("Settings", "设置"));
+    ws.tabs.push_back(std::move(tab));
+    ws.active_tab_id = created_id;
+  });
+  const WorkspaceModel& ws_now = workspace.Get();
+  app.Update([&ws_now](AppModel& model) { SyncAppFromActiveTab(model, ws_now); });
+  return created_id;
+}
+
 void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                   const TaskScope& tasks, std::uint64_t session_id, std::string object,
                   std::string db_schema, bool is_view, NotifyFn notify) {
@@ -1096,8 +1329,8 @@ void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& wor
 
 void CloseSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                   const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify) {
-  (void)tasks;
   (void)notify;
+  std::shared_ptr<AdbcSession> adbc_to_close;
   std::vector<std::uint64_t> tabs_to_close;
   for (const WorkspaceTab& tab : workspace.Get().tabs) {
     if (tab.session_id == session_id) {
@@ -1105,6 +1338,12 @@ void CloseSession(const State<AppModel>& app, const State<WorkspaceModel>& works
     }
   }
   app.Update([&](AppModel& model) {
+    for (DbSession& session : model.sessions) {
+      if (session.id == session_id) {
+        adbc_to_close = std::move(session.session);
+        break;
+      }
+    }
     std::erase_if(model.sessions, [session_id](const DbSession& session) {
       return session.id == session_id;
     });
@@ -1120,8 +1359,130 @@ void CloseSession(const State<AppModel>& app, const State<WorkspaceModel>& works
     }
     ++model.revision;
   });
+  CloseSessionAsync(std::move(adbc_to_close), tasks);
   if (!tabs_to_close.empty()) {
     CloseWorkspaceTabs(app, workspace, tabs_to_close);
+  }
+}
+
+void HandleSessionDisconnected(const State<AppModel>& app,
+                                const State<WorkspaceModel>& workspace,
+                                const TaskScope& tasks, std::uint64_t session_id,
+                                std::string reason, NotifyFn notify) {
+  std::shared_ptr<AdbcSession> adbc_to_close;
+  std::string session_name;
+  bool removed = false;
+  app.Update([&](AppModel& model) {
+    for (auto it = model.sessions.begin(); it != model.sessions.end(); ++it) {
+      if (it->id == session_id) {
+        session_name = it->name;
+        adbc_to_close = std::move(it->session);
+        model.sessions.erase(it);
+        removed = true;
+        break;
+      }
+    }
+    if (!removed) {
+      return;
+    }
+    if (model.sessions.empty()) {
+      model.active_session = 0;
+      model.active_object.clear();
+      model.active_is_view = false;
+      model.status.clear();
+    } else if (model.active_session == session_id) {
+      model.active_session = model.sessions.front().id;
+      model.active_object.clear();
+      model.active_is_view = false;
+    }
+    ++model.revision;
+  });
+  if (!removed) {
+    return;
+  }
+  CloseSessionAsync(std::move(adbc_to_close), tasks);
+
+  // Close clean table tabs for the lost session, while keeping SQL tabs and
+  // dirty table tabs so unsaved drafts and editor queries remain intact.
+  std::vector<std::uint64_t> tabs_to_close;
+  for (const WorkspaceTab& tab : workspace.Get().tabs) {
+    if (tab.session_id == session_id && tab.kind == WorkspaceTabKind::Table &&
+        tab.table.pending_inserts.empty()) {
+      tabs_to_close.push_back(tab.id);
+    }
+  }
+  if (!tabs_to_close.empty()) {
+    CloseWorkspaceTabs(app, workspace, tabs_to_close);
+  }
+
+  if (notify) {
+    notify(reason.empty()
+               ? TrFmt("Connection {0} disconnected", "连接 {0} 已断开", {session_name})
+               : TrFmt("Connection {0} disconnected: {1}", "连接 {0} 已断开: {1}",
+                       {session_name, reason}));
+  }
+}
+
+void CloseAllSessions(const State<AppModel>& app, const TaskScope& tasks) {
+  std::vector<std::shared_ptr<AdbcSession>> closing;
+  app.Update([&](AppModel& model) {
+    closing.reserve(model.sessions.size());
+    for (DbSession& session : model.sessions) {
+      if (session.session) {
+        closing.push_back(std::move(session.session));
+      }
+    }
+    model.sessions.clear();
+    model.active_session = 0;
+    model.active_object.clear();
+    model.active_is_view = false;
+    model.status.clear();
+    ++model.revision;
+  });
+  for (std::shared_ptr<AdbcSession>& adbc : closing) {
+    CloseSessionAsync(std::move(adbc), tasks);
+  }
+}
+
+void ScheduleSessionHealthCheck(const State<AppModel>& app,
+                                const State<WorkspaceModel>& workspace,
+                                const TaskScope& tasks, NotifyFn notify) {
+  struct ProbeTarget {
+    std::uint64_t session_id = 0;
+    std::shared_ptr<AdbcSession> adbc;
+  };
+  std::vector<ProbeTarget> targets;
+  {
+    const AppModel& model = app.Get();
+    targets.reserve(model.sessions.size());
+    for (const DbSession& session : model.sessions) {
+      if (session.session && !session.session->IsClosed() &&
+          ShouldHealthCheckSession(session.dialect, session.uri)) {
+        targets.push_back(ProbeTarget{.session_id = session.id, .adbc = session.session});
+      }
+    }
+  }
+  for (ProbeTarget& target : targets) {
+    if (target.adbc->ping_in_flight.exchange(true, std::memory_order_acq_rel)) {
+      continue;
+    }
+    tasks.Launch([app, workspace, tasks, notify, session_id = target.session_id,
+                  adbc = std::move(target.adbc)]() mutable -> Task<void> {
+      struct InFlightGuard {
+        AdbcSession* ptr = nullptr;
+        ~InFlightGuard() {
+          if (ptr != nullptr) {
+            ptr->ping_in_flight.store(false, std::memory_order_release);
+          }
+        }
+      } guard{adbc.get()};
+
+      const AdbcQueryResult ping = co_await adbc->sequence.Run(
+          [adbc](std::stop_token) { return PingSessionBlocking(*adbc); });
+      if (ping.connection_lost && !adbc->IsClosed()) {
+        HandleSessionDisconnected(app, workspace, tasks, session_id, ping.error, notify);
+      }
+    });
   }
 }
 
@@ -1130,7 +1491,10 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
                            bool notify_success) {
   const AppModel& snapshot = app.Get();
   const DbSession* session = FindSession(snapshot, session_id);
-  if (session == nullptr || !session->session) {
+  if (session == nullptr || !session->session || session->session->IsClosed()) {
+    if (session != nullptr) {
+      HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
+    }
     return;
   }
 
@@ -1140,6 +1504,10 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
                 session_name = std::move(session_name), notify_success]() mutable -> Task<void> {
     AdbcObjectsResult objects = co_await adbc->sequence.Run(
         [adbc](std::stop_token) { return LoadObjectsBlocking(*adbc); });
+    if (objects.connection_lost) {
+      HandleSessionDisconnected(app, workspace, tasks, session_id, objects.error, notify);
+      co_return;
+    }
     if (!objects.error.empty()) {
       if (notify) {
         notify(TrFmt("Refresh failed: {0}", "刷新失败: {0}", {objects.error}));
@@ -1480,6 +1848,32 @@ bool SaveConnectionProfilesToTsv(const std::string& path,
   return true;
 }
 
+struct SqliteDbGuard {
+  sqlite3* db = nullptr;
+  SqliteDbGuard() = default;
+  SqliteDbGuard(const SqliteDbGuard&) = delete;
+  SqliteDbGuard& operator=(const SqliteDbGuard&) = delete;
+  ~SqliteDbGuard() {
+    if (db != nullptr) {
+      sqlite3_close_v2(db);
+      db = nullptr;
+    }
+  }
+};
+
+struct SqliteStmtGuard {
+  sqlite3_stmt* stmt = nullptr;
+  SqliteStmtGuard() = default;
+  SqliteStmtGuard(const SqliteStmtGuard&) = delete;
+  SqliteStmtGuard& operator=(const SqliteStmtGuard&) = delete;
+  ~SqliteStmtGuard() {
+    if (stmt != nullptr) {
+      sqlite3_finalize(stmt);
+      stmt = nullptr;
+    }
+  }
+};
+
 std::string ColumnTextString(sqlite3_stmt* stmt, int col) {
   const unsigned char* ptr = sqlite3_column_text(stmt, col);
   const int bytes = sqlite3_column_bytes(stmt, col);
@@ -1513,37 +1907,32 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
     }
   }
 
-  sqlite3* db = nullptr;
-  if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
-      db == nullptr) {
-    if (db != nullptr) {
-      sqlite3_close_v2(db);
-    }
+  SqliteDbGuard db_guard;
+  if (sqlite3_open_v2(path.c_str(), &db_guard.db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
+      db_guard.db == nullptr) {
     return {};
   }
-  sqlite3_busy_timeout(db, 5000);
+  sqlite3_busy_timeout(db_guard.db, 5000);
 
-  sqlite3_stmt* stmt = nullptr;
+  SqliteStmtGuard stmt_guard;
   std::vector<ConnectionProfile> profiles;
   if (sqlite3_prepare_v2(
-          db,
+          db_guard.db,
           "SELECT name, driver_path, uri, username, password "
           "FROM connections ORDER BY sort_order ASC, id ASC;",
-          -1, &stmt, nullptr) == SQLITE_OK) {
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+          -1, &stmt_guard.stmt, nullptr) == SQLITE_OK) {
+    while (sqlite3_step(stmt_guard.stmt) == SQLITE_ROW) {
       ConnectionProfile profile;
-      profile.name = ColumnTextString(stmt, 0);
-      profile.driver_path = ColumnTextString(stmt, 1);
-      profile.uri = ColumnTextString(stmt, 2);
-      profile.username = ColumnTextString(stmt, 3);
-      profile.password = ColumnTextString(stmt, 4);
+      profile.name = ColumnTextString(stmt_guard.stmt, 0);
+      profile.driver_path = ColumnTextString(stmt_guard.stmt, 1);
+      profile.uri = ColumnTextString(stmt_guard.stmt, 2);
+      profile.username = ColumnTextString(stmt_guard.stmt, 3);
+      profile.password = ColumnTextString(stmt_guard.stmt, 4);
       if (!profile.driver_path.empty() && !profile.uri.empty()) {
         profiles.push_back(std::move(profile));
       }
     }
-    sqlite3_finalize(stmt);
   }
-  sqlite3_close_v2(db);
   return profiles;
 }
 
@@ -1559,60 +1948,59 @@ bool SaveConnectionProfiles(const std::string& path,
     return false;
   }
 
-  sqlite3* db = nullptr;
-  if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK ||
-      db == nullptr) {
-    if (db != nullptr) {
-      sqlite3_close_v2(db);
+  bool ok = false;
+  {
+    SqliteDbGuard db_guard;
+    if (sqlite3_open_v2(path.c_str(), &db_guard.db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK ||
+        db_guard.db == nullptr) {
+      return false;
     }
-    return false;
-  }
-  sqlite3_busy_timeout(db, 5000);
+    sqlite3_busy_timeout(db_guard.db, 5000);
 
-  bool ok = sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
-  if (ok) {
-    ok = sqlite3_exec(db, "DELETE FROM connections;", nullptr, nullptr, nullptr) == SQLITE_OK;
-  }
-  if (ok && !profiles.empty()) {
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(
-            db,
-            "INSERT INTO connections "
-            "(sort_order, name, driver_path, uri, username, password) "
-            "VALUES (?, ?, ?, ?, ?, ?);",
-            -1, &stmt, nullptr) != SQLITE_OK) {
-      ok = false;
-    } else {
-      for (std::size_t i = 0; i < profiles.size(); ++i) {
-        const auto& p = profiles[i];
-        sqlite3_reset(stmt);
-        sqlite3_clear_bindings(stmt);
-        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(i));
-        sqlite3_bind_text(stmt, 2, p.name.data(), static_cast<int>(p.name.size()),
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, p.driver_path.data(), static_cast<int>(p.driver_path.size()),
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, p.uri.data(), static_cast<int>(p.uri.size()),
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, p.username.data(), static_cast<int>(p.username.size()),
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 6, p.password.data(), static_cast<int>(p.password.size()),
-                          SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) != SQLITE_DONE) {
-          ok = false;
-          break;
+    ok = sqlite3_exec(db_guard.db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
+    if (ok) {
+      ok = sqlite3_exec(db_guard.db, "DELETE FROM connections;", nullptr, nullptr, nullptr) ==
+           SQLITE_OK;
+    }
+    if (ok && !profiles.empty()) {
+      SqliteStmtGuard stmt_guard;
+      if (sqlite3_prepare_v2(
+              db_guard.db,
+              "INSERT INTO connections "
+              "(sort_order, name, driver_path, uri, username, password) "
+              "VALUES (?, ?, ?, ?, ?, ?);",
+              -1, &stmt_guard.stmt, nullptr) != SQLITE_OK) {
+        ok = false;
+      } else {
+        for (std::size_t i = 0; i < profiles.size(); ++i) {
+          const auto& p = profiles[i];
+          sqlite3_reset(stmt_guard.stmt);
+          sqlite3_clear_bindings(stmt_guard.stmt);
+          sqlite3_bind_int64(stmt_guard.stmt, 1, static_cast<sqlite3_int64>(i));
+          sqlite3_bind_text(stmt_guard.stmt, 2, p.name.data(), static_cast<int>(p.name.size()),
+                            SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 3, p.driver_path.data(),
+                            static_cast<int>(p.driver_path.size()), SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 4, p.uri.data(), static_cast<int>(p.uri.size()),
+                            SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 5, p.username.data(),
+                            static_cast<int>(p.username.size()), SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 6, p.password.data(),
+                            static_cast<int>(p.password.size()), SQLITE_TRANSIENT);
+          if (sqlite3_step(stmt_guard.stmt) != SQLITE_DONE) {
+            ok = false;
+            break;
+          }
         }
       }
-      sqlite3_finalize(stmt);
+    }
+    if (ok) {
+      ok = sqlite3_exec(db_guard.db, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK;
+    }
+    if (!ok) {
+      sqlite3_exec(db_guard.db, "ROLLBACK;", nullptr, nullptr, nullptr);
     }
   }
-  if (ok) {
-    ok = sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK;
-  }
-  if (!ok) {
-    sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
-  }
-  sqlite3_close_v2(db);
   if (ok) {
     detail::RestrictConfigFilePermissions(path);
   }

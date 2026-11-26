@@ -27,6 +27,7 @@ struct TrayRuntime : std::enable_shared_from_this<TrayRuntime> {
   huxerui::SystemTrayHandle tray;
   std::shared_ptr<huxerui::Resources> resources;
   std::shared_ptr<SettingsModel> settings;
+  std::shared_ptr<McpServerService> mcp_service;
   huxerui::TaskScope tasks;
   bool retired = true;
   bool exit_requested = false;

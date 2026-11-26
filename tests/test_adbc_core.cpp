@@ -5,6 +5,7 @@ import dbpp.settings;
 import dbpp.i18n;
 import dbpp.types;
 import dbpp.adbc;
+import dbpp.db;
 import dbpp.driver_installer;
 
 namespace fs = std::filesystem;
@@ -744,6 +745,247 @@ void TestUriDecomposeAndDatabaseHierarchy() {
          "IsSystemDatabaseOrSchema classification check");
 }
 
+void TestConnectionLostAndSessionLifecycle(const fs::path& dir, const std::string& driver_path) {
+  // Positive disconnect / transport failure patterns.
+  Expect(dbpp::IsConnectionLostError(10 /* ADBC_STATUS_IO */, ""),
+         "ADBC_STATUS_IO must be treated as connection_lost");
+  for (const std::string_view msg : {
+           "sql: connection is already closed",
+           "MySQL server has gone away",
+           "driver: bad connection",
+           "invalid connection",
+           "FATAL: terminating connection due to administrator command",
+           "server closed the connection unexpectedly",
+           "no connection to the server",
+           "write unix: broken pipe",
+           "read tcp 127.0.0.1: connection reset by peer",
+           "unexpected EOF",
+           "use of closed network connection",
+           "Redis 服务器已关闭连接",
+           "连接已关闭",
+       }) {
+    Expect(dbpp::IsConnectionLostError(0, msg),
+           std::string("Expected connection-lost classification for: ") + std::string(msg));
+  }
+
+  // Negative cases: ordinary SQL/schema errors must NOT drop the session.
+  for (const std::string_view msg : {
+           "syntax error at or near \"SELECT\"",
+           "no such table: users",
+           "no such column: eof_marker",
+           "UNIQUE constraint failed: items.id",
+           "permission denied for table secrets",
+           "",
+       }) {
+    Expect(!dbpp::IsConnectionLostError(0, msg),
+           std::string("Ordinary error misclassified as connection_lost: ") + std::string(msg));
+  }
+
+  // Health-check eligibility across local vs remote backends.
+  Expect(!dbpp::ShouldHealthCheckSession(dbpp::Dialect::Sqlite, (dir / "x.sqlite").string()),
+         "SQLite should not trigger periodic network health checks");
+  Expect(!dbpp::ShouldHealthCheckSession(dbpp::Dialect::Duckdb, "duckdb::memory:"),
+         "DuckDB should not trigger periodic network health checks");
+  Expect(dbpp::ShouldHealthCheckSession(dbpp::Dialect::Mysql, "mysql://127.0.0.1:3306/app"),
+         "MySQL should enable periodic health checks");
+  Expect(dbpp::ShouldHealthCheckSession(dbpp::Dialect::Postgresql,
+                                        "postgresql://127.0.0.1:5432/app"),
+         "PostgreSQL should enable periodic health checks");
+  Expect(dbpp::ShouldHealthCheckSession(dbpp::Dialect::Redis, "redis://127.0.0.1:6379/0"),
+         "Redis should enable periodic health checks");
+  Expect(dbpp::ShouldHealthCheckSession(dbpp::Dialect::Generic, "grpc+tls://host:31337"),
+         "Generic scheme URI should enable periodic health checks");
+
+  // Session RAII / explicit close lifecycle on a real SQLite ADBC session.
+  const fs::path db_path = dir / "lifecycle.sqlite";
+  const dbpp::AdbcOpenResult opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = driver_path,
+      .uri = db_path.string(),
+      .username = {},
+      .password = {},
+      .title = "lifecycle",
+  });
+  Expect(opened.error.empty() && opened.session != nullptr,
+         "Open SQLite session for lifecycle test failed: " + opened.error);
+  if (!opened.session) {
+    return;
+  }
+  Expect(opened.session->IsAlive() && !opened.session->IsClosed(),
+         "Newly opened session must be alive and not closed");
+
+  const dbpp::AdbcQueryResult ping = dbpp::PingSessionBlocking(*opened.session);
+  Expect(ping.error.empty() && !ping.connection_lost && opened.session->IsAlive(),
+         "PingSessionBlocking on live SQLite session failed: " + ping.error);
+
+  opened.session->MarkClosed();
+  opened.session->ReleaseResourcesBlocking();
+  Expect(opened.session->IsClosed() && !opened.session->IsAlive() &&
+             !opened.session->connection_created && !opened.session->database_created,
+         "MarkClosed + ReleaseResourcesBlocking must release handles and clear flags");
+
+  // Idempotent second release must be safe.
+  opened.session->ReleaseResourcesBlocking();
+
+  const dbpp::AdbcQueryResult exec_after_close =
+      dbpp::ExecuteBlocking(*opened.session, "SELECT 1", true, 10);
+  Expect(exec_after_close.connection_lost && !exec_after_close.error.empty(),
+         "ExecuteBlocking on closed session must return connection_lost");
+
+  const dbpp::AdbcObjectsResult objs_after_close = dbpp::LoadObjectsBlocking(*opened.session);
+  Expect(objs_after_close.connection_lost && !objs_after_close.error.empty(),
+         "LoadObjectsBlocking on closed session must return connection_lost");
+
+  dbpp::DbObject test_obj;
+  test_obj.name = "t";
+
+  const dbpp::AdbcSchemaResult schema_after_close =
+      dbpp::LoadSchemaBlocking(*opened.session, test_obj);
+  Expect(schema_after_close.connection_lost && !schema_after_close.error.empty(),
+         "LoadSchemaBlocking on closed session must return connection_lost");
+
+  const dbpp::TableModel table_after_close =
+      dbpp::LoadTableBlocking(*opened.session, 1, test_obj, 0, 50, std::nullopt, {});
+  Expect(table_after_close.connection_lost && !table_after_close.error.empty(),
+         "LoadTableBlocking on closed session must return connection_lost");
+}
+
+void TestSqlFilterNormalizationAndFiltering(const fs::path& dir, const std::string& driver_path) {
+  Expect(dbpp::NormalizeSqlFilter("  id > 1  ") == "id > 1", "Trim whitespace");
+  Expect(dbpp::NormalizeSqlFilter("WHERE id > 1") == "id > 1", "Strip uppercase WHERE");
+  Expect(dbpp::NormalizeSqlFilter("where\n (id = 2 OR id = 3);;") == "(id = 2 OR id = 3)",
+         "Strip lowercase where and trailing semicolons");
+  Expect(dbpp::NormalizeSqlFilter("where_col = 5") == "where_col = 5",
+         "Do not strip column name starting with where_");
+  Expect(dbpp::NormalizeSqlFilter("   ;  ") == "", "Empty after stripping punctuation");
+
+  const fs::path db_path = dir / "filter_test.sqlite";
+  auto opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = driver_path,
+      .uri = db_path.string(),
+  });
+  Expect(opened.error.empty() && opened.session != nullptr,
+         "Open SQLite for filter test failed: " + opened.error);
+  if (!opened.session) {
+    return;
+  }
+  Expect(dbpp::ExecuteBlocking(
+             *opened.session,
+             "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);", false, 0)
+             .error.empty(),
+         "CREATE TABLE products failed");
+  Expect(dbpp::ExecuteBlocking(
+             *opened.session,
+             "INSERT INTO products VALUES (1, 'Apple', 5.0), (2, 'Apricot', 12.5), "
+             "(3, 'Banana', 20.0);",
+             false, 0)
+             .error.empty(),
+         "Seed products failed");
+
+  dbpp::DbObject obj;
+  obj.name = "products";
+
+  const dbpp::TableModel f1 =
+      dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, 50, std::nullopt,
+                              "WHERE price > 10 AND name LIKE 'A%';");
+  Expect(f1.error.empty() && f1.total == 1 && f1.filter == "price > 10 AND name LIKE 'A%'" &&
+             f1.snapshot && f1.snapshot->rows.size() == 1 &&
+             f1.snapshot->rows[0].values[1].text == "Apricot",
+         "SQL filter with WHERE and semicolon should match Apricot: " + f1.error);
+
+  const dbpp::TableModel cleared =
+      dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, 50, std::nullopt, "   ");
+  Expect(cleared.error.empty() && cleared.total == 3 && cleared.filter.empty(),
+         "Clearing filter should restore all 3 rows");
+}
+
+void TestEditTableDdlGenerationAndExecution(const fs::path& dir, const std::string& driver_path) {
+  dbpp::DbObject sql_obj;
+  sql_obj.name = "orders";
+  sql_obj.db_schema = "public";
+  Expect(dbpp::BuildRenameTableSql(dbpp::Dialect::Postgresql, sql_obj, "orders_v2") ==
+             R"(ALTER TABLE "public"."orders" RENAME TO "orders_v2")",
+         "BuildRenameTableSql mismatch");
+  Expect(dbpp::BuildAddColumnSql(dbpp::Dialect::Postgresql, sql_obj, "note", "TEXT", false, "''") ==
+             R"(ALTER TABLE "public"."orders" ADD COLUMN "note" TEXT NOT NULL DEFAULT '')",
+         "BuildAddColumnSql mismatch");
+  Expect(dbpp::BuildRenameColumnSql(dbpp::Dialect::Mysql, dbpp::DbObject{.name = "orders"}, "old",
+                                    "new_col") ==
+             "ALTER TABLE `orders` RENAME COLUMN `old` TO `new_col`",
+         "BuildRenameColumnSql MySQL mismatch");
+  Expect(dbpp::BuildDropColumnSql(dbpp::Dialect::Sqlite, dbpp::DbObject{.name = "orders"},
+                                  "unused") == R"(ALTER TABLE "orders" DROP COLUMN "unused")",
+         "BuildDropColumnSql SQLite mismatch");
+  Expect(dbpp::BuildAlterColumnTypeSql(dbpp::Dialect::Sqlite, dbpp::DbObject{.name = "orders"},
+                                       "a", "TEXT", true)
+             .empty(),
+         "SQLite should not emit direct ALTER COLUMN TYPE");
+  Expect(dbpp::BuildAlterColumnTypeSql(dbpp::Dialect::Mysql, dbpp::DbObject{.name = "orders"},
+                                       "a", "VARCHAR(64)", false) ==
+             "ALTER TABLE `orders` MODIFY COLUMN `a` VARCHAR(64) NOT NULL",
+         "MySQL MODIFY COLUMN mismatch");
+
+  const fs::path db_path = dir / "edit_table.sqlite";
+  auto opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = driver_path,
+      .uri = db_path.string(),
+  });
+  Expect(opened.error.empty() && opened.session != nullptr, "Open SQLite edit test failed");
+  if (!opened.session) {
+    return;
+  }
+  dbpp::DbObject tbl;
+  tbl.name = "users";
+  Expect(dbpp::ExecuteBlocking(*opened.session,
+                               "CREATE TABLE users (id INTEGER PRIMARY KEY, title TEXT);", false,
+                               0)
+             .error.empty(),
+         "CREATE TABLE users failed");
+  Expect(dbpp::ExecuteBlocking(
+             *opened.session,
+             dbpp::BuildAddColumnSql(dbpp::Dialect::Sqlite, tbl, "age", "INTEGER", true, "0"),
+             false, 0)
+             .error.empty(),
+         "ADD COLUMN failed");
+  Expect(dbpp::ExecuteBlocking(
+             *opened.session,
+             dbpp::BuildRenameColumnSql(dbpp::Dialect::Sqlite, tbl, "title", "full_name"), false,
+             0)
+             .error.empty(),
+         "RENAME COLUMN failed");
+  Expect(dbpp::ExecuteBlocking(
+             *opened.session, dbpp::BuildDropColumnSql(dbpp::Dialect::Sqlite, tbl, "age"), false,
+             0)
+             .error.empty(),
+         "DROP COLUMN failed");
+  Expect(dbpp::ExecuteBlocking(
+             *opened.session,
+             dbpp::BuildRenameTableSql(dbpp::Dialect::Sqlite, tbl, "members"), false, 0)
+             .error.empty(),
+         "RENAME TABLE failed");
+
+  dbpp::DbObject renamed;
+  renamed.name = "members";
+  const dbpp::AdbcSchemaResult schema = dbpp::LoadSchemaBlocking(*opened.session, renamed);
+  Expect(schema.error.empty() && schema.columns.size() == 2 &&
+             schema.columns[1].name == "full_name",
+         "Edited table schema mismatch after DDL sequence");
+}
+
+void TestMcpSettingsPersistence(const fs::path& dir) {
+  const fs::path cfg_db = dir / "mcp_settings.sqlite3";
+  dbpp::TraySettings saved;
+  saved.mcp_enabled = true;
+  saved.mcp_host = "127.0.0.1";
+  saved.mcp_port = 19200;
+  saved.mcp_read_only = false;
+  Expect(dbpp::SaveTraySettings(cfg_db.string(), saved), "SaveTraySettings for MCP failed");
+
+  const dbpp::TraySettings loaded = dbpp::LoadTraySettings(cfg_db.string());
+  Expect(loaded.mcp_enabled && loaded.mcp_host == "127.0.0.1" && loaded.mcp_port == 19200 &&
+             !loaded.mcp_read_only,
+         "LoadTraySettings MCP roundtrip mismatch");
+}
+
 } // namespace
 
 int main() {
@@ -759,6 +1001,10 @@ int main() {
   TestDatabaseBrandDetection();
   TestI18nResolutionAndFormatting();
   TestUriDecomposeAndDatabaseHierarchy();
+  TestConnectionLostAndSessionLifecycle(temp.path, driver_path);
+  TestSqlFilterNormalizationAndFiltering(temp.path, driver_path);
+  TestEditTableDdlGenerationAndExecution(temp.path, driver_path);
+  TestMcpSettingsPersistence(temp.path);
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

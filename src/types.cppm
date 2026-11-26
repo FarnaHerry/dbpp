@@ -59,6 +59,13 @@ struct ColumnMeta {
   bool operator==(const ColumnMeta&) const = default;
 };
 
+struct AddColumnSpec {
+  std::string name;
+  std::string type;
+  bool nullable = true;
+  std::string default_expr;
+};
+
 struct DbObject {
   std::string name;
   std::string catalog;
@@ -175,6 +182,7 @@ struct PendingInsertRow {
 struct BatchInsertResult {
   std::size_t inserted = 0;
   bool rolled_back = false;
+  bool connection_lost = false;
   std::string error;
 };
 
@@ -195,12 +203,14 @@ struct TableModel {
   std::string filter;
   std::optional<huxerui::DataTableSort> sort;
   bool loading = false;
+  bool connection_lost = false;
   std::string error;
   std::string message;
   std::vector<PendingInsertRow> pending_inserts;
   std::uint64_t next_draft_id = 1;
   bool committing = false;
   std::unordered_map<std::string, float> column_widths;
+  std::uint64_t snapshot_version = 0;
 };
 
 struct QueryResult {
@@ -223,6 +233,7 @@ struct SqlModel {
 enum class WorkspaceTabKind {
   Table,
   Sql,
+  Settings,
 };
 
 struct WorkspaceTab {
@@ -296,15 +307,35 @@ struct WorkspaceModel {
     }
     return nullptr;
   }
+
+  [[nodiscard]] const WorkspaceTab* FindSettingsTab() const {
+    for (const auto& tab : tabs) {
+      if (tab.kind == WorkspaceTabKind::Settings) {
+        return &tab;
+      }
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] WorkspaceTab* FindSettingsTab() {
+    for (auto& tab : tabs) {
+      if (tab.kind == WorkspaceTabKind::Settings) {
+        return &tab;
+      }
+    }
+    return nullptr;
+  }
 };
 
 struct AdbcObjectsResult {
   std::vector<DbObject> objects;
+  bool connection_lost = false;
   std::string error;
 };
 
 struct AdbcSchemaResult {
   std::vector<ColumnMeta> columns;
+  bool connection_lost = false;
   std::string error;
 };
 
@@ -313,6 +344,7 @@ struct AdbcQueryResult {
   std::vector<GridRow> rows;
   std::int64_t affected = -1;
   bool truncated = false;
+  bool connection_lost = false;
   std::string error;
 };
 

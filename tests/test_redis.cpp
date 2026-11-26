@@ -1000,6 +1000,42 @@ void TestRedisAuditRegressions() {
   }
 }
 
+void TestRedisDisconnectDetection() {
+  auto server = std::make_unique<MockRedisServer>();
+  const std::string uri = "redis://127.0.0.1:" + std::to_string(server->Port()) + "/0";
+  const dbpp::AdbcOpenResult opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = uri,
+      .username = {},
+      .password = {},
+      .title = "disconnect-check",
+  });
+  Expect(opened.error.empty() && opened.session != nullptr && opened.session->IsAlive(),
+         "Initial Redis connect should succeed: " + opened.error);
+  if (!opened.session) {
+    return;
+  }
+
+  const dbpp::AdbcQueryResult ping_ok = dbpp::PingSessionBlocking(*opened.session);
+  Expect(ping_ok.error.empty() && !ping_ok.connection_lost && opened.session->IsAlive(),
+         "Ping before server shutdown should succeed: " + ping_ok.error);
+
+  // Stop the mock Redis server completely so subsequent queries and reconnect fail.
+  server.reset();
+
+  const dbpp::AdbcQueryResult after_drop =
+      dbpp::ExecuteBlocking(*opened.session, "GET any_key", true, 50);
+  Expect(after_drop.connection_lost && !after_drop.error.empty(),
+         "ExecuteBlocking after server shutdown must report connection_lost");
+  Expect(!opened.session->IsAlive() &&
+             (!opened.session->redis || !opened.session->redis->IsConnected()),
+         "Session and RedisClient must report disconnected after server shutdown");
+
+  const dbpp::AdbcQueryResult ping_drop = dbpp::PingSessionBlocking(*opened.session);
+  Expect(ping_drop.connection_lost && !opened.session->IsAlive(),
+         "PingSessionBlocking after server shutdown must report connection_lost");
+}
+
 } // namespace
 
 int main() {
@@ -1007,6 +1043,7 @@ int main() {
   TestUriAndParsingHelpers();
   TestRedisSessionCrudAndCli(temp.path);
   TestRedisAuditRegressions();
+  TestRedisDisconnectDetection();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " Redis test assertion(s) failed\n";

@@ -75,6 +75,15 @@ const huxerui::ImageResource& BrandImageResource(dbpp::DatabaseBrand brand) {
 
 } // namespace
 
+View TintedIcon(const ImageResource& resource, Color color, float size) {
+  return Image(resource)
+      .Fit(ImageFit::Contain)
+      .Tint(color)
+      .With(Grow(0.0F),
+            Frame{.width = size, .height = size, .min_width = size, .max_width = size,
+                  .min_height = size, .max_height = size});
+}
+
 View DatabaseIcon(dbpp::DatabaseBrand brand, float size) {
   return Image(BrandImageResource(brand))
       .Fit(ImageFit::Contain)

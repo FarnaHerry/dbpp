@@ -19,6 +19,7 @@ import dbpp.settings;
 import dbpp.i18n;
 import dbpp.types;
 import dbpp.db;
+import dbpp.mcp;
 import dbpp.config_db;
 import dbpp.instance;
 
@@ -143,6 +144,9 @@ void TrayRuntime::RequestExit() {
     return;
   }
   exit_requested = true;
+  if (mcp_service) {
+    mcp_service->Shutdown();
+  }
   MarkInstanceClosing();
   HideTray();
   HideWindow();
@@ -302,6 +306,10 @@ void InstallTrayRuntime(ApplicationContext& context) {
   settings->theme_mode = startup.theme_mode;
   settings->theme_preset = startup.theme_preset;
   settings->language = startup.language;
+  settings->mcp_enabled = startup.mcp_enabled;
+  settings->mcp_host = startup.mcp_host;
+  settings->mcp_port = startup.mcp_port;
+  settings->mcp_read_only = startup.mcp_read_only;
   settings->persist_setting = [config_db](std::string key, std::string value) {
     config_db->PersistSetting(std::move(key), std::move(value));
   };
@@ -324,6 +332,12 @@ void InstallTrayRuntime(ApplicationContext& context) {
     runtime->applied_menu_theme = std::pair<int, bool>{
         static_cast<int>(startup.theme_mode), effective_dark};
   }
+  auto mcp_service = std::make_shared<McpServerService>();
+  mcp_service->profiles_db_path = db_path;
+  (void)mcp_service->ApplySettings(startup.mcp_enabled, startup.mcp_host, startup.mcp_port,
+                                   startup.mcp_read_only);
+  runtime->mcp_service = mcp_service;
+  context.Provide(mcp_service);
   context.Provide(config_db);
   context.Provide(std::move(settings));
   context.Provide(runtime);

@@ -12,6 +12,8 @@ enum class ButtonTone {
 
 huxerui::View ActionButton(huxerui::View action, ButtonTone tone = ButtonTone::Default);
 huxerui::View AccentDot(huxerui::Color color, float size = 7.0F);
+huxerui::View TintedIcon(const huxerui::ImageResource& resource, huxerui::Color color,
+                         float size = 14.0F);
 huxerui::View DatabaseIcon(dbpp::DatabaseBrand brand, float size = 16.0F);
 huxerui::View DatabaseBadgeIcon(dbpp::DatabaseBrand brand, float icon_size = 20.0F,
                                 float tile_size = 34.0F);

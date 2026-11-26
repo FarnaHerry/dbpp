@@ -57,6 +57,14 @@ void ApplySettingPair(std::string_view key, std::string_view value, TraySettings
     out.theme_preset = ThemePresetFromKey(value);
   } else if (key == kSettingUiLanguage) {
     out.language = LanguageModeFromKey(value);
+  } else if (key == kSettingMcpEnabled) {
+    out.mcp_enabled = (value == "true");
+  } else if (key == kSettingMcpHost) {
+    out.mcp_host = NormalizeMcpHost(value);
+  } else if (key == kSettingMcpPort) {
+    out.mcp_port = ParseMcpPort(value);
+  } else if (key == kSettingMcpReadOnly) {
+    out.mcp_read_only = (value != "false");
   }
 }
 
@@ -118,7 +126,8 @@ TraySettings ConfigDbService::ReadStartupSettingsSync(const std::string& db_path
   auto read = sqlite::Database::QueryReadOnlySync(
       huxerui::File{db_path},
       "SELECT key, value FROM settings WHERE key IN "
-      "('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', 'ui.language')",
+      "('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', 'ui.language', "
+      "'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only')",
       [&result](const sqlite::RowView& row) -> sqlite::Result<void> {
         auto key = row.Get<std::string>("key");
         if (!key) {

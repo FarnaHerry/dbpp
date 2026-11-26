@@ -35,18 +35,6 @@ namespace dbpp {
 
 namespace {
 
-AdbcError MakeError() {
-  AdbcError error = ADBC_ERROR_INIT;
-  return error;
-}
-
-void ReleaseError(AdbcError& error) {
-  if (error.release != nullptr) {
-    error.release(&error);
-    error.release = nullptr;
-  }
-}
-
 bool DecodeUtf8Sequence(std::string_view text, std::size_t index, std::size_t& out_len) noexcept {
   out_len = 0;
   if (index >= text.size()) {
@@ -120,12 +108,44 @@ std::string DecodeSystemTextToUtf8(std::string_view raw) {
   return SanitizeUtf8(raw);
 }
 
-std::string TakeError(AdbcError& error) {
-  std::string message =
-      error.message != nullptr ? DecodeSystemTextToUtf8(error.message) : "unknown ADBC error";
-  ReleaseError(error);
-  return message;
-}
+class AdbcErrorGuard {
+public:
+  AdbcErrorGuard() = default;
+  AdbcErrorGuard(const AdbcErrorGuard&) = delete;
+  AdbcErrorGuard& operator=(const AdbcErrorGuard&) = delete;
+  ~AdbcErrorGuard() { Reset(); }
+
+  AdbcError* Ptr() noexcept { return &error_; }
+
+  void Reset() noexcept {
+    if (error_.release != nullptr) {
+      error_.release(&error_);
+      error_.release = nullptr;
+    }
+  }
+
+  [[nodiscard]] std::string Take() {
+    std::string message =
+        error_.message != nullptr ? DecodeSystemTextToUtf8(error_.message) : "unknown ADBC error";
+    Reset();
+    return message;
+  }
+
+private:
+  AdbcError error_ = ADBC_ERROR_INIT;
+};
+
+struct AdbcStatementGuard {
+  AdbcStatement statement{};
+  bool created = false;
+  ~AdbcStatementGuard() {
+    if (created) {
+      AdbcErrorGuard release_error;
+      AdbcStatementRelease(&statement, release_error.Ptr());
+    }
+  }
+};
+
 
 std::string LowerAscii(std::string_view text) {
   std::string result;
@@ -435,18 +455,58 @@ Dialect DetectDialect(std::string_view driver_path, std::string_view uri) {
 
 struct StreamHolder {
   ArrowArrayStream stream{};
+  StreamHolder() = default;
+  StreamHolder(const StreamHolder&) = delete;
+  StreamHolder& operator=(const StreamHolder&) = delete;
   ~StreamHolder() {
     if (stream.release != nullptr) {
       stream.release(&stream);
+      stream = ArrowArrayStream{};
     }
   }
 };
 
 struct SchemaHolder {
   ArrowSchema schema{};
+  SchemaHolder() = default;
+  SchemaHolder(const SchemaHolder&) = delete;
+  SchemaHolder& operator=(const SchemaHolder&) = delete;
   ~SchemaHolder() {
     if (schema.release != nullptr) {
       schema.release(&schema);
+      schema = ArrowSchema{};
+    }
+  }
+};
+
+struct ArrayHolder {
+  ArrowArray array{};
+  ArrayHolder() = default;
+  ArrayHolder(const ArrayHolder&) = delete;
+  ArrayHolder& operator=(const ArrayHolder&) = delete;
+  ~ArrayHolder() { Reset(); }
+
+  void Reset() noexcept {
+    if (array.release != nullptr) {
+      array.release(&array);
+      array = ArrowArray{};
+    }
+  }
+};
+
+struct ArrayViewHolder {
+  ArrowArrayView view{};
+  bool initialized = false;
+  ArrayViewHolder() = default;
+  ArrayViewHolder(const ArrayViewHolder&) = delete;
+  ArrayViewHolder& operator=(const ArrayViewHolder&) = delete;
+  ~ArrayViewHolder() { Reset(); }
+
+  void Reset() noexcept {
+    if (initialized) {
+      ArrowArrayViewReset(&view);
+      view = ArrowArrayView{};
+      initialized = false;
     }
   }
 };
@@ -838,144 +898,38 @@ std::string DefaultSqliteDriverPath() {
   return "adbc_driver_sqlite";
 }
 
-AdbcSession::~AdbcSession() {
-  AdbcError error = MakeError();
-  if (connection_created) {
-    AdbcConnectionRelease(&connection, &error);
-    ReleaseError(error);
+namespace {
+
+void ReleaseNativeAdbcHandles(AdbcSession& session) noexcept {
+  if (session.connection_created) {
+    AdbcErrorGuard error;
+    AdbcConnectionRelease(&session.connection, error.Ptr());
+    session.connection_created = false;
+    session.connection = {};
   }
-  if (database_created) {
-    AdbcDatabaseRelease(&database, &error);
-    ReleaseError(error);
+  if (session.database_created) {
+    AdbcErrorGuard error;
+    AdbcDatabaseRelease(&session.database, error.Ptr());
+    session.database_created = false;
+    session.database = {};
   }
+  session.initialized = false;
 }
 
-AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
-  AdbcOpenResult result;
-  auto session = std::make_shared<AdbcSession>();
-  const Dialect dialect = DetectDialect(request.driver_path, request.uri);
-  if (dialect == Dialect::Redis) {
-    const RedisParseUriResult parsed =
-        ParseRedisUri(request.uri, request.username, request.password);
-    if (!parsed.error.empty()) {
-      result.error = parsed.error;
-      return result;
-    }
-    auto client = std::make_unique<RedisClient>();
-    std::string conn_err;
-    if (!client->Connect(parsed.endpoint, conn_err)) {
-      result.error = conn_err;
-      return result;
-    }
-    session->dialect = Dialect::Redis;
-    session->redis = std::move(client);
-    session->initialized = true;
-    result.session = std::move(session);
-    return result;
-  }
-
-  AdbcError error = MakeError();
-
-  const auto fail = [&](std::string_view operation) -> AdbcOpenResult {
-    result.error = std::string(operation) + ": " + TakeError(error);
-    result.session.reset();
-    return result;
-  };
-
-  if (AdbcDatabaseNew(&session->database, &error) != ADBC_STATUS_OK) {
-    return fail(Tr("create ADBC database", "创建 ADBC database"));
-  }
-  session->database_created = true;
-
-  if (AdbcDriverManagerDatabaseSetLoadFlags(&session->database, ADBC_LOAD_FLAG_DEFAULT,
-                                            &error) != ADBC_STATUS_OK) {
-    return fail(Tr("set ADBC load flags", "设置 ADBC 加载标志"));
-  }
-  const std::string extra_paths = BuildAdditionalSearchPathList();
-  if (!extra_paths.empty() &&
-      AdbcDriverManagerDatabaseSetAdditionalSearchPathList(
-          &session->database, extra_paths.c_str(), &error) != ADBC_STATUS_OK) {
-    return fail(Tr("set ADBC search paths", "设置 ADBC 搜索路径"));
-  }
-
-  if (AdbcDatabaseSetOption(&session->database, "driver",
-                            request.driver_path.c_str(), &error) != ADBC_STATUS_OK) {
-    return fail(Tr("set ADBC driver", "设置 ADBC driver"));
-  }
-
-  const std::string lower_uri = LowerAscii(request.uri);
-  const std::string lower_driver = LowerAscii(request.driver_path);
-  bool credentials_in_uri = false;
-  std::string effective_uri = request.uri;
-  if (dialect == Dialect::Postgresql) {
-    effective_uri =
-        BuildPostgresqlUriWithCredentials(request.uri, request.username, request.password);
-    credentials_in_uri = true;
-  } else if ((!request.username.empty() || !request.password.empty()) &&
-             (lower_uri.starts_with("mysql://") || lower_uri.starts_with("mariadb://") ||
-              lower_uri.starts_with("mssql://") || lower_uri.starts_with("sqlserver://") ||
-              (lower_driver.find("clickhouse") != std::string::npos &&
-               (lower_uri.starts_with("http://") || lower_uri.starts_with("https://"))))) {
-    effective_uri = InjectSchemeUriCredentials(request.uri, request.username, request.password);
-    credentials_in_uri = true;
-  }
-  if (!effective_uri.empty() &&
-      AdbcDatabaseSetOption(&session->database, ADBC_OPTION_URI, effective_uri.c_str(),
-                            &error) != ADBC_STATUS_OK) {
-    return fail(Tr("set URI", "设置 URI"));
-  }
-
-  if (dialect == Dialect::Sqlite && !request.uri.empty() &&
-      request.uri != ":memory:" &&
-      request.uri.rfind("file:", 0) != 0 && request.uri.find("://") == std::string::npos) {
-    std::error_code filesystem_error;
-    const std::filesystem::path database_path(request.uri);
-    if (database_path.has_parent_path()) {
-      std::filesystem::create_directories(database_path.parent_path(), filesystem_error);
-    }
-  }
-  if (!credentials_in_uri && dialect != Dialect::Sqlite) {
-    if (!request.username.empty() &&
-        AdbcDatabaseSetOption(&session->database, "username", request.username.c_str(),
-                              &error) != ADBC_STATUS_OK) {
-      return fail(Tr("set username", "设置用户名"));
-    }
-    if (!request.password.empty() &&
-        AdbcDatabaseSetOption(&session->database, "password", request.password.c_str(),
-                              &error) != ADBC_STATUS_OK) {
-      return fail(Tr("set password", "设置密码"));
-    }
-  }
-  if (AdbcDatabaseInit(&session->database, &error) != ADBC_STATUS_OK) {
-    return fail(Tr("initialize database", "初始化数据库"));
-  }
-
-  if (AdbcConnectionNew(&session->connection, &error) != ADBC_STATUS_OK) {
-    return fail(Tr("create connection", "创建连接"));
-  }
-  session->connection_created = true;
-  if (AdbcConnectionInit(&session->connection, &session->database, &error) !=
-      ADBC_STATUS_OK) {
-    return fail(Tr("initialize connection", "初始化连接"));
-  }
-
-  session->dialect = dialect;
-  session->initialized = true;
-  result.session = std::move(session);
-  return result;
-}
-
-AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
-  if (session.dialect == Dialect::Redis && session.redis) {
-    return LoadRedisObjectsBlocking(*session.redis);
-  }
+AdbcObjectsResult LoadObjectsBlockingOnce(AdbcSession& session, AdbcStatusCode& status_out) {
   AdbcObjectsResult result;
-  AdbcError error = MakeError();
+  if (!session.connection_created) {
+    status_out = ADBC_STATUS_INVALID_STATE;
+    result.error = Tr("Connection is closed", "连接已关闭");
+    return result;
+  }
+
+  AdbcErrorGuard error;
   StreamHolder stream;
-  if (AdbcConnectionGetObjects(&session.connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
-                               nullptr, nullptr, nullptr, &stream.stream,
-                               &error) != ADBC_STATUS_OK) {
-    result.error = TakeError(error);
+  status_out = AdbcConnectionGetObjects(&session.connection, ADBC_OBJECT_DEPTH_ALL, nullptr, nullptr,
+                                        nullptr, nullptr, nullptr, &stream.stream, error.Ptr());
+  if (status_out != ADBC_STATUS_OK) {
+    result.error = error.Take();
     return result;
   }
 
@@ -985,43 +939,34 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
     return result;
   }
 
-  ArrowArrayView root{};
-  auto reset_root = [&] {
-    if (root.array != nullptr) {
-      ArrowArrayViewReset(&root);
-    }
-  };
-
   while (true) {
-    ArrowArray array{};
-    if (stream.stream.get_next(&stream.stream, &array) != 0) {
+    ArrayHolder array;
+    if (stream.stream.get_next(&stream.stream, &array.array) != 0) {
       result.error = StreamError(stream.stream);
-      reset_root();
       return result;
     }
-    if (array.release == nullptr) {
+    if (array.array.release == nullptr) {
       break;
     }
-    root = ArrowArrayView{};
+
+    ArrayViewHolder root;
     ArrowError arrow_error;
     ArrowErrorInit(&arrow_error);
-    if (ArrowArrayViewInitFromSchema(&root, &schema.schema, &arrow_error) != NANOARROW_OK) {
+    if (ArrowArrayViewInitFromSchema(&root.view, &schema.schema, &arrow_error) != NANOARROW_OK) {
       result.error = DecodeSystemTextToUtf8(arrow_error.message);
-      array.release(&array);
       return result;
     }
+    root.initialized = true;
     ArrowErrorInit(&arrow_error);
-    if (ArrowArrayViewSetArray(&root, &array, &arrow_error) != NANOARROW_OK) {
+    if (ArrowArrayViewSetArray(&root.view, &array.array, &arrow_error) != NANOARROW_OK) {
       result.error = DecodeSystemTextToUtf8(arrow_error.message);
-      array.release(&array);
-      ArrowArrayViewReset(&root);
       return result;
     }
 
-    const ArrowArrayView* catalogs = root.n_children > 1 ? root.children[1] : nullptr;
-    for (int64_t catalog_index = 0; catalog_index < root.array->length; ++catalog_index) {
+    const ArrowArrayView* catalogs = root.view.n_children > 1 ? root.view.children[1] : nullptr;
+    for (int64_t catalog_index = 0; catalog_index < root.view.array->length; ++catalog_index) {
       const std::string catalog_name =
-          root.n_children > 0 ? StringAt(root.children[0], catalog_index) : std::string{};
+          root.view.n_children > 0 ? StringAt(root.view.children[0], catalog_index) : std::string{};
       if (catalogs == nullptr || ArrowArrayViewIsNull(catalogs, catalog_index) != 0) {
         continue;
       }
@@ -1089,9 +1034,6 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
         }
       }
     }
-
-    ArrowArrayViewReset(&root);
-    array.release(&array);
   }
 
   std::ranges::sort(result.objects, [](const DbObject& left, const DbObject& right) {
@@ -1106,22 +1048,24 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
   return result;
 }
 
-AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object) {
-  if (session.dialect == Dialect::Redis) {
-    AdbcSchemaResult result;
-    result.columns = RedisKeySchema();
+AdbcSchemaResult LoadSchemaBlockingOnce(AdbcSession& session, const DbObject& object,
+                                      AdbcStatusCode& status_out) {
+  AdbcSchemaResult result;
+  if (!session.connection_created) {
+    status_out = ADBC_STATUS_INVALID_STATE;
+    result.error = Tr("Connection is closed", "连接已关闭");
     return result;
   }
-  AdbcSchemaResult result;
-  AdbcError error = MakeError();
+
+  AdbcErrorGuard error;
   SchemaHolder schema;
   const char* catalog = object.catalog.empty() ? nullptr : object.catalog.c_str();
   const char* db_schema = object.db_schema.empty() ? nullptr : object.db_schema.c_str();
 
-  if (AdbcConnectionGetTableSchema(&session.connection, catalog, db_schema,
-                                   object.name.c_str(), &schema.schema,
-                                   &error) != ADBC_STATUS_OK) {
-    result.error = TakeError(error);
+  status_out = AdbcConnectionGetTableSchema(&session.connection, catalog, db_schema,
+                                            object.name.c_str(), &schema.schema, error.Ptr());
+  if (status_out != ADBC_STATUS_OK) {
+    result.error = error.Take();
     result.columns = object.columns;
     return result;
   }
@@ -1161,51 +1105,54 @@ AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object
   return result;
 }
 
-AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want_rows,
-                                std::size_t max_rows) {
-  if (session.dialect == Dialect::Redis && session.redis) {
-    return ExecuteRedisCommandBlocking(*session.redis, sql, max_rows);
-  }
+AdbcQueryResult ExecuteBlockingOnce(AdbcSession& session, const std::string& sql, bool want_rows,
+                                    std::size_t max_rows, AdbcStatusCode& status_out,
+                                    bool& before_execute_out) {
   AdbcQueryResult result;
-  AdbcError error = MakeError();
-  AdbcStatement statement{};
-  if (AdbcStatementNew(&session.connection, &statement, &error) != ADBC_STATUS_OK) {
-    result.error = TakeError(error);
+  before_execute_out = true;
+  if (!session.connection_created) {
+    status_out = ADBC_STATUS_INVALID_STATE;
+    result.error = Tr("Connection is closed", "连接已关闭");
     return result;
   }
 
-  const auto cleanup = [&] {
-    AdbcError release_error = MakeError();
-    AdbcStatementRelease(&statement, &release_error);
-    ReleaseError(release_error);
-  };
+  AdbcErrorGuard error;
+  // Declared before StreamHolder/SchemaHolder/ArrayViewHolder so C++ destroys
+  // Arrow views/streams before calling AdbcStatementRelease.
+  AdbcStatementGuard statement_guard;
+  status_out = AdbcStatementNew(&session.connection, &statement_guard.statement, error.Ptr());
+  if (status_out != ADBC_STATUS_OK) {
+    result.error = error.Take();
+    return result;
+  }
+  statement_guard.created = true;
 
-  if (AdbcStatementSetSqlQuery(&statement, sql.c_str(), &error) != ADBC_STATUS_OK) {
-    result.error = TakeError(error);
-    cleanup();
+  status_out =
+      AdbcStatementSetSqlQuery(&statement_guard.statement, sql.c_str(), error.Ptr());
+  if (status_out != ADBC_STATUS_OK) {
+    result.error = error.Take();
     return result;
   }
 
   StreamHolder stream;
   std::int64_t affected = -1;
-  const AdbcStatusCode status = AdbcStatementExecuteQuery(
-      &statement, want_rows ? &stream.stream : nullptr, &affected, &error);
-  if (status != ADBC_STATUS_OK) {
-    result.error = TakeError(error);
-    cleanup();
+  before_execute_out = false;
+  status_out = AdbcStatementExecuteQuery(&statement_guard.statement,
+                                         want_rows ? &stream.stream : nullptr, &affected,
+                                         error.Ptr());
+  if (status_out != ADBC_STATUS_OK) {
+    result.error = error.Take();
     return result;
   }
   result.affected = affected;
 
   if (!want_rows) {
-    cleanup();
     return result;
   }
 
   SchemaHolder schema;
   if (stream.stream.get_schema(&stream.stream, &schema.schema) != 0) {
     result.error = StreamError(stream.stream);
-    cleanup();
     return result;
   }
 
@@ -1230,41 +1177,44 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
     result.columns.push_back(fields.back().name);
   }
 
-  ArrowArrayView root{};
-  ArrowError arrow_error;
-  ArrowErrorInit(&arrow_error);
-  if (ArrowArrayViewInitFromSchema(&root, &schema.schema, &arrow_error) != NANOARROW_OK) {
-    result.error = DecodeSystemTextToUtf8(arrow_error.message);
-    cleanup();
-    return result;
+  {
+    ArrayViewHolder schema_check;
+    ArrowError arrow_error;
+    ArrowErrorInit(&arrow_error);
+    if (ArrowArrayViewInitFromSchema(&schema_check.view, &schema.schema, &arrow_error) !=
+        NANOARROW_OK) {
+      result.error = DecodeSystemTextToUtf8(arrow_error.message);
+      return result;
+    }
+    schema_check.initialized = true;
   }
 
   bool stop = false;
   while (!stop) {
-    ArrowArray array{};
-    if (stream.stream.get_next(&stream.stream, &array) != 0) {
+    ArrayHolder array;
+    if (stream.stream.get_next(&stream.stream, &array.array) != 0) {
       result.error = StreamError(stream.stream);
       break;
     }
-    if (array.release == nullptr) {
+    if (array.array.release == nullptr) {
       break;
     }
 
-    ArrowArrayViewReset(&root);
+    ArrayViewHolder root;
+    ArrowError arrow_error;
     ArrowErrorInit(&arrow_error);
-    if (ArrowArrayViewInitFromSchema(&root, &schema.schema, &arrow_error) != NANOARROW_OK) {
+    if (ArrowArrayViewInitFromSchema(&root.view, &schema.schema, &arrow_error) != NANOARROW_OK) {
       result.error = DecodeSystemTextToUtf8(arrow_error.message);
-      array.release(&array);
       break;
     }
+    root.initialized = true;
     ArrowErrorInit(&arrow_error);
-    if (ArrowArrayViewSetArray(&root, &array, &arrow_error) != NANOARROW_OK) {
+    if (ArrowArrayViewSetArray(&root.view, &array.array, &arrow_error) != NANOARROW_OK) {
       result.error = DecodeSystemTextToUtf8(arrow_error.message);
-      array.release(&array);
       break;
     }
 
-    const int64_t rows = array.length;
+    const int64_t rows = array.array.length;
     for (int64_t row = 0; row < rows; ++row) {
       if (result.rows.size() >= max_rows) {
         result.truncated = true;
@@ -1274,18 +1224,408 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
       GridRow grid_row;
       grid_row.values.reserve(fields.size());
       for (int64_t column = 0; column < field_count; ++column) {
-        grid_row.values.push_back(ExtractCell(*root.children[column], row, fields[column]));
+        grid_row.values.push_back(ExtractCell(*root.view.children[column], row, fields[column]));
       }
       result.rows.push_back(std::move(grid_row));
     }
-
-    ArrowArrayViewReset(&root);
-    array.release(&array);
   }
 
-  ArrowArrayViewReset(&root);
-  cleanup();
   return result;
+}
+
+} // namespace
+
+void AdbcSession::ReleaseResourcesBlocking() noexcept {
+  ReleaseNativeAdbcHandles(*this);
+  redis.reset();
+  request = ConnectionRequest{};
+  alive.store(false, std::memory_order_release);
+}
+
+AdbcSession::~AdbcSession() {
+  MarkClosed();
+  ReleaseResourcesBlocking();
+}
+
+bool IsConnectionLostError(int adbc_status, std::string_view message) {
+  if (adbc_status == ADBC_STATUS_IO) {
+    return true;
+  }
+  const std::string lower = LowerAscii(TrimAscii(message));
+  if (lower.empty()) {
+    return false;
+  }
+  if (lower == "eof" || lower.ends_with(": eof") ||
+      lower.find(": eof\n") != std::string::npos ||
+      lower.find(": eof\r") != std::string::npos) {
+    return true;
+  }
+  static constexpr std::string_view kPatterns[] = {
+      "connection is already closed",
+      "connection already closed",
+      "connection has been closed",
+      "connection closed",
+      "closed network connection",
+      "use of closed network connection",
+      "invalid connection",
+      "bad connection",
+      "broken pipe",
+      "connection reset",
+      "connection aborted",
+      "connection refused",
+      "server has gone away",
+      "lost connection",
+      "server closed the connection",
+      "no connection to the server",
+      "terminating connection",
+      "unexpected eof",
+      "eof detected",
+      "socket is not connected",
+      "network is unreachable",
+      "software caused connection abort",
+      "connection timed out",
+      "i/o timeout",
+  };
+  for (const std::string_view pattern : kPatterns) {
+    if (lower.find(pattern) != std::string_view::npos) {
+      return true;
+    }
+  }
+  return message.find("服务器已关闭连接") != std::string_view::npos ||
+         message.find("连接已关闭") != std::string_view::npos ||
+         message.find("连接未建立") != std::string_view::npos ||
+         message.find("连接超时") != std::string_view::npos;
+}
+
+bool ShouldHealthCheckSession(Dialect dialect, std::string_view uri) {
+  if (dialect == Dialect::Sqlite || dialect == Dialect::Duckdb) {
+    return false;
+  }
+  if (dialect == Dialect::Redis || dialect == Dialect::Mysql || dialect == Dialect::Postgresql) {
+    return true;
+  }
+  return uri.find("://") != std::string_view::npos;
+}
+
+AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
+  AdbcOpenResult result;
+  auto session = std::make_shared<AdbcSession>();
+  session->request = request;
+  const Dialect dialect = DetectDialect(request.driver_path, request.uri);
+  if (dialect == Dialect::Redis) {
+    const RedisParseUriResult parsed =
+        ParseRedisUri(request.uri, request.username, request.password);
+    if (!parsed.error.empty()) {
+      result.error = parsed.error;
+      return result;
+    }
+    auto client = std::make_unique<RedisClient>();
+    std::string conn_err;
+    if (!client->Connect(parsed.endpoint, conn_err)) {
+      result.error = conn_err;
+      return result;
+    }
+    session->dialect = Dialect::Redis;
+    session->redis = std::move(client);
+    session->initialized = true;
+    session->alive.store(true, std::memory_order_release);
+    result.session = std::move(session);
+    return result;
+  }
+
+  AdbcErrorGuard error;
+
+  const auto fail = [&](std::string_view operation) -> AdbcOpenResult {
+    result.error = std::string(operation) + ": " + error.Take();
+    result.session.reset();
+    return result;
+  };
+
+  if (AdbcDatabaseNew(&session->database, error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("create ADBC database", "创建 ADBC database"));
+  }
+  session->database_created = true;
+
+  if (AdbcDriverManagerDatabaseSetLoadFlags(&session->database, ADBC_LOAD_FLAG_DEFAULT,
+                                            error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("set ADBC load flags", "设置 ADBC 加载标志"));
+  }
+  const std::string extra_paths = BuildAdditionalSearchPathList();
+  if (!extra_paths.empty() &&
+      AdbcDriverManagerDatabaseSetAdditionalSearchPathList(
+          &session->database, extra_paths.c_str(), error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("set ADBC search paths", "设置 ADBC 搜索路径"));
+  }
+
+  if (AdbcDatabaseSetOption(&session->database, "driver",
+                            request.driver_path.c_str(), error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("set ADBC driver", "设置 ADBC driver"));
+  }
+
+  const std::string lower_uri = LowerAscii(request.uri);
+  const std::string lower_driver = LowerAscii(request.driver_path);
+  bool credentials_in_uri = false;
+  std::string effective_uri = request.uri;
+  if (dialect == Dialect::Postgresql) {
+    effective_uri =
+        BuildPostgresqlUriWithCredentials(request.uri, request.username, request.password);
+    credentials_in_uri = true;
+  } else if ((!request.username.empty() || !request.password.empty()) &&
+             (lower_uri.starts_with("mysql://") || lower_uri.starts_with("mariadb://") ||
+              lower_uri.starts_with("mssql://") || lower_uri.starts_with("sqlserver://") ||
+              (lower_driver.find("clickhouse") != std::string::npos &&
+               (lower_uri.starts_with("http://") || lower_uri.starts_with("https://"))))) {
+    effective_uri = InjectSchemeUriCredentials(request.uri, request.username, request.password);
+    credentials_in_uri = true;
+  }
+  if (!effective_uri.empty() &&
+      AdbcDatabaseSetOption(&session->database, ADBC_OPTION_URI, effective_uri.c_str(),
+                            error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("set URI", "设置 URI"));
+  }
+
+  if (dialect == Dialect::Sqlite && !request.uri.empty() &&
+      request.uri != ":memory:" &&
+      request.uri.rfind("file:", 0) != 0 && request.uri.find("://") == std::string::npos) {
+    std::error_code filesystem_error;
+    const std::filesystem::path database_path(request.uri);
+    if (database_path.has_parent_path()) {
+      std::filesystem::create_directories(database_path.parent_path(), filesystem_error);
+    }
+  }
+  if (!credentials_in_uri && dialect != Dialect::Sqlite) {
+    if (!request.username.empty() &&
+        AdbcDatabaseSetOption(&session->database, "username", request.username.c_str(),
+                              error.Ptr()) != ADBC_STATUS_OK) {
+      return fail(Tr("set username", "设置用户名"));
+    }
+    if (!request.password.empty() &&
+        AdbcDatabaseSetOption(&session->database, "password", request.password.c_str(),
+                              error.Ptr()) != ADBC_STATUS_OK) {
+      return fail(Tr("set password", "设置密码"));
+    }
+  }
+  if (AdbcDatabaseInit(&session->database, error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("initialize database", "初始化数据库"));
+  }
+
+  if (AdbcConnectionNew(&session->connection, error.Ptr()) != ADBC_STATUS_OK) {
+    return fail(Tr("create connection", "创建连接"));
+  }
+  session->connection_created = true;
+  if (AdbcConnectionInit(&session->connection, &session->database, error.Ptr()) !=
+      ADBC_STATUS_OK) {
+    return fail(Tr("initialize connection", "初始化连接"));
+  }
+
+  session->dialect = dialect;
+  session->initialized = true;
+  session->alive.store(true, std::memory_order_release);
+  result.session = std::move(session);
+  return result;
+}
+
+bool ReconnectBlocking(AdbcSession& session, std::string& error_out) {
+  error_out.clear();
+  if (session.IsClosed()) {
+    error_out = Tr("Connection is closed", "连接已关闭");
+    return false;
+  }
+  if (session.dialect == Dialect::Redis && session.redis) {
+    const bool ok = session.redis->Connect(session.redis->Endpoint(), error_out);
+    session.alive.store(ok, std::memory_order_release);
+    return ok;
+  }
+  if (session.dialect == Dialect::Sqlite || session.request.uri == ":memory:" ||
+      (session.request.driver_path.empty() && session.request.uri.empty())) {
+    return false;
+  }
+
+  AdbcOpenResult fresh = OpenAdbcBlocking(session.request);
+  if (!fresh.session) {
+    ReleaseNativeAdbcHandles(session);
+    session.alive.store(false, std::memory_order_release);
+    error_out = std::move(fresh.error);
+    return false;
+  }
+
+  ReleaseNativeAdbcHandles(session);
+  session.database = fresh.session->database;
+  session.connection = fresh.session->connection;
+  session.database_created = fresh.session->database_created;
+  session.connection_created = fresh.session->connection_created;
+  session.initialized = fresh.session->initialized;
+  session.dialect = fresh.session->dialect;
+  fresh.session->database = {};
+  fresh.session->connection = {};
+  fresh.session->database_created = false;
+  fresh.session->connection_created = false;
+  fresh.session->initialized = false;
+  session.alive.store(true, std::memory_order_release);
+  return true;
+}
+
+AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
+  if (session.IsClosed()) {
+    AdbcObjectsResult result;
+    result.connection_lost = true;
+    result.error = Tr("Connection is closed", "连接已关闭");
+    return result;
+  }
+  if (session.dialect == Dialect::Redis && session.redis) {
+    AdbcObjectsResult result = LoadRedisObjectsBlocking(*session.redis);
+    if (!result.error.empty() &&
+        (!session.redis->IsConnected() || IsConnectionLostError(0, result.error))) {
+      result.connection_lost = true;
+      session.alive.store(false, std::memory_order_release);
+    } else if (result.error.empty()) {
+      session.alive.store(true, std::memory_order_release);
+    }
+    return result;
+  }
+
+  AdbcStatusCode status = ADBC_STATUS_OK;
+  AdbcObjectsResult result = LoadObjectsBlockingOnce(session, status);
+  if (!result.error.empty() &&
+      (!session.connection_created || IsConnectionLostError(status, result.error))) {
+    std::string reconnect_err;
+    if (ReconnectBlocking(session, reconnect_err)) {
+      status = ADBC_STATUS_OK;
+      result = LoadObjectsBlockingOnce(session, status);
+    } else if (!reconnect_err.empty()) {
+      result.error = std::move(reconnect_err);
+    }
+    if (!result.error.empty() &&
+        (!session.connection_created || IsConnectionLostError(status, result.error) ||
+         !session.IsAlive())) {
+      result.connection_lost = true;
+      session.alive.store(false, std::memory_order_release);
+      return result;
+    }
+  }
+  if (result.error.empty()) {
+    session.alive.store(true, std::memory_order_release);
+  }
+  return result;
+}
+
+AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object) {
+  if (session.IsClosed()) {
+    AdbcSchemaResult result;
+    result.connection_lost = true;
+    result.error = Tr("Connection is closed", "连接已关闭");
+    return result;
+  }
+  if (session.dialect == Dialect::Redis) {
+    AdbcSchemaResult result;
+    result.columns = RedisKeySchema();
+    return result;
+  }
+
+  AdbcStatusCode status = ADBC_STATUS_OK;
+  AdbcSchemaResult result = LoadSchemaBlockingOnce(session, object, status);
+  if (!result.error.empty() &&
+      (!session.connection_created || IsConnectionLostError(status, result.error))) {
+    std::string reconnect_err;
+    if (ReconnectBlocking(session, reconnect_err)) {
+      status = ADBC_STATUS_OK;
+      result = LoadSchemaBlockingOnce(session, object, status);
+    } else if (!reconnect_err.empty()) {
+      result.error = std::move(reconnect_err);
+    }
+    if (!result.error.empty() &&
+        (!session.connection_created || IsConnectionLostError(status, result.error) ||
+         !session.IsAlive())) {
+      result.connection_lost = true;
+      session.alive.store(false, std::memory_order_release);
+      return result;
+    }
+  }
+  if (result.error.empty()) {
+    session.alive.store(true, std::memory_order_release);
+  }
+  return result;
+}
+
+AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want_rows,
+                                std::size_t max_rows) {
+  if (session.IsClosed()) {
+    AdbcQueryResult result;
+    result.connection_lost = true;
+    result.error = Tr("Connection is closed", "连接已关闭");
+    return result;
+  }
+  if (session.dialect == Dialect::Redis && session.redis) {
+    AdbcQueryResult result = ExecuteRedisCommandBlocking(*session.redis, sql, max_rows);
+    if (!result.error.empty() &&
+        (!session.redis->IsConnected() || IsConnectionLostError(0, result.error))) {
+      result.connection_lost = true;
+      session.alive.store(false, std::memory_order_release);
+    } else if (result.error.empty()) {
+      session.alive.store(true, std::memory_order_release);
+    }
+    return result;
+  }
+
+  AdbcStatusCode status = ADBC_STATUS_OK;
+  bool before_execute = false;
+  AdbcQueryResult result =
+      ExecuteBlockingOnce(session, sql, want_rows, max_rows, status, before_execute);
+  if (!result.error.empty() &&
+      (!session.connection_created || IsConnectionLostError(status, result.error))) {
+    if (before_execute || IsSqlReadStatement(sql)) {
+      std::string reconnect_err;
+      if (ReconnectBlocking(session, reconnect_err)) {
+        status = ADBC_STATUS_OK;
+        result = ExecuteBlockingOnce(session, sql, want_rows, max_rows, status, before_execute);
+      } else if (!reconnect_err.empty()) {
+        result.error = std::move(reconnect_err);
+      }
+    }
+    if (!result.error.empty() &&
+        (!session.connection_created || IsConnectionLostError(status, result.error) ||
+         !session.IsAlive())) {
+      result.connection_lost = true;
+      session.alive.store(false, std::memory_order_release);
+      return result;
+    }
+  }
+  if (result.error.empty()) {
+    session.alive.store(true, std::memory_order_release);
+  }
+  return result;
+}
+
+AdbcQueryResult PingSessionBlocking(AdbcSession& session) {
+  if (session.IsClosed()) {
+    AdbcQueryResult result;
+    result.connection_lost = true;
+    result.error = Tr("Connection is closed", "连接已关闭");
+    return result;
+  }
+  if (session.dialect == Dialect::Redis) {
+    AdbcQueryResult res = ExecuteBlocking(session, "PING", true, 1);
+    if (res.connection_lost || !session.redis || !session.redis->IsConnected() ||
+        (!res.error.empty() && IsConnectionLostError(0, res.error))) {
+      res.connection_lost = true;
+      session.alive.store(false, std::memory_order_release);
+      return res;
+    }
+    res.error.clear();
+    res.connection_lost = false;
+    session.alive.store(true, std::memory_order_release);
+    return res;
+  }
+
+  AdbcQueryResult res = ExecuteBlocking(session, "SELECT 1", true, 1);
+  if (res.connection_lost) {
+    session.alive.store(false, std::memory_order_release);
+    return res;
+  }
+  res.error.clear();
+  res.connection_lost = false;
+  session.alive.store(true, std::memory_order_release);
+  return res;
 }
 
 bool IsValidUtf8(std::string_view text) noexcept {
@@ -1383,6 +1723,26 @@ std::string QualifiedName(Dialect dialect, const DbObject& object) {
          QuoteIdentifier(dialect, object.name);
 }
 
+std::string NormalizeSqlFilter(std::string_view raw) {
+  std::string_view text = TrimAscii(raw);
+  while (!text.empty() && text.back() == ';') {
+    text.remove_suffix(1);
+    text = TrimAscii(text);
+  }
+  if (text.size() > 5 && LowerAscii(text.substr(0, 5)) == "where") {
+    const unsigned char next = static_cast<unsigned char>(text[5]);
+    if (next == ' ' || next == '\t' || next == '\r' || next == '\n' || next == '(') {
+      text.remove_prefix(5);
+      text = TrimAscii(text);
+    }
+  }
+  while (!text.empty() && text.back() == ';') {
+    text.remove_suffix(1);
+    text = TrimAscii(text);
+  }
+  return std::string(text);
+}
+
 std::string BuildDropObjectSql(Dialect dialect, const DbObject& object) {
   const std::string qualified = QualifiedName(dialect, object);
   if (object.is_view) {
@@ -1395,6 +1755,77 @@ std::string BuildDropObjectSql(Dialect dialect, const DbObject& object) {
     return "DROP FOREIGN TABLE " + qualified;
   }
   return "DROP TABLE " + qualified;
+}
+
+std::string BuildRenameTableSql(Dialect dialect, const DbObject& object,
+                                std::string_view new_name) {
+  const std::string_view trimmed = TrimAscii(new_name);
+  if (trimmed.empty() || dialect == Dialect::Redis) {
+    return {};
+  }
+  return "ALTER TABLE " + QualifiedName(dialect, object) + " RENAME TO " +
+         QuoteIdentifier(dialect, trimmed);
+}
+
+std::string BuildAddColumnSql(Dialect dialect, const DbObject& object,
+                              std::string_view column_name, std::string_view column_type,
+                              bool nullable, std::string_view default_expr) {
+  const std::string_view name = TrimAscii(column_name);
+  const std::string_view type = TrimAscii(column_type);
+  const std::string_view def = TrimAscii(default_expr);
+  if (name.empty() || type.empty() || dialect == Dialect::Redis) {
+    return {};
+  }
+  std::string sql = "ALTER TABLE " + QualifiedName(dialect, object) + " ADD COLUMN " +
+                    QuoteIdentifier(dialect, name) + " " + std::string(type);
+  if (!nullable) {
+    sql += " NOT NULL";
+  }
+  if (!def.empty()) {
+    sql += " DEFAULT ";
+    sql.append(def);
+  }
+  return sql;
+}
+
+std::string BuildRenameColumnSql(Dialect dialect, const DbObject& object,
+                                 std::string_view old_name, std::string_view new_name) {
+  const std::string_view old_trimmed = TrimAscii(old_name);
+  const std::string_view new_trimmed = TrimAscii(new_name);
+  if (old_trimmed.empty() || new_trimmed.empty() || old_trimmed == new_trimmed ||
+      dialect == Dialect::Redis) {
+    return {};
+  }
+  return "ALTER TABLE " + QualifiedName(dialect, object) + " RENAME COLUMN " +
+         QuoteIdentifier(dialect, old_trimmed) + " TO " +
+         QuoteIdentifier(dialect, new_trimmed);
+}
+
+std::string BuildDropColumnSql(Dialect dialect, const DbObject& object,
+                               std::string_view column_name) {
+  const std::string_view trimmed = TrimAscii(column_name);
+  if (trimmed.empty() || dialect == Dialect::Redis) {
+    return {};
+  }
+  return "ALTER TABLE " + QualifiedName(dialect, object) + " DROP COLUMN " +
+         QuoteIdentifier(dialect, trimmed);
+}
+
+std::string BuildAlterColumnTypeSql(Dialect dialect, const DbObject& object,
+                                    std::string_view column_name, std::string_view new_type,
+                                    bool nullable) {
+  const std::string_view col = TrimAscii(column_name);
+  const std::string_view type = TrimAscii(new_type);
+  if (col.empty() || type.empty() || dialect == Dialect::Sqlite || dialect == Dialect::Redis) {
+    return {};
+  }
+  if (dialect == Dialect::Mysql) {
+    return "ALTER TABLE " + QualifiedName(dialect, object) + " MODIFY COLUMN " +
+           QuoteIdentifier(dialect, col) + " " + std::string(type) +
+           (nullable ? " NULL" : " NOT NULL");
+  }
+  return "ALTER TABLE " + QualifiedName(dialect, object) + " ALTER COLUMN " +
+         QuoteIdentifier(dialect, col) + " TYPE " + std::string(type);
 }
 
 namespace {
