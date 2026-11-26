@@ -712,9 +712,15 @@ ThemeDefinition AppThemeDefinition(const ResolvedTheme& resolved) {
   definition.Set(bars);
 
   ProgressCircleStyle circles = ProgressCircleStyle::Default();
+  circles.size = 28.0F;
+  circles.stroke_width = 3.0F;
   circles.track_color = WithAlpha(spec.colors.outline, 0.22F);
-  circles.indeterminate_track_color = WithAlpha(spec.colors.outline, 0.22F);
+  circles.indeterminate_track_color = WithAlpha(spec.colors.outline, 0.18F);
   circles.indicator_color = spec.colors.primary;
+  circles.indeterminate_motion = ProgressCircleIndeterminateMotion::PulsingArc;
+  circles.minimum_indeterminate_arc_fraction = 0.12F;
+  circles.maximum_indeterminate_arc_fraction = 0.80F;
+  circles.animation_duration = spec.motion.reduced_motion ? 0.0 : 6.0;
   definition.Set(circles);
 
   TextFieldStyle text_fields = TextFieldStyle::Default();

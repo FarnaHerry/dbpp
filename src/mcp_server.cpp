@@ -31,7 +31,7 @@ import dbpp.adbc;
 import dbpp.db;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.3.1"
+#define DBPP_VERSION "0.3.2"
 #endif
 
 namespace dbpp {

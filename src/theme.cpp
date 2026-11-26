@@ -177,9 +177,32 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
 }
 
 [[huxerui::composable]] View TitleBarButton(std::string label, std::function<void()> on_click,
-                                            bool active) {
+                                            bool active,
+                                            const ImageResource* leading_icon) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  auto interaction = UseState(InteractionState{});
+  if (leading_icon != nullptr) {
+    const InteractionState state = interaction.Get();
+    const bool hovered = state.enabled && (state.hovered || state.pressed || state.focus_visible);
+    const Color fg = active ? spec.colors.on_primary_container : spec.colors.on_surface;
+    const Color icon_color = active ? spec.colors.primary : spec.colors.on_surface_variant;
+    const Color bg =
+        active ? spec.colors.primary_container
+               : (state.pressed ? semantic.press_fill
+                                : (hovered ? semantic.hover_fill : Color::Transparent()));
+    const Color border_color = active ? WithAlpha(spec.colors.primary, 0.50F) : Color::Transparent();
+    const Font font = active ? Font::System(font_size::kChip).WithWeight(FontWeight::SemiBold)
+                             : Font::System(font_size::kChip).WithWeight(FontWeight::Medium);
+    return Row{
+        TintedIcon(*leading_icon, icon_color, 14.0F),
+        Text(std::move(label)).Style(TextStyle{font, fg}).LineLimit(1),
+    }
+        .With(Frame{.min_height = 26.0F}, Padding{EdgeInsets::Symmetric(10.0F, 4.0F)},
+              Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+              Background{VisualFill{bg}}, Border{border_color, 1.0F}, InteractionSink{interaction})
+        .OnClick(std::move(on_click));
+  }
   ButtonStyle style = UseEnvironment<ButtonStyle>();
   style.padding = EdgeInsets::Symmetric(10.0F, 4.0F);
   style.minimum_height = 26.0F;
@@ -294,14 +317,14 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
   const float left_padding = 8.0F + static_cast<float>(std::max(0, options.indent_level)) * 12.0F;
 
   Views children;
-  if (options.selected) {
-    children.Add(Spacer().With(
-        Grow(0.0F),
-        Frame{.width = 3.0F, .height = 14.0F, .min_width = 3.0F, .max_width = 3.0F,
-              .min_height = 14.0F, .max_height = 14.0F},
-        CornerRadius{1.5F}, Background{VisualFill{spec.colors.primary}}));
-  }
-  if (!options.prefix.empty()) {
+  if (options.expanded.has_value()) {
+    const Color p_color = options.selected
+                              ? spec.colors.primary
+                              : options.prefix_color.value_or(secondary);
+    children.Add(
+        TintedIcon(*options.expanded ? app::images::chevron_down : app::images::chevron_right,
+                   p_color, 12.0F));
+  } else if (!options.prefix.empty()) {
     const Color p_color = options.selected
                               ? spec.colors.primary
                               : options.prefix_color.value_or(secondary);
@@ -491,6 +514,50 @@ View PageTitle(std::string title, View actions) {
   return std::move(card).With(Background{VisualFill{spec.colors.surface_container_highest}},
                               CornerRadius{10.0F}, Border{semantic.border_subtle, 1.0F},
                               Padding{EdgeInsets::Symmetric(20.0F, 18.0F)});
+}
+
+namespace {
+
+Views LoadingIndicatorItems(const std::string& resolved_label) {
+  Views items;
+  items.Add(ProgressCircle());
+  if (!resolved_label.empty()) {
+    items.Add(MutedText(resolved_label));
+  }
+  return items;
+}
+
+} // namespace
+
+[[huxerui::composable]] View LoadingState(StringVariant label) {
+  const std::string resolved = UseString(std::move(label));
+  return Column{LoadingIndicatorItems(resolved)}.With(
+      Grow(1.0F), MainAlign{MainAxisAlignment::Center}, CrossAlign{CrossAxisAlignment::Center},
+      Spacing{10.0F});
+}
+
+[[huxerui::composable]] View LoadingOverlay(View content, bool loading, StringVariant label) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const std::string resolved = UseString(std::move(label));
+  Views layers;
+  layers.Add(std::move(content));
+  if (loading) {
+    View badge = Column{LoadingIndicatorItems(resolved)}.With(
+        Padding{EdgeInsets::Symmetric(20.0F, 14.0F)}, Spacing{10.0F},
+        CrossAlign{CrossAxisAlignment::Center}, CornerRadius{10.0F},
+        Background{VisualFill{spec.colors.surface_container_highest}},
+        Border{semantic.border_subtle, 1.0F});
+    View scrim =
+        Column{std::move(badge)}
+            .With(MainAlign{MainAxisAlignment::Center}, CrossAlign{CrossAxisAlignment::Center},
+                  CornerRadius{8.0F},
+                  Background{VisualFill{WithAlpha(spec.colors.background, 0.56F)}})
+            .On<ViewEvents::PointerIntercept>([](const PointerEvent&) { return true; });
+    layers.Add(std::move(scrim));
+  }
+  return Stack{std::move(layers)}.With(
+      Align{HorizontalAlignment::Stretch, VerticalAlignment::Stretch});
 }
 
 } // namespace dbpp::ui

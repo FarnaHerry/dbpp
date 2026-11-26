@@ -28,7 +28,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.3.1"
+#define DBPP_VERSION "0.3.2"
 #endif
 
 #include "theme_palette.h"
@@ -1136,6 +1136,25 @@ std::string SessionObjectBucketName(const DbSession& session, const DbObject& ob
   if (session.dialect == Dialect::Mysql) {
     return ObjectDatabaseName(Dialect::Mysql, object);
   }
+  if (session.dialect == Dialect::Sqlite) {
+    if (!object.db_schema.empty()) {
+      return object.db_schema;
+    }
+    if (!object.catalog.empty()) {
+      return object.catalog;
+    }
+    return "main";
+  }
+  if (session.dialect == Dialect::Duckdb) {
+    const std::string name = ObjectDatabaseName(Dialect::Duckdb, object);
+    if (!name.empty()) {
+      return name;
+    }
+    if (!object.catalog.empty()) {
+      return object.catalog;
+    }
+    return "main";
+  }
   if (multi_catalog && !object.catalog.empty() &&
       !ContainsIgnoreCaseAscii(object.catalog, "def") &&
       !ContainsIgnoreCaseAscii(object.catalog, "main")) {
@@ -1188,7 +1207,8 @@ bool SessionUsesDatabaseHierarchy(const DbSession& session) {
     }
   }
   if (distinct_buckets.size() == 1) {
-    return session.dialect == Dialect::Mysql || session.dialect == Dialect::Postgresql ||
+    return session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb ||
+           session.dialect == Dialect::Mysql || session.dialect == Dialect::Postgresql ||
            ContainsIgnoreCaseAscii(session.driver_path, "mssql") ||
            ContainsIgnoreCaseAscii(session.uri, "mssql://");
   }
@@ -1202,6 +1222,10 @@ std::vector<SidebarDatabaseGroup> GroupSessionDatabases(const DbSession& session
   std::string target_lower = target_db;
   for (char& ch : target_lower) {
     ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  if (target_lower.empty() &&
+      (session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb)) {
+    target_lower = "main";
   }
 
   struct RawBucket {
@@ -1366,10 +1390,11 @@ StringResource ObjectKindResource(const DbObject& object) {
   const std::vector<ColumnMeta>& cols = columns.Get();
   View body_content;
   if (loading.Get()) {
-    body_content = MutedText(UseString(app::strings::schema_dialog_loading));
+    body_content = LoadingState(app::strings::schema_dialog_loading).With(Frame{.height = 200.0F});
   } else if (cols.empty()) {
-    body_content = MutedText(UseString(error.Get().empty() ? app::strings::schema_dialog_empty
-                                                           : app::strings::schema_dialog_load_failed));
+    body_content = TableEmptyState(error.Get().empty() ? app::strings::schema_dialog_empty
+                                                       : app::strings::schema_dialog_load_failed)
+                       .With(Frame{.height = 140.0F});
   } else {
     Views col_rows;
     col_rows.Reserve(cols.size());
@@ -1684,15 +1709,18 @@ StringResource ObjectKindResource(const DbObject& object) {
 
   View columns_body =
       loading.Get() && cols.empty()
-          ? View(MutedText(UseString(app::strings::schema_dialog_loading)))
-          : View(ScrollView(Column{std::move(col_rows)}
-                                .With(Spacing{3.0F}, CrossAlign{CrossAxisAlignment::Stretch}))
-                     .With(Frame{.height = 170.0F}));
+          ? LoadingState(app::strings::schema_dialog_loading).With(Frame{.height = 170.0F})
+          : LoadingOverlay(
+                ScrollView(Column{std::move(col_rows)}
+                               .With(Spacing{3.0F}, CrossAlign{CrossAxisAlignment::Stretch})),
+                loading.Get(), app::strings::schema_dialog_loading)
+                .With(Frame{.height = 170.0F});
 
   const std::string header_label =
       cur_obj.name.empty() ? display_label : QualifiedName(dialect, cur_obj);
 
-  return DialogCard(Column{
+  return DialogCard(LoadingOverlay(
+      Column{
       Row{
           TintedIcon(app::images::table, spec.colors.primary, 18.0F),
           Text::Format(TextRole::Title, app::strings::edit_table_title, header_label),
@@ -1767,8 +1795,9 @@ StringResource ObjectKindResource(const DbObject& object) {
               error_text.Get().empty() ? View{} : ErrorText(error_text.Get()),
           }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch}))
           .With(Grow(1.0F)),
-  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch},
-         Frame{.width = 660.0F, .height = 590.0F}));
+  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+      busy.Get(), app::strings::edit_table_executing)
+                        .With(Frame{.width = 660.0F, .height = 590.0F}));
 }
 
 [[huxerui::composable]] View DropObjectDialog(
@@ -1815,23 +1844,25 @@ StringResource ObjectKindResource(const DbObject& object) {
     });
   };
 
-  return DialogCard(Column{
-      Row{
-          Text::Format(TextRole::Title, app::strings::drop_dialog_title, kind),
-          Spacer(),
-          ActionButton(Button(app::strings::action_cancel)
-                           .OnClick([dialog] { dialog.Dismiss(); })
-                           .With(Enabled{!busy.Get()})),
-          ActionButton(Button(busy.Get() ? app::strings::drop_dialog_confirming
-                                         : app::strings::drop_dialog_confirm)
-                           .OnClick(confirm)
-                           .With(Enabled{!busy.Get()}),
-                       ButtonTone::DangerSolid),
-      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText(UseString(app::strings::drop_dialog_warning, display_label)),
-      MutedText(UseString(app::strings::drop_dialog_sql_preview, drop_sql)),
-  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-                    .With(Frame{.width = 520.0F}));
+  return DialogCard(LoadingOverlay(
+      Column{
+          Row{
+              Text::Format(TextRole::Title, app::strings::drop_dialog_title, kind),
+              Spacer(),
+              ActionButton(Button(app::strings::action_cancel)
+                               .OnClick([dialog] { dialog.Dismiss(); })
+                               .With(Enabled{!busy.Get()})),
+              ActionButton(Button(busy.Get() ? app::strings::drop_dialog_confirming
+                                             : app::strings::drop_dialog_confirm)
+                               .OnClick(confirm)
+                               .With(Enabled{!busy.Get()}),
+                           ButtonTone::DangerSolid),
+          }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
+          MutedText(UseString(app::strings::drop_dialog_warning, display_label)),
+          MutedText(UseString(app::strings::drop_dialog_sql_preview, drop_sql)),
+      }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+      busy.Get(), app::strings::drop_dialog_confirming)
+                        .With(Frame{.width = 520.0F}));
 }
 
 [[huxerui::composable]] View DeleteSavedProfileDialog(
@@ -2121,7 +2152,7 @@ struct SidebarConnectionEntry {
 
       View unopened_row =
           TreeRow(TreeRowOptions{
-                      .prefix = "▸",
+                      .prefix = {},
                       .label = display_name,
                       .trailing_text = UseString(app::strings::sidebar_status_disconnected),
                       .indent_level = 0,
@@ -2133,6 +2164,7 @@ struct SidebarConnectionEntry {
                       .status_dot = WithAlpha(spec.colors.on_surface_variant, 0.45F),
                       .leading_icon =
                           DatabaseIcon(DetectDatabaseBrand(profile.driver_path, profile.uri), 15.0F),
+                      .expanded = false,
                   },
                   [connect_profile, profile] { connect_profile(profile); })
               .With(Grow(1.0F),
@@ -2248,7 +2280,7 @@ struct SidebarConnectionEntry {
     View connection_row =
         TreeRow(
             TreeRowOptions{
-                .prefix = is_expanded ? "▾" : "▸",
+                .prefix = {},
                 .label = session.name,
                 .trailing_text = std::to_string(session.objects.size()),
                 .indent_level = 0,
@@ -2260,6 +2292,7 @@ struct SidebarConnectionEntry {
                 .status_dot = semantic.success,
                 .leading_icon = DatabaseIcon(
                     DetectDatabaseBrand(session.driver_path, session.uri, session.dialect), 15.0F),
+                .expanded = is_expanded,
             },
             toggle_session)
             .With(Grow(1.0F),
@@ -2379,6 +2412,197 @@ struct SidebarConnectionEntry {
     const bool multi_schema = SessionHasMultipleSchemas(session);
     const bool use_db_hierarchy = SessionUsesDatabaseHierarchy(session);
 
+    const auto render_object_row = [&](const DbObject& object, const std::string& key_prefix,
+                                       std::size_t idx, int indent_level,
+                                       bool hide_schema_prefix, Color icon_accent) {
+      const bool is_redis = session.dialect == Dialect::Redis;
+      const std::string object_schema =
+          object.db_schema.empty() ? ObjectDatabaseName(session.dialect, object)
+                                   : object.db_schema;
+      const bool is_selected =
+          active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Table &&
+          active_tab->session_id == session_id && active_tab->object_name == object.name &&
+          active_tab->object_schema == object_schema &&
+          active_tab->is_view == object.is_view;
+      const std::string display_label =
+          (!hide_schema_prefix && multi_schema && !object_schema.empty())
+              ? (object_schema + "." + object.name)
+              : object.name;
+      const std::string name = object.name;
+      const bool is_view = object.is_view;
+      const std::string qualified =
+          is_redis ? object.name : QualifiedName(session.dialect, object);
+      const std::string select_sql = "SELECT * FROM " + qualified + " LIMIT 100;";
+      const std::string drop_sql = BuildDropObjectSql(session.dialect, object);
+      const StringResource kind_res = ObjectKindResource(object);
+      const std::string row_trailing =
+          (is_redis && object.item_count.has_value())
+              ? std::to_string(*object.item_count)
+              : std::string{};
+      std::string redis_db_index = "0";
+      if (is_redis && object.name.size() > 2 &&
+          (object.name.starts_with("db") || object.name.starts_with("DB"))) {
+        redis_db_index = object.name.substr(2);
+      }
+
+      const auto open_object = [app, workspace, tasks, notify, session_id, name,
+                                object_schema, is_view] {
+        SelectObject(app, workspace, tasks, session_id, name, object_schema, is_view,
+                     notify);
+      };
+
+      const auto open_schema_dialog = [dialogs, adbc = session.session, session_id, object,
+                                       display_label, qualified, app, workspace, tasks,
+                                       notify, theme_config, language_mode, system_dark] {
+        if (!adbc || adbc->IsClosed()) {
+          HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
+          return;
+        }
+        dialogs.Show([adbc, session_id, object, display_label, qualified, app, workspace,
+                      tasks, notify, theme_config, language_mode,
+                      system_dark](DialogContext dialog) {
+          return WithDialogTheme(
+              theme_config, language_mode, system_dark,
+              ObjectSchemaDialog(dialog, adbc, session_id, object, display_label, qualified,
+                                 app, workspace, tasks, notify));
+        });
+      };
+
+      const auto open_drop_dialog = [dialogs, adbc = session.session, session_id, object,
+                                     display_label, drop_sql, app, workspace, tasks, notify,
+                                     theme_config, language_mode, system_dark] {
+        if (!adbc || adbc->IsClosed()) {
+          HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
+          return;
+        }
+        dialogs.Show([adbc, session_id, object, display_label, drop_sql, app, workspace,
+                      tasks, notify, theme_config, language_mode,
+                      system_dark](DialogContext dialog) {
+          return WithDialogTheme(theme_config, language_mode, system_dark,
+                                 DropObjectDialog(dialog, adbc, session_id, object,
+                                                  display_label, drop_sql, app, workspace,
+                                                  tasks, notify));
+        });
+      };
+
+      const auto open_edit_table_dialog = [dialogs, adbc = session.session, session_id,
+                                           dialect = session.dialect, object, display_label,
+                                           app, workspace, tasks, notify, theme_config,
+                                           language_mode, system_dark] {
+        if (!adbc || adbc->IsClosed()) {
+          HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
+          return;
+        }
+        dialogs.Show([adbc, session_id, dialect, object, display_label, app, workspace, tasks,
+                      notify, theme_config, language_mode,
+                      system_dark](DialogContext dialog) {
+          return WithDialogTheme(
+              theme_config, language_mode, system_dark,
+              EditTableDialog(dialog, adbc, session_id, dialect, object, display_label, app,
+                              workspace, tasks, notify));
+        });
+      };
+
+      const bool is_editable_table =
+          !is_redis && !object.is_view &&
+          !ContainsIgnoreCaseAscii(object.table_type, "foreign");
+      const ImageResource& obj_icon =
+          is_redis
+              ? app::images::database
+              : (ContainsIgnoreCaseAscii(object.table_type, "materialized")
+                     ? app::images::mview
+                     : (object.is_view
+                            ? app::images::view
+                            : (ContainsIgnoreCaseAscii(object.table_type, "foreign")
+                                   ? app::images::foreign_table
+                                   : app::images::table)));
+      const Color resolved_icon_color =
+          is_redis ? (is_selected ? spec.colors.primary : icon_accent) : icon_accent;
+
+      tree_rows.Add(
+          TreeRow(TreeRowOptions{
+                      .prefix = {},
+                      .label = display_label,
+                      .trailing_text = row_trailing,
+                      .indent_level = indent_level,
+                      .selected = is_selected,
+                      .emphasize = is_redis && is_selected,
+                      .active_hint = false,
+                      .muted = false,
+                      .prefix_color = icon_accent,
+                      .status_dot = std::nullopt,
+                      .leading_icon = TintedIcon(obj_icon, resolved_icon_color, 14.0F),
+                  },
+                  open_object)
+              .On<ViewEvents::ContextMenuRequested>(
+                  [menu, loc, open_object, app, workspace, open_schema_dialog,
+                   open_edit_table_dialog, copy_text, refresh_session, open_drop_dialog,
+                   session_id, select_sql, display_label, kind_res, is_redis,
+                   is_editable_table, redis_db_index](Point position) {
+                    if (is_redis) {
+                      menu.ShowAt(position, {
+                          MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse),
+                                   open_object),
+                          MenuItem(loc.Get(app::strings::sidebar_ctx_open_in_console),
+                                   [app, workspace, session_id, redis_db_index,
+                                    display_label] {
+                                     (void)OpenSqlTab(app, workspace, session_id,
+                                                      "SELECT " + redis_db_index,
+                                                      "Redis · " + display_label);
+                                   }),
+                          MenuItem(loc.Get(app::strings::sidebar_ctx_view_fields),
+                                   open_schema_dialog),
+                          MenuSection{},
+                          MenuItem(loc.Get(app::strings::sidebar_ctx_copy_name),
+                                   [copy_text, display_label] {
+                                     copy_text(display_label,
+                                               app::strings::sidebar_copy_name_label);
+                                   }),
+                          MenuSection{},
+                          MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_dbs),
+                                   refresh_session),
+                      });
+                      return;
+                    }
+                    std::vector<MenuEntry> entries;
+                    entries.emplace_back(
+                        MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse), open_object));
+                    entries.emplace_back(MenuItem(
+                        loc.Get(app::strings::sidebar_ctx_open_in_sql),
+                        [app, workspace, session_id, select_sql, display_label] {
+                          (void)OpenSqlTab(app, workspace, session_id, select_sql,
+                                           "SQL · " + display_label);
+                        }));
+                    entries.emplace_back(MenuItem(
+                        loc.Get(app::strings::sidebar_ctx_view_schema), open_schema_dialog));
+                    if (is_editable_table) {
+                      entries.emplace_back(MenuItem(
+                          loc.Get(app::strings::sidebar_ctx_edit_table),
+                          open_edit_table_dialog));
+                    }
+                    entries.emplace_back(MenuSection{});
+                    entries.emplace_back(MenuItem(
+                        loc.Get(app::strings::sidebar_ctx_copy_name),
+                        [copy_text, display_label] {
+                          copy_text(display_label, app::strings::sidebar_copy_name_label);
+                        }));
+                    entries.emplace_back(MenuItem(
+                        loc.Get(app::strings::sidebar_ctx_copy_select),
+                        [copy_text, select_sql] {
+                          copy_text(select_sql, app::strings::sidebar_copy_select_label);
+                        }));
+                    entries.emplace_back(MenuSection{});
+                    entries.emplace_back(MenuItem(
+                        loc.Get(app::strings::sidebar_ctx_refresh_objects), refresh_session));
+                    entries.emplace_back(MenuItem(
+                        loc.Fmt(app::strings::sidebar_ctx_drop_object, loc.Get(kind_res)),
+                        open_drop_dialog));
+                    menu.ShowAt(position, std::move(entries));
+                  })
+              .Key("obj-" + key_prefix + "-" + object_schema + "-" + name + "-" +
+                   std::to_string(idx)));
+    };
+
     const auto render_object_group =
         [&](const SidebarObjectGroup& group, const std::string& group_id, int group_indent,
             bool hide_schema_prefix) {
@@ -2405,7 +2629,7 @@ struct SidebarConnectionEntry {
 
           tree_rows.Add(
               TreeRow(TreeRowOptions{
-                          .prefix = group_open ? "▾" : "▸",
+                          .prefix = {},
                           .label = UseString(group.label),
                           .trailing_text = std::to_string(group.items.size()),
                           .indent_level = group_indent,
@@ -2416,6 +2640,7 @@ struct SidebarConnectionEntry {
                           .prefix_color = group_accent,
                           .status_dot = std::nullopt,
                           .leading_icon = TintedIcon(group_icon, group_accent, 14.0F),
+                          .expanded = group_open,
                       },
                       toggle_group)
                   .On<ViewEvents::ContextMenuRequested>(
@@ -2440,195 +2665,18 @@ struct SidebarConnectionEntry {
           }
 
           for (std::size_t idx = 0; idx < group.items.size(); ++idx) {
-            const DbObject& object = *group.items[idx];
-            const bool is_redis = session.dialect == Dialect::Redis;
-            const std::string object_schema =
-                object.db_schema.empty() ? ObjectDatabaseName(session.dialect, object)
-                                         : object.db_schema;
-            const bool is_selected =
-                active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Table &&
-                active_tab->session_id == session_id && active_tab->object_name == object.name &&
-                active_tab->object_schema == object_schema &&
-                active_tab->is_view == object.is_view;
-            const std::string display_label =
-                (!hide_schema_prefix && multi_schema && !object_schema.empty())
-                    ? (object_schema + "." + object.name)
-                    : object.name;
-            const std::string name = object.name;
-            const bool is_view = object.is_view;
-            const std::string qualified =
-                is_redis ? object.name : QualifiedName(session.dialect, object);
-            const std::string select_sql = "SELECT * FROM " + qualified + " LIMIT 100;";
-            const std::string drop_sql = BuildDropObjectSql(session.dialect, object);
-            const StringResource kind_res = ObjectKindResource(object);
-            const std::string row_trailing =
-                (is_redis && object.item_count.has_value())
-                    ? std::to_string(*object.item_count)
-                    : std::string{};
-            std::string redis_db_index = "0";
-            if (is_redis && object.name.size() > 2 &&
-                (object.name.starts_with("db") || object.name.starts_with("DB"))) {
-              redis_db_index = object.name.substr(2);
-            }
-
-            const auto open_object = [app, workspace, tasks, notify, session_id, name,
-                                      object_schema, is_view] {
-              SelectObject(app, workspace, tasks, session_id, name, object_schema, is_view,
-                           notify);
-            };
-
-            const auto open_schema_dialog = [dialogs, adbc = session.session, session_id, object,
-                                             display_label, qualified, app, workspace, tasks,
-                                             notify, theme_config, language_mode, system_dark] {
-              if (!adbc || adbc->IsClosed()) {
-                HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-                return;
-              }
-              dialogs.Show([adbc, session_id, object, display_label, qualified, app, workspace,
-                            tasks, notify, theme_config, language_mode,
-                            system_dark](DialogContext dialog) {
-                return WithDialogTheme(
-                    theme_config, language_mode, system_dark,
-                    ObjectSchemaDialog(dialog, adbc, session_id, object, display_label, qualified,
-                                       app, workspace, tasks, notify));
-              });
-            };
-
-            const auto open_drop_dialog = [dialogs, adbc = session.session, session_id, object,
-                                           display_label, drop_sql, app, workspace, tasks, notify,
-                                           theme_config, language_mode, system_dark] {
-              if (!adbc || adbc->IsClosed()) {
-                HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-                return;
-              }
-              dialogs.Show([adbc, session_id, object, display_label, drop_sql, app, workspace,
-                            tasks, notify, theme_config, language_mode,
-                            system_dark](DialogContext dialog) {
-                return WithDialogTheme(theme_config, language_mode, system_dark,
-                                       DropObjectDialog(dialog, adbc, session_id, object,
-                                                        display_label, drop_sql, app, workspace,
-                                                        tasks, notify));
-              });
-            };
-
-            const auto open_edit_table_dialog = [dialogs, adbc = session.session, session_id,
-                                                 dialect = session.dialect, object, display_label,
-                                                 app, workspace, tasks, notify, theme_config,
-                                                 language_mode, system_dark] {
-              if (!adbc || adbc->IsClosed()) {
-                HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-                return;
-              }
-              dialogs.Show([adbc, session_id, dialect, object, display_label, app, workspace, tasks,
-                            notify, theme_config, language_mode,
-                            system_dark](DialogContext dialog) {
-                return WithDialogTheme(
-                    theme_config, language_mode, system_dark,
-                    EditTableDialog(dialog, adbc, session_id, dialect, object, display_label, app,
-                                    workspace, tasks, notify));
-              });
-            };
-
-            const bool is_editable_table =
-                !is_redis && !object.is_view &&
-                !ContainsIgnoreCaseAscii(object.table_type, "foreign");
-            const ImageResource& obj_icon =
-                is_redis
-                    ? app::images::database
-                    : (ContainsIgnoreCaseAscii(object.table_type, "materialized")
-                           ? app::images::mview
-                           : (object.is_view
-                                  ? app::images::view
-                                  : (ContainsIgnoreCaseAscii(object.table_type, "foreign")
-                                         ? app::images::foreign_table
-                                         : app::images::table)));
-
-            tree_rows.Add(
-                TreeRow(TreeRowOptions{
-                            .prefix = {},
-                            .label = display_label,
-                            .trailing_text = row_trailing,
-                            .indent_level = group_indent + 1,
-                            .selected = is_selected,
-                            .emphasize = false,
-                            .active_hint = false,
-                            .muted = false,
-                            .prefix_color = group_accent,
-                            .status_dot = std::nullopt,
-                            .leading_icon = TintedIcon(obj_icon, group_accent, 14.0F),
-                        },
-                        open_object)
-                    .On<ViewEvents::ContextMenuRequested>(
-                        [menu, loc, open_object, app, workspace, open_schema_dialog,
-                         open_edit_table_dialog, copy_text, refresh_session, open_drop_dialog,
-                         session_id, select_sql, display_label, kind_res, is_redis,
-                         is_editable_table, redis_db_index](Point position) {
-                          if (is_redis) {
-                            menu.ShowAt(position, {
-                                MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse),
-                                         open_object),
-                                MenuItem(loc.Get(app::strings::sidebar_ctx_open_in_console),
-                                         [app, workspace, session_id, redis_db_index,
-                                          display_label] {
-                                           (void)OpenSqlTab(app, workspace, session_id,
-                                                            "SELECT " + redis_db_index,
-                                                            "Redis · " + display_label);
-                                         }),
-                                MenuItem(loc.Get(app::strings::sidebar_ctx_view_fields),
-                                         open_schema_dialog),
-                                MenuSection{},
-                                MenuItem(loc.Get(app::strings::sidebar_ctx_copy_name),
-                                         [copy_text, display_label] {
-                                           copy_text(display_label,
-                                                     app::strings::sidebar_copy_name_label);
-                                         }),
-                                MenuSection{},
-                                MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_dbs),
-                                         refresh_session),
-                            });
-                            return;
-                          }
-                          std::vector<MenuEntry> entries;
-                          entries.emplace_back(
-                              MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse), open_object));
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sidebar_ctx_open_in_sql),
-                              [app, workspace, session_id, select_sql, display_label] {
-                                (void)OpenSqlTab(app, workspace, session_id, select_sql,
-                                                 "SQL · " + display_label);
-                              }));
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sidebar_ctx_view_schema), open_schema_dialog));
-                          if (is_editable_table) {
-                            entries.emplace_back(MenuItem(
-                                loc.Get(app::strings::sidebar_ctx_edit_table),
-                                open_edit_table_dialog));
-                          }
-                          entries.emplace_back(MenuSection{});
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sidebar_ctx_copy_name),
-                              [copy_text, display_label] {
-                                copy_text(display_label, app::strings::sidebar_copy_name_label);
-                              }));
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sidebar_ctx_copy_select),
-                              [copy_text, select_sql] {
-                                copy_text(select_sql, app::strings::sidebar_copy_select_label);
-                              }));
-                          entries.emplace_back(MenuSection{});
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sidebar_ctx_refresh_objects), refresh_session));
-                          entries.emplace_back(MenuItem(
-                              loc.Fmt(app::strings::sidebar_ctx_drop_object, loc.Get(kind_res)),
-                              open_drop_dialog));
-                          menu.ShowAt(position, std::move(entries));
-                        })
-                    .Key("obj-" + group_id + "-" + object_schema + "-" + name + "-" +
-                         std::to_string(idx)));
+            render_object_row(*group.items[idx], group_id, idx, group_indent + 1,
+                              hide_schema_prefix, group_accent);
           }
         };
 
-    if (use_db_hierarchy) {
+    if (session.dialect == Dialect::Redis) {
+      const std::string key_prefix = std::to_string(session_id) + ":redis";
+      for (std::size_t idx = 0; idx < session.objects.size(); ++idx) {
+        render_object_row(session.objects[idx], key_prefix, idx, 1, true,
+                          spec.colors.on_surface_variant);
+      }
+    } else if (use_db_hierarchy) {
       const std::vector<SidebarDatabaseGroup> db_buckets = GroupSessionDatabases(session);
       for (const SidebarDatabaseGroup& db_bucket : db_buckets) {
         const std::string db_key = std::to_string(session_id) + ":db:" + db_bucket.name;
@@ -2642,23 +2690,24 @@ struct SidebarConnectionEntry {
         };
 
         const Color db_icon_color =
-            db_bucket.is_target ? spec.colors.primary : spec.colors.on_surface_variant;
+            db_open ? spec.colors.primary : spec.colors.on_surface_variant;
         tree_rows.Add(
             TreeRow(TreeRowOptions{
-                        .prefix = db_open ? "▾" : "▸",
+                        .prefix = {},
                         .label = db_bucket.name,
                         .trailing_text = std::to_string(db_bucket.object_count),
                         .indent_level = 1,
                         .selected = false,
-                        .emphasize = !db_bucket.is_system,
+                        .emphasize = db_open,
                         .active_hint = false,
-                        .muted = db_bucket.is_system,
+                        .muted = !db_open && db_bucket.is_system,
                         .prefix_color =
-                            db_bucket.is_target
+                            db_open
                                 ? std::optional<Color>(spec.colors.primary)
                                 : std::optional<Color>(spec.colors.on_surface_variant),
                         .status_dot = std::nullopt,
                         .leading_icon = TintedIcon(app::images::database, db_icon_color, 14.0F),
+                        .expanded = db_open,
                     },
                     toggle_db)
                 .On<ViewEvents::ContextMenuRequested>(
@@ -3168,19 +3217,21 @@ struct SidebarConnectionEntry {
 
   View install_list_content;
   if (catalog_loading.Get() && catalog_list.empty()) {
-    install_list_content =
-        Column{MutedText(UseString(app::strings::adbc_catalog_loading))}.With(Grow(1.0F));
+    install_list_content = LoadingState(app::strings::adbc_catalog_loading);
   } else if (catalog_failed.Get() && catalog_list.empty()) {
-    install_list_content =
-        Column{MutedText(UseString(app::strings::adbc_catalog_failed))}.With(Grow(1.0F));
+    install_list_content = TableEmptyState(app::strings::adbc_catalog_failed);
   } else if (registry_rows.Size() == 0) {
-    install_list_content = Column{
-        MutedText(UseString(catalog_list.empty() ? app::strings::adbc_catalog_prompt
-                                                 : app::strings::adbc_catalog_no_match)),
-    }.With(Grow(1.0F));
+    install_list_content = TableEmptyState(catalog_list.empty() ? app::strings::adbc_catalog_prompt
+                                                                : app::strings::adbc_catalog_no_match);
   } else {
+    const StringVariant overlay_label =
+        busy ? (!install_status.Get().empty() ? StringVariant(install_status.Get())
+                                              : StringVariant(app::strings::adbc_status_busy))
+             : StringVariant(app::strings::adbc_catalog_loading);
     install_list_content =
-        ScrollView(Column{std::move(registry_rows)}.With(Spacing{4.0F})).With(Grow(1.0F));
+        LoadingOverlay(ScrollView(Column{std::move(registry_rows)}.With(Spacing{4.0F})),
+                       catalog_loading.Get() || busy, overlay_label)
+            .With(Grow(1.0F));
   }
 
   const std::string user_dir = UserAdbcDriversDir();
@@ -3200,7 +3251,6 @@ struct SidebarConnectionEntry {
             registry_filter = value;
           }),
       std::move(install_list_content),
-      busy && !install_status.Get().empty() ? MutedText(install_status.Get()) : View{},
   }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
 
   View header_actions;
@@ -3732,12 +3782,13 @@ struct SidebarConnectionEntry {
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
       std::move(readiness_strip),
       ScrollView(std::move(form_fields)).With(Grow(1.0F)),
-      installing.Get() && !install_status.Get().empty() ? MutedText(install_status.Get())
-                                                        : View{},
-  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch},
-         Frame{.width = 740.0F, .height = 560.0F});
+  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 
-  return DialogCard(std::move(step1_body));
+  const StringVariant install_label =
+      !install_status.Get().empty() ? StringVariant(install_status.Get())
+                                    : StringVariant(app::strings::connect_installing_btn);
+  return DialogCard(LoadingOverlay(std::move(step1_body), installing.Get(), install_label)
+                        .With(Frame{.width = 740.0F, .height = 560.0F}));
 }
 
 [[huxerui::composable]] View TableBrowserPage(
@@ -3748,6 +3799,9 @@ struct SidebarConnectionEntry {
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto dialogs = UseDialog();
+  const auto menu = UseMenu();
+  const auto sort_anchor = UseViewHandle();
+  const auto page_size_anchor = UseViewHandle();
   auto live_drafts = UseState(std::make_shared<std::unordered_map<std::string, std::string>>());
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
@@ -4018,6 +4072,19 @@ struct SidebarConnectionEntry {
     });
   };
 
+  const auto apply_sort = [app, workspace, tasks, tab_id, notify,
+                           block_if_dirty](std::optional<DataTableSort> next_sort) {
+    if (block_if_dirty()) {
+      return;
+    }
+    const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+    if (cur == nullptr) {
+      return;
+    }
+    RequestLoadTable(app, workspace, tasks, tab_id, 0, std::move(next_sort), cur->table.filter,
+                     false, notify);
+  };
+
   Views toolbar_items;
   TextField filter_field =
       TextField(tab->filter_input)
@@ -4040,6 +4107,86 @@ struct SidebarConnectionEntry {
   if (!model.filter.empty() || !TrimmedSql(tab->filter_input.text).empty()) {
     toolbar_items.Add(ActionButton(Button(app::strings::table_clear_filter).OnClick(clear_filter)));
   }
+  const bool sort_active = model.sort.has_value();
+  const std::string sort_label =
+      sort_active ? UseString(model.sort->direction == DataTableSortDirection::Descending
+                                  ? app::strings::table_sort_active_desc
+                                  : app::strings::table_sort_active_asc,
+                              model.sort->column_id)
+                  : UseString(app::strings::table_sort);
+  const Color sort_fg = sort_active ? spec.colors.on_primary_container : spec.colors.on_surface;
+  const Color sort_bg = sort_active ? spec.colors.primary_container : spec.colors.surface;
+  const Color sort_border =
+      sort_active ? WithAlpha(spec.colors.primary, 0.45F) : semantic.border_subtle;
+  const Color sort_icon_color =
+      sort_active ? spec.colors.primary : spec.colors.on_surface_variant;
+  const std::vector<ColumnMeta> sort_cols = model.columns;
+  const std::optional<DataTableSort> current_sort = model.sort;
+  toolbar_items.Add(
+      Row{
+          TintedIcon(app::images::sort, sort_icon_color, 14.0F),
+          Text(sort_label)
+              .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium),
+                               sort_fg})
+              .LineLimit(1),
+          TintedIcon(app::images::chevron_down, sort_icon_color, 12.0F),
+      }
+          .With(Padding{EdgeInsets::Symmetric(10.0F, 6.0F)}, Spacing{6.0F},
+                CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+                Background{VisualFill{sort_bg}}, Border{sort_border, 1.0F}, sort_anchor,
+                Enabled{!model.columns.empty() && model.pending_inserts.empty()})
+          .OnClick([menu, sort_anchor, loc, apply_sort, sort_cols, current_sort] {
+            std::vector<MenuEntry> entries;
+            if (current_sort.has_value()) {
+              const bool is_desc = current_sort->direction == DataTableSortDirection::Descending;
+              entries.emplace_back(
+                  MenuItem(loc.Get(is_desc ? app::strings::table_sort_toggle_asc
+                                           : app::strings::table_sort_toggle_desc),
+                           [apply_sort, col_id = current_sort->column_id, is_desc] {
+                             apply_sort(DataTableSort{
+                                 .column_id = col_id,
+                                 .direction = is_desc ? DataTableSortDirection::Ascending
+                                                      : DataTableSortDirection::Descending,
+                             });
+                           }));
+              entries.emplace_back(
+                  MenuItem(loc.Get(app::strings::table_sort_clear), [apply_sort] {
+                    apply_sort(std::nullopt);
+                  }));
+              entries.emplace_back(MenuSection{});
+            }
+            for (const ColumnMeta& col : sort_cols) {
+              const bool active_col =
+                  current_sort.has_value() && current_sort->column_id == col.name;
+              const bool active_desc =
+                  active_col && current_sort->direction == DataTableSortDirection::Descending;
+              std::string item_label = col.name;
+              if (active_col) {
+                item_label += active_desc ? " ↓" : " ↑";
+              }
+              entries.emplace_back(
+                  MenuItem(std::move(item_label),
+                           [apply_sort, col_name = col.name, active_col, active_desc] {
+                             DataTableSortDirection next_dir =
+                                 (active_col && !active_desc) ? DataTableSortDirection::Descending
+                                                              : DataTableSortDirection::Ascending;
+                             apply_sort(DataTableSort{.column_id = col_name, .direction = next_dir});
+                           })
+                      .Checked(active_col));
+            }
+            menu.Show(sort_anchor, std::move(entries),
+                      MenuOptions{
+                          .placement = {.side = AnchorSide::Below,
+                                        .alignment = AnchorAlignment::Start},
+                          .gap = 4.0F,
+                          .viewport_margin = 8.0F,
+                          .offset = {},
+                          .width = std::nullopt,
+                          .dismiss_on_outside_press = true,
+                          .dismiss_on_cancel = true,
+                          .on_dismiss_request = {},
+                      });
+          }));
   toolbar_items.Add(Spacer());
   toolbar_items.Add(ActionButton(Button(app::strings::action_refresh).OnClick(refresh)));
   toolbar_items.Add(
@@ -4067,6 +4214,55 @@ struct SidebarConnectionEntry {
   View toolbar = Row{std::move(toolbar_items)}.With(CrossAlign{CrossAxisAlignment::Center},
                                                     Spacing{8.0F});
 
+  const auto change_page_size = [app, workspace, tasks, tab_id, notify,
+                                 block_if_dirty](std::int64_t next_size) {
+    if (block_if_dirty()) {
+      return;
+    }
+    const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+    if (cur == nullptr || next_size <= 0 || cur->table.page_size == next_size) {
+      return;
+    }
+    RequestLoadTable(app, workspace, tasks, tab_id, 0, cur->table.sort, cur->table.filter, false,
+                     notify, next_size);
+  };
+
+  static constexpr std::int64_t kPageSizeOptions[] = {50, 100, 200, 500, 1000};
+  const std::int64_t current_page_size = model.page_size > 0 ? model.page_size : kPageSize;
+  View page_size_selector =
+      Row{
+          Text(UseString(app::strings::table_page_size_label, current_page_size))
+              .Style(TextStyle{Font::System(font_size::kCaption).WithWeight(FontWeight::Medium),
+                               spec.colors.on_surface}),
+          TintedIcon(app::images::chevron_down, spec.colors.on_surface_variant, 13.0F),
+      }
+          .With(Padding{EdgeInsets::Symmetric(10.0F, 5.0F)}, Spacing{6.0F},
+                CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+                Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
+                page_size_anchor, Enabled{model.pending_inserts.empty()})
+          .OnClick([menu, page_size_anchor, loc, change_page_size, current_page_size] {
+            std::vector<MenuEntry> entries;
+            entries.reserve(std::size(kPageSizeOptions));
+            for (const std::int64_t size : kPageSizeOptions) {
+              entries.emplace_back(
+                  MenuItem(loc.Fmt(app::strings::table_page_size_option, size),
+                           [change_page_size, size] { change_page_size(size); })
+                      .Checked(size == current_page_size));
+            }
+            menu.Show(page_size_anchor, std::move(entries),
+                      MenuOptions{
+                          .placement = {.side = AnchorSide::Above,
+                                        .alignment = AnchorAlignment::End},
+                          .gap = 4.0F,
+                          .viewport_margin = 8.0F,
+                          .offset = {},
+                          .width = std::nullopt,
+                          .dismiss_on_outside_press = true,
+                          .dismiss_on_cancel = true,
+                          .on_dismiss_request = {},
+                      });
+          });
+
   const std::int64_t page_count =
       std::max<std::int64_t>(1, (model.total + model.page_size - 1) / model.page_size);
   const std::string status_text =
@@ -4082,6 +4278,7 @@ struct SidebarConnectionEntry {
           : View{},
       model.read_only ? Chip(app::strings::table_read_only) : View{},
       Spacer(),
+      std::move(page_size_selector),
       ActionButton(Button(app::strings::table_prev_page)
                        .OnClick([reload, model] {
                          if (model.page > 0) {
@@ -4100,12 +4297,12 @@ struct SidebarConnectionEntry {
 
   View table_view;
   if ((model.snapshot == nullptr && model.pending_inserts.empty()) || model.columns.empty()) {
-    const StringResource empty_res =
-        model.loading
-            ? app::strings::table_loading
-            : (!model.error.empty() ? app::strings::table_load_failed_retry
-                                    : app::strings::table_no_columns);
-    table_view = TableEmptyState(empty_res);
+    if (model.loading) {
+      table_view = LoadingState(app::strings::table_loading);
+    } else {
+      table_view = TableEmptyState(!model.error.empty() ? app::strings::table_load_failed_retry
+                                                        : app::strings::table_no_columns);
+    }
   } else {
     const std::shared_ptr<const GridSnapshot> snapshot = model.snapshot;
     const std::vector<PendingInsertRow> drafts = model.pending_inserts;
@@ -4240,7 +4437,7 @@ struct SidebarConnectionEntry {
         .selected_cell = tab->selected_cell,
     };
 
-    table_view =
+    View grid =
         DataTable(std::move(options))
             .On<DataTableEvents::SortRequested>(
                 [app, workspace, tasks, tab_id, notify,
@@ -4252,18 +4449,23 @@ struct SidebarConnectionEntry {
                   if (cur == nullptr) {
                     return;
                   }
-                  DataTableSort next = requested;
-                  if (cur->table.sort.has_value() &&
-                      cur->table.sort->column_id == requested.column_id) {
-                    next.direction =
-                        cur->table.sort->direction == DataTableSortDirection::Ascending
-                            ? DataTableSortDirection::Descending
-                            : DataTableSortDirection::Ascending;
+                  std::optional<DataTableSort> next;
+                  if (!cur->table.sort.has_value() ||
+                      cur->table.sort->column_id != requested.column_id) {
+                    next = DataTableSort{
+                        .column_id = requested.column_id,
+                        .direction = DataTableSortDirection::Ascending,
+                    };
+                  } else if (cur->table.sort->direction == DataTableSortDirection::Ascending) {
+                    next = DataTableSort{
+                        .column_id = requested.column_id,
+                        .direction = DataTableSortDirection::Descending,
+                    };
                   } else {
-                    next.direction = DataTableSortDirection::Ascending;
+                    next = std::nullopt;
                   }
-                  RequestLoadTable(app, workspace, tasks, tab_id, 0, next, cur->table.filter,
-                                   false, notify);
+                  RequestLoadTable(app, workspace, tasks, tab_id, 0, std::move(next),
+                                   cur->table.filter, false, notify);
                 })
             .On<DataTableEvents::SelectionRequested>(
                 [workspace, tab_id](const DataTableCellId& cell) {
@@ -4292,9 +4494,14 @@ struct SidebarConnectionEntry {
                     }
                   });
                 })
-            .With(Grow(1.0F), Border{semantic.border_subtle, 1.0F})
+            .With(Border{semantic.border_subtle, 1.0F})
             .Key("table-grid-" + std::to_string(tab_id) + "-" +
                  std::to_string(model.snapshot_version));
+    const bool table_busy = model.loading || model.committing;
+    const StringVariant table_busy_label =
+        model.committing ? StringVariant(app::strings::table_committing)
+                         : StringVariant(app::strings::table_loading);
+    table_view = LoadingOverlay(std::move(grid), table_busy, table_busy_label).With(Grow(1.0F));
   }
 
   return Column{
@@ -4487,39 +4694,46 @@ struct SidebarConnectionEntry {
   };
 
   View result_view;
-  if (sql_model.result) {
-    const std::shared_ptr<const GridSnapshot> snapshot = sql_model.result->snapshot;
-    if (snapshot && !sql_model.result->columns.empty()) {
-      const std::uint64_t result_id = sql_model.result->id;
-      DataTableOptions options{
-          .rows = MakeRows(snapshot),
-          .columns = BuildReadOnlyColumns(sql_model.result->columns, snapshot,
-                                          sql_model.column_widths, spec.colors.on_surface,
-                                          semantic.null_text),
-          .row_height = 30.0F,
-          .header_height = 32.0F,
-          .frozen_column_count = 0,
-          .sort = std::nullopt,
-          .selected_cell = std::nullopt,
-      };
-      result_view = DataTable(std::move(options))
-                        .On<DataTableEvents::ColumnResized>(
-                            [workspace, tab_id, result_id](const DataTableColumnResize& resize) {
-                              workspace.Update([&](WorkspaceModel& ws) {
-                                if (WorkspaceTab* target = ws.FindTab(tab_id);
-                                    target != nullptr && target->sql.result &&
-                                    target->sql.result->id == result_id) {
-                                  target->sql.column_widths[resize.column_id] = resize.width;
-                                }
-                              });
-                            })
-                        .With(Grow(1.0F), Border{semantic.border_subtle, 1.0F})
-                        .Key("sql-result-" + std::to_string(result_id));
-    } else {
-      result_view = TableEmptyState(sql_model.status);
-    }
+  if (sql_model.running && !sql_model.result) {
+    result_view = LoadingState(app::strings::sql_running);
   } else {
-    result_view = TableEmptyState(app::strings::sql_empty_prompt);
+    View base_result;
+    if (sql_model.result) {
+      const std::shared_ptr<const GridSnapshot> snapshot = sql_model.result->snapshot;
+      if (snapshot && !sql_model.result->columns.empty()) {
+        const std::uint64_t result_id = sql_model.result->id;
+        DataTableOptions options{
+            .rows = MakeRows(snapshot),
+            .columns = BuildReadOnlyColumns(sql_model.result->columns, snapshot,
+                                            sql_model.column_widths, spec.colors.on_surface,
+                                            semantic.null_text),
+            .row_height = 30.0F,
+            .header_height = 32.0F,
+            .frozen_column_count = 0,
+            .sort = std::nullopt,
+            .selected_cell = std::nullopt,
+        };
+        base_result = DataTable(std::move(options))
+                          .On<DataTableEvents::ColumnResized>(
+                              [workspace, tab_id, result_id](const DataTableColumnResize& resize) {
+                                workspace.Update([&](WorkspaceModel& ws) {
+                                  if (WorkspaceTab* target = ws.FindTab(tab_id);
+                                      target != nullptr && target->sql.result &&
+                                      target->sql.result->id == result_id) {
+                                    target->sql.column_widths[resize.column_id] = resize.width;
+                                  }
+                                });
+                              })
+                          .With(Border{semantic.border_subtle, 1.0F})
+                          .Key("sql-result-" + std::to_string(result_id));
+      } else {
+        base_result = TableEmptyState(sql_model.status);
+      }
+    } else {
+      base_result = TableEmptyState(app::strings::sql_empty_prompt);
+    }
+    result_view = LoadingOverlay(std::move(base_result), sql_model.running, app::strings::sql_running)
+                      .With(Grow(1.0F));
   }
 
   return Column{
@@ -4978,7 +5192,7 @@ struct SidebarConnectionEntry {
       return NavItem(UseString(title_res), url, false, [open_link, url] { open_link(url); },
                      TintedIcon(app::images::external_link, spec.colors.primary, 16.0F),
                      std::nullopt,
-                     TintedIcon(app::images::info, spec.colors.on_surface_variant, 16.0F));
+                     TintedIcon(app::images::github, spec.colors.on_surface, 18.0F));
     };
 
     right_pane = Column{
@@ -5006,6 +5220,8 @@ struct SidebarConnectionEntry {
         link_row(app::strings::settings_about_link_dbpp, app::strings::settings_about_link_dbpp_sub),
         link_row(app::strings::settings_about_link_huxerui,
                  app::strings::settings_about_link_huxerui_sub),
+        link_row(app::strings::settings_about_link_datatable,
+                 app::strings::settings_about_link_datatable_sub),
         link_row(app::strings::settings_about_link_adbc, app::strings::settings_about_link_adbc_sub),
         MutedText(UseString(app::strings::settings_footer)),
     }.With(Frame{.max_width = 640.0F}, Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch});
@@ -5275,13 +5491,16 @@ struct SidebarConnectionEntry {
       TitleBarButton(UseString(app::strings::nav_new_connection),
                      [open_new] {
                        open_new();
-                     }),
+                     },
+                     false, &app::images::add_connection),
       TitleBarButton(UseString(app::strings::nav_new_query), open_new_query,
-                     active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Sql),
+                     active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Sql,
+                     &app::images::sql_console),
       TitleBarButton(UseString(app::strings::nav_driver_manager),
                      [open_manager] {
                        open_manager(1, {});
-                     }),
+                     },
+                     false, &app::images::drivers),
       Spacer(),
       std::move(gear_button),
   }.With(Padding{EdgeInsets::Symmetric(10.0F, 0.0F)}, Spacing{6.0F},
@@ -5449,7 +5668,8 @@ struct SidebarConnectionEntry {
   View page_content = Row{
       Sidebar(app, workspace, profiles, profiles_path, tasks, notify, theme_config,
               language_mode, system_dark, connect_profile),
-      std::move(main_content).With(Grow(1.0F)),
+      LoadingOverlay(std::move(main_content), !model.status.empty(), model.status)
+          .With(Grow(1.0F)),
   }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch});
 
   const float strip_h = semantic.uses_gradient_chrome ? 2.0F : 1.0F;
@@ -5475,10 +5695,7 @@ struct SidebarConnectionEntry {
       resources ? resources->Configuration().locale : Locale::Default();
   const Locale effective = EffectiveLocale(mode, platform_locale);
   SetActiveUiLanguage(ResolveUiLanguage(mode, effective.LanguageTag()));
-  if (auto override_locale = EffectiveLocaleOverride(mode)) {
-    return ProvideEnvironment(*override_locale, AppContent());
-  }
-  return AppContent();
+  return ProvideEnvironment(effective, AppContent());
 }
 
 } // namespace dbpp

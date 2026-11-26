@@ -896,6 +896,43 @@ void TestSqlFilterNormalizationAndFiltering(const fs::path& dir, const std::stri
       dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, 50, std::nullopt, "   ");
   Expect(cleared.error.empty() && cleared.total == 3 && cleared.filter.empty(),
          "Clearing filter should restore all 3 rows");
+
+  Expect(dbpp::kPageSize == 100, "Default page size should be 100");
+  const dbpp::TableModel page0 =
+      dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, 2, std::nullopt, {});
+  Expect(page0.error.empty() && page0.total == 3 && page0.page == 0 && page0.page_size == 2 &&
+             page0.snapshot && page0.snapshot->rows.size() == 2,
+         "Page 0 with page_size=2 should return 2 rows");
+  const dbpp::TableModel page1 =
+      dbpp::LoadTableBlocking(*opened.session, 1, obj, 1, 2, std::nullopt, {});
+  Expect(page1.error.empty() && page1.total == 3 && page1.page == 1 && page1.page_size == 2 &&
+             page1.snapshot && page1.snapshot->rows.size() == 1,
+         "Page 1 with page_size=2 should return 1 row");
+  const dbpp::TableModel default_page =
+      dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, dbpp::kPageSize, std::nullopt, {});
+  Expect(default_page.error.empty() && default_page.page_size == 100 &&
+             default_page.snapshot && default_page.snapshot->rows.size() == 3,
+         "Default page size=100 should return all 3 rows");
+
+  using SortSpec = std::remove_cvref_t<decltype(*default_page.sort)>;
+  using SortDir = decltype(SortSpec::direction);
+
+  const dbpp::TableModel sort_desc = dbpp::LoadTableBlocking(
+      *opened.session, 1, obj, 0, dbpp::kPageSize,
+      SortSpec{.column_id = "price", .direction = SortDir::Descending}, {});
+  Expect(sort_desc.error.empty() && sort_desc.sort.has_value() && sort_desc.snapshot &&
+             sort_desc.snapshot->rows.size() == 3 &&
+             sort_desc.snapshot->rows[0].values[1].text == "Banana" &&
+             sort_desc.snapshot->rows[2].values[1].text == "Apple",
+         "Descending sort on price should order Banana first and Apple last");
+
+  const dbpp::TableModel sort_asc = dbpp::LoadTableBlocking(
+      *opened.session, 1, obj, 0, dbpp::kPageSize,
+      SortSpec{.column_id = "name", .direction = SortDir::Ascending}, {});
+  Expect(sort_asc.error.empty() && sort_asc.sort.has_value() && sort_asc.snapshot &&
+             sort_asc.snapshot->rows.size() == 3 &&
+             sort_asc.snapshot->rows[0].values[1].text == "Apple",
+         "Ascending sort on name should put Apple first");
 }
 
 void TestEditTableDdlGenerationAndExecution(const fs::path& dir, const std::string& driver_path) {

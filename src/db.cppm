@@ -114,7 +114,8 @@ void RequestLoadTable(const huxerui::State<AppModel>& app,
                       const huxerui::State<WorkspaceModel>& workspace,
                       const huxerui::TaskScope& tasks, std::uint64_t tab_id,
                       std::int64_t page, std::optional<huxerui::DataTableSort> sort,
-                      std::string filter, bool keep_selection, NotifyFn notify);
+                      std::string filter, bool keep_selection, NotifyFn notify,
+                      std::int64_t page_size = 0);
 void RequestSaveCell(const huxerui::State<AppModel>& app,
                      const huxerui::State<WorkspaceModel>& workspace,
                      const huxerui::TaskScope& tasks, std::uint64_t tab_id,

@@ -764,7 +764,7 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
 void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                       const TaskScope& tasks, std::uint64_t tab_id, std::int64_t page,
                       std::optional<DataTableSort> sort, std::string filter,
-                      bool keep_selection, NotifyFn notify) {
+                      bool keep_selection, NotifyFn notify, std::int64_t page_size) {
   const WorkspaceModel& ws_snapshot = workspace.Get();
   const WorkspaceTab* tab = ws_snapshot.FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
@@ -774,6 +774,9 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
   const std::uint64_t session_id = tab->session_id;
   const std::string object_name = tab->object_name;
   const std::string object_schema = tab->object_schema;
+  const std::int64_t effective_page_size =
+      page_size > 0 ? page_size
+                    : (tab->table.page_size > 0 ? tab->table.page_size : kPageSize);
 
   const AppModel& model = app.Get();
   const DbSession* session = FindSession(model, session_id);
@@ -819,13 +822,13 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
   DbObject object_copy = *object;
 
   tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session, tab_id, session_id,
-                object_copy = std::move(object_copy), object_name, object_schema, page, sort,
-                filter]() mutable -> Task<void> {
+                object_copy = std::move(object_copy), object_name, object_schema, page,
+                effective_page_size, sort, filter]() mutable -> Task<void> {
     TableModel result = co_await adbc_session->sequence.Run(
-        [adbc_session, session_id, object_copy = std::move(object_copy), page, sort, filter](
-            std::stop_token) mutable {
+        [adbc_session, session_id, object_copy = std::move(object_copy), page,
+         effective_page_size, sort, filter](std::stop_token) mutable {
           return LoadTableBlocking(*adbc_session, session_id, std::move(object_copy), page,
-                                   kPageSize, sort, filter);
+                                   effective_page_size, sort, filter);
         });
 
     const bool load_lost = result.connection_lost;

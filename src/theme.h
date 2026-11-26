@@ -21,7 +21,8 @@ huxerui::View StatusBadge(std::string text, huxerui::Color foreground,
                           huxerui::Color background,
                           huxerui::Color border = huxerui::Color::Transparent());
 huxerui::View TitleBarButton(std::string label, std::function<void()> on_click,
-                             bool active = false);
+                             bool active = false,
+                             const huxerui::ImageResource* leading_icon = nullptr);
 huxerui::View NavItem(std::string label, std::string detail, bool selected,
                       std::function<void()> on_click, huxerui::View trailing = {},
                       std::optional<huxerui::Color> accent_dot = std::nullopt,
@@ -39,6 +40,7 @@ struct TreeRowOptions {
   std::optional<huxerui::Color> prefix_color{};
   std::optional<huxerui::Color> status_dot{};
   huxerui::View leading_icon{};
+  std::optional<bool> expanded{};
 };
 
 huxerui::View TreeRow(TreeRowOptions options, std::function<void()> on_click = {});
@@ -65,5 +67,8 @@ huxerui::View PasswordField(huxerui::State<huxerui::TextEditingValue> value,
                             huxerui::StringVariant label,
                             std::function<void()> on_submitted = {});
 huxerui::View DialogCard(huxerui::View content);
+huxerui::View LoadingState(huxerui::StringVariant label = {});
+huxerui::View LoadingOverlay(huxerui::View content, bool loading,
+                             huxerui::StringVariant label = {});
 
 } // namespace dbpp::ui
