@@ -94,6 +94,8 @@ struct SqlLimitRewriteResult {
                                                           std::string_view sql,
                                                           std::int64_t page_size,
                                                           std::int64_t page = 0);
+[[nodiscard]] std::string FormatExecutionDuration(std::int64_t elapsed_us);
+[[nodiscard]] std::string CompactSqlPreview(std::string_view sql, std::size_t max_bytes = 240);
 [[nodiscard]] std::string SingleLineCellPreview(std::string_view text);
 [[nodiscard]] float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
                                            const GridSnapshot* snapshot);

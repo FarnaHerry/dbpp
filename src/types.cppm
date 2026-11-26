@@ -206,6 +206,8 @@ struct TableModel {
   bool connection_lost = false;
   std::string error;
   std::string message;
+  std::string executed_sql;
+  std::int64_t elapsed_us = -1;
   std::vector<PendingInsertRow> pending_inserts;
   std::uint64_t next_draft_id = 1;
   bool committing = false;
@@ -229,6 +231,8 @@ struct SqlModel {
   bool has_next_page = false;
   std::string last_sql;
   std::string last_database;
+  std::string last_executed_sql;
+  std::int64_t last_elapsed_us = -1;
   std::shared_ptr<const QueryResult> result;
   std::unordered_map<std::string, float> column_widths;
   std::uint64_t next_result_id = 1;
@@ -350,6 +354,7 @@ struct AdbcQueryResult {
   std::vector<std::string> columns;
   std::vector<GridRow> rows;
   std::int64_t affected = -1;
+  std::int64_t elapsed_us = -1;
   bool truncated = false;
   bool connection_lost = false;
   std::string error;

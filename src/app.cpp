@@ -28,7 +28,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.3.5"
+#define DBPP_VERSION "0.3.6"
 #endif
 
 #include "theme_palette.h"
@@ -2432,6 +2432,7 @@ struct SidebarConnectionEntry {
       const bool is_view = object.is_view;
       const std::string qualified =
           is_redis ? object.name : QualifiedName(session.dialect, object);
+      const std::string open_in_sql = "SELECT * FROM " + qualified + ";";
       const std::string select_sql = "SELECT * FROM " + qualified + " LIMIT 100;";
       const std::string drop_sql = BuildDropObjectSql(session.dialect, object);
       const StringResource kind_res = ObjectKindResource(object);
@@ -2537,7 +2538,7 @@ struct SidebarConnectionEntry {
               .On<ViewEvents::ContextMenuRequested>(
                   [menu, loc, open_object, app, workspace, open_schema_dialog,
                    open_edit_table_dialog, copy_text, refresh_session, open_drop_dialog,
-                   session_id, select_sql, display_label, kind_res, is_redis,
+                   session_id, open_in_sql, select_sql, display_label, kind_res, is_redis,
                    is_editable_table, redis_db_index](Point position) {
                     if (is_redis) {
                       menu.ShowAt(position, {
@@ -2570,8 +2571,8 @@ struct SidebarConnectionEntry {
                         MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse), open_object));
                     entries.emplace_back(MenuItem(
                         loc.Get(app::strings::sidebar_ctx_open_in_sql),
-                        [app, workspace, session_id, select_sql, display_label] {
-                          (void)OpenSqlTab(app, workspace, session_id, select_sql,
+                        [app, workspace, session_id, open_in_sql, display_label] {
+                          (void)OpenSqlTab(app, workspace, session_id, open_in_sql,
                                            "SQL · " + display_label);
                         }));
                     entries.emplace_back(MenuItem(
@@ -3808,10 +3809,10 @@ struct SidebarConnectionEntry {
       return;
     }
     invalid = false;
-    popup.Dismiss();
     if (on_apply) {
       on_apply(*parsed);
     }
+    popup.Dismiss();
   };
 
   static constexpr std::int64_t kPresets[] = {50, 100, 200, 500, 1000};
@@ -3821,10 +3822,10 @@ struct SidebarConnectionEntry {
     preset_rows.Add(NavItem(UseString(app::strings::table_page_size_option, preset_size), {},
                             preset_size == initial,
                             [on_apply, popup, preset_size] {
-                              popup.Dismiss();
                               if (on_apply) {
                                 on_apply(preset_size);
                               }
+                              popup.Dismiss();
                             })
                         .Key("page-size-opt-" + std::to_string(preset_size)));
   }
@@ -3853,6 +3854,51 @@ struct SidebarConnectionEntry {
   }.With(Frame{.width = 270.0F}, Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch},
          Background{VisualFill{spec.colors.surface_container_highest}}, CornerRadius{10.0F},
          Border{semantic.border_subtle, 1.0F}, Padding{EdgeInsets::Symmetric(10.0F, 10.0F)});
+}
+
+[[huxerui::composable]] View AuditDurationBadge(std::int64_t elapsed_us) {
+  const ThemeSpec& spec = UseTheme();
+  const std::string text = FormatExecutionDuration(elapsed_us);
+  if (text.empty()) {
+    return View{};
+  }
+  return Text(text)
+      .Style(TextStyle{Font::Monospace(font_size::kCaption).WithWeight(FontWeight::Medium),
+                       spec.colors.primary})
+      .LineLimit(1)
+      .With(Padding{EdgeInsets::Symmetric(6.0F, 2.0F)}, CornerRadius{5.0F},
+            Background{VisualFill{WithAlpha(spec.colors.primary, 0.10F)}},
+            LayoutPriority(1.0F));
+}
+
+[[huxerui::composable]] View AuditSqlBadge(std::string executed_sql, NotifyFn notify) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
+  const auto clipboard = UseApplication().Clipboard();
+  if (executed_sql.empty()) {
+    return View{};
+  }
+  const std::string preview = CompactSqlPreview(executed_sql);
+  return Row{
+      Text(preview)
+          .Style(TextStyle{Font::Monospace(font_size::kCaption), spec.colors.on_surface_variant})
+          .LineLimit(1)
+          .Overflow(TextOverflow::Ellipsis),
+  }
+      .With(Padding{EdgeInsets::Symmetric(7.0F, 3.0F)}, CrossAlign{CrossAxisAlignment::Center},
+            CornerRadius{5.0F}, Background{VisualFill{spec.colors.surface_container}},
+            Border{semantic.border_subtle, 1.0F}, Tooltip(StringVariant(executed_sql)))
+      .OnClick([clipboard, notify, loc, full_sql = std::move(executed_sql)] {
+        if (clipboard && clipboard->SupportsSynchronousText() && clipboard->WriteText(full_sql)) {
+          if (notify) {
+            notify(loc.Fmt(app::strings::toast_copied,
+                           loc.Get(app::strings::audit_copy_sql_label)));
+          }
+        } else if (notify) {
+          notify(loc.Get(app::strings::toast_clipboard_unsupported));
+        }
+      });
 }
 
 [[huxerui::composable]] View TableBrowserPage(
@@ -4290,7 +4336,8 @@ struct SidebarConnectionEntry {
       (void)settings->SetDefaultPageSize(clamped);
     }
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
-    if (cur == nullptr || cur->table.page_size == clamped) {
+    if (cur == nullptr || (cur->table.page_size == clamped && cur->table.page == 0 &&
+                           cur->table.snapshot != nullptr)) {
       return;
     }
     RequestLoadTable(app, workspace, tasks, tab_id, 0, cur->table.sort, cur->table.filter, false,
@@ -4340,29 +4387,33 @@ struct SidebarConnectionEntry {
           ? UseString(app::strings::table_pending_hint, model.pending_inserts.size())
           : (model.message.empty() ? UseString(app::strings::table_no_data) : model.message);
   View pager = Row{
-      MutedText(status_text),
+      AuditDurationBadge(model.elapsed_us),
+      MutedText(status_text).With(LayoutPriority(1.0F)),
       !model.filter.empty()
           ? StatusBadge(UseString(app::strings::table_active_filter, model.filter),
                         spec.colors.primary, spec.colors.primary_container,
                         WithAlpha(spec.colors.primary, 0.35F))
+                .With(LayoutPriority(1.0F))
           : View{},
-      model.read_only ? Chip(app::strings::table_read_only) : View{},
+      model.read_only ? Chip(app::strings::table_read_only).With(LayoutPriority(1.0F)) : View{},
+      AuditSqlBadge(model.executed_sql, notify),
       Spacer(),
-      std::move(page_size_selector),
+      std::move(page_size_selector).With(LayoutPriority(1.0F)),
       ActionButton(Button(app::strings::table_prev_page)
                        .OnClick([reload, model] {
                          if (model.page > 0) {
                            reload(model.page - 1, model.filter);
                          }
                        }))
-          .With(Enabled{model.page > 0 && model.pending_inserts.empty()}),
+          .With(Enabled{model.page > 0 && model.pending_inserts.empty()}, LayoutPriority(1.0F)),
       ActionButton(Button(app::strings::table_next_page)
                        .OnClick([reload, model, page_count] {
                          if (model.page + 1 < page_count) {
                            reload(model.page + 1, model.filter);
                          }
                        }))
-          .With(Enabled{model.page + 1 < page_count && model.pending_inserts.empty()}),
+          .With(Enabled{model.page + 1 < page_count && model.pending_inserts.empty()},
+                LayoutPriority(1.0F)),
   }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
 
   View table_view;
@@ -4586,6 +4637,240 @@ struct SidebarConnectionEntry {
 // SQL console
 // ---------------------------------------------------------------------------
 
+void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                        const std::shared_ptr<SettingsModel>& settings, std::uint64_t tab_id,
+                        const TaskScope& tasks, NotifyFn notify, const LocalizedCatalog& loc,
+                        std::int64_t requested_page, bool from_editor,
+                        std::int64_t override_page_size) {
+  const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
+  if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
+    return;
+  }
+  if (!from_editor && !cur_tab->sql.paginated) {
+    return;
+  }
+  const std::string text =
+      TrimmedSql(from_editor ? cur_tab->sql.editor.text : cur_tab->sql.last_sql);
+  if (text.empty()) {
+    return;
+  }
+  const std::int64_t clamped_page =
+      from_editor ? 0 : std::max<std::int64_t>(0, requested_page);
+  const std::uint64_t session_id = cur_tab->session_id;
+  std::shared_ptr<AdbcSession> adbc;
+  bool session_found = false;
+  bool session_is_redis = false;
+  Dialect session_dialect = Dialect::Generic;
+  std::string target_database = TrimmedSql(
+      from_editor
+          ? cur_tab->sql.target_database
+          : (cur_tab->sql.last_database.empty() ? cur_tab->sql.target_database
+                                                : cur_tab->sql.last_database));
+  for (const DbSession& open : app.Get().sessions) {
+    if (open.id == session_id) {
+      session_found = true;
+      adbc = open.session;
+      session_dialect = open.dialect;
+      session_is_redis = (open.dialect == Dialect::Redis);
+      if (target_database.empty()) {
+        target_database = DefaultSessionDatabase(open);
+      }
+      break;
+    }
+  }
+  if (!adbc || adbc->IsClosed()) {
+    if (session_found) {
+      HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
+    } else if (notify) {
+      notify(loc.Get(app::strings::toast_connection_closed));
+    }
+    return;
+  }
+
+  const std::int64_t configured_limit =
+      settings ? settings->default_page_size.Get() : kDefaultPageSize;
+  const std::int64_t active_limit =
+      override_page_size > 0
+          ? std::clamp(override_page_size, kMinPageSize, kMaxPageSize)
+          : (cur_tab->sql.page_size > 0 ? cur_tab->sql.page_size : configured_limit);
+
+  const std::string running_status = loc.Get(app::strings::sql_running);
+  workspace.Update([tab_id, running_status, active_limit](WorkspaceModel& ws) {
+    if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+      target->sql.page_size = active_limit;
+      target->sql.running = true;
+      target->sql.error.clear();
+      target->sql.status = running_status;
+    }
+  });
+
+  tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_dialect,
+                session_is_redis, text, target_database, active_limit, clamped_page,
+                from_editor, loc]() -> Task<void> {
+    if (session_is_redis || IsSqlReadStatement(text)) {
+      const SqlLimitRewriteResult rewritten =
+          session_is_redis
+              ? SqlLimitRewriteResult{}
+              : ApplyImplicitSqlLimit(session_dialect, text, active_limit, clamped_page);
+      const std::string exec_sql = rewritten.applied ? rewritten.sql : text;
+      const std::size_t max_rows =
+          session_is_redis
+              ? kMaxQueryRows
+              : (rewritten.applied
+                     ? static_cast<std::size_t>(rewritten.effective_limit)
+                     : std::max<std::size_t>(kMaxQueryRows,
+                                             static_cast<std::size_t>(active_limit)));
+      AdbcQueryResult result =
+          co_await ExecuteQueryAsync(adbc, exec_sql, true, max_rows, target_database);
+      if (result.connection_lost) {
+        const std::string message = result.error;
+        workspace.Update([tab_id](WorkspaceModel& ws) {
+          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+            target->sql.running = false;
+            target->sql.error.clear();
+            target->sql.status.clear();
+          }
+        });
+        HandleSessionDisconnected(app, workspace, tasks, session_id, message, notify);
+        co_return;
+      }
+      if (!result.error.empty()) {
+        const std::string message = result.error;
+        const std::int64_t elapsed_us = result.elapsed_us;
+        workspace.Update([tab_id, exec_sql, elapsed_us](WorkspaceModel& ws) {
+          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+            target->sql.last_executed_sql = exec_sql;
+            target->sql.last_elapsed_us = elapsed_us;
+            target->sql.running = false;
+            target->sql.error.clear();
+            target->sql.status.clear();
+          }
+        });
+        if (notify) {
+          notify(loc.Fmt(session_is_redis ? app::strings::sql_cmd_failed
+                                          : app::strings::sql_query_failed,
+                         message));
+        }
+        co_return;
+      }
+      auto query = std::make_shared<QueryResult>();
+      query->columns = std::move(result.columns);
+      query->snapshot =
+          std::make_shared<const GridSnapshot>(GridSnapshot{.rows = std::move(result.rows)});
+      query->truncated = result.truncated;
+      const std::int64_t elapsed_us = result.elapsed_us;
+      std::unordered_map<std::string, float> auto_widths;
+      auto_widths.reserve(query->columns.size());
+      for (std::size_t i = 0; i < query->columns.size(); ++i) {
+        auto_widths.emplace("result-" + std::to_string(i),
+                            ComputeAutoColumnWidth(query->columns[i], i, query->snapshot.get()));
+      }
+      const std::size_t rows = query->snapshot->rows.size();
+      const std::string returned_status =
+          rewritten.applied
+              ? loc.Fmt(query->truncated ? app::strings::sql_returned_rows_page_more
+                                         : app::strings::sql_returned_rows_page,
+                        rows, clamped_page + 1)
+              : loc.Fmt(query->truncated ? app::strings::sql_returned_rows_truncated
+                                         : app::strings::sql_returned_rows,
+                        rows);
+      const std::string redis_current_db =
+          (session_is_redis && adbc && adbc->redis)
+              ? ("db" + std::to_string(adbc->redis->CurrentDb()))
+              : std::string{};
+      workspace.Update([tab_id, query, returned_status, redis_current_db, rewritten, active_limit,
+                        clamped_page, from_editor, text, exec_sql, elapsed_us, target_database,
+                        auto_widths = std::move(auto_widths)](WorkspaceModel& ws) mutable {
+        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+          query->id = target->sql.next_result_id++;
+          const bool keep_widths = !from_editor && target->sql.result &&
+                                   target->sql.result->columns == query->columns;
+          target->sql.result = query;
+          if (!keep_widths) {
+            target->sql.column_widths = std::move(auto_widths);
+          }
+          target->sql.page_size = active_limit;
+          target->sql.page = rewritten.applied ? clamped_page : 0;
+          target->sql.paginated = rewritten.applied;
+          target->sql.has_next_page = rewritten.applied && query->truncated;
+          target->sql.last_sql = rewritten.applied ? text : std::string{};
+          target->sql.last_database = rewritten.applied ? target_database : std::string{};
+          target->sql.last_executed_sql = exec_sql;
+          target->sql.last_elapsed_us = elapsed_us;
+          target->sql.running = false;
+          target->sql.error.clear();
+          target->sql.status = returned_status;
+          if (!redis_current_db.empty()) {
+            target->sql.target_database = redis_current_db;
+          }
+        }
+      });
+      if (session_is_redis && !IsReadStatement(Dialect::Redis, text)) {
+        RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
+      }
+      co_return;
+    }
+
+    AdbcQueryResult executed =
+        co_await ExecuteQueryAsync(adbc, text, false, 0, target_database);
+    if (executed.connection_lost) {
+      const std::string message = executed.error;
+      workspace.Update([tab_id](WorkspaceModel& ws) {
+        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+          target->sql.running = false;
+          target->sql.error.clear();
+          target->sql.status.clear();
+        }
+      });
+      HandleSessionDisconnected(app, workspace, tasks, session_id, message, notify);
+      co_return;
+    }
+    if (!executed.error.empty()) {
+      const std::string message = executed.error;
+      const std::int64_t elapsed_us = executed.elapsed_us;
+      workspace.Update([tab_id, text, elapsed_us](WorkspaceModel& ws) {
+        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+          target->sql.last_executed_sql = text;
+          target->sql.last_elapsed_us = elapsed_us;
+          target->sql.running = false;
+          target->sql.error.clear();
+          target->sql.status.clear();
+        }
+      });
+      if (notify) {
+        notify(loc.Fmt(app::strings::sql_query_failed, message));
+      }
+      co_return;
+    }
+
+    const std::int64_t elapsed_us = executed.elapsed_us;
+    const std::string done_status =
+        executed.affected >= 0
+            ? loc.Fmt(app::strings::sql_affected_rows, executed.affected)
+            : loc.Get(app::strings::sql_exec_done);
+    workspace.Update([tab_id, done_status, text, elapsed_us](WorkspaceModel& ws) {
+      if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+        target->sql.result.reset();
+        target->sql.column_widths.clear();
+        target->sql.page = 0;
+        target->sql.paginated = false;
+        target->sql.has_next_page = false;
+        target->sql.last_sql.clear();
+        target->sql.last_database.clear();
+        target->sql.last_executed_sql = text;
+        target->sql.last_elapsed_us = elapsed_us;
+        target->sql.running = false;
+        target->sql.error.clear();
+        target->sql.status = done_status;
+      }
+    });
+    RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
+    if (notify) {
+      notify(loc.Fmt(app::strings::sql_toast_affected, executed.affected));
+    }
+  });
+}
+
 [[huxerui::composable]] View SqlPage(State<AppModel> app, State<WorkspaceModel> workspace,
                                      State<std::vector<ConnectionProfile>> profiles,
                                      std::uint64_t tab_id, TaskScope tasks, NotifyFn notify,
@@ -4642,219 +4927,8 @@ struct SidebarConnectionEntry {
   const auto execute_query = [app, workspace, settings, tab_id, tasks, notify,
                               loc](std::int64_t requested_page, bool from_editor,
                                    std::int64_t override_page_size) {
-    const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
-    if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
-      return;
-    }
-    if (!from_editor && !cur_tab->sql.paginated) {
-      return;
-    }
-    const std::string text =
-        TrimmedSql(from_editor ? cur_tab->sql.editor.text : cur_tab->sql.last_sql);
-    if (text.empty()) {
-      return;
-    }
-    const std::int64_t clamped_page =
-        from_editor ? 0 : std::max<std::int64_t>(0, requested_page);
-    const std::uint64_t session_id = cur_tab->session_id;
-    std::shared_ptr<AdbcSession> adbc;
-    bool session_found = false;
-    bool session_is_redis = false;
-    Dialect session_dialect = Dialect::Generic;
-    std::string target_database = TrimmedSql(
-        from_editor
-            ? cur_tab->sql.target_database
-            : (cur_tab->sql.last_database.empty() ? cur_tab->sql.target_database
-                                                  : cur_tab->sql.last_database));
-    for (const DbSession& open : app.Get().sessions) {
-      if (open.id == session_id) {
-        session_found = true;
-        adbc = open.session;
-        session_dialect = open.dialect;
-        session_is_redis = (open.dialect == Dialect::Redis);
-        if (target_database.empty()) {
-          target_database = DefaultSessionDatabase(open);
-        }
-        break;
-      }
-    }
-    if (!adbc || adbc->IsClosed()) {
-      if (session_found) {
-        HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-      } else if (notify) {
-        notify(loc.Get(app::strings::toast_connection_closed));
-      }
-      return;
-    }
-
-    const std::int64_t configured_limit =
-        settings ? settings->default_page_size.Get() : kDefaultPageSize;
-    const std::int64_t active_limit =
-        override_page_size > 0
-            ? std::clamp(override_page_size, kMinPageSize, kMaxPageSize)
-            : (cur_tab->sql.page_size > 0 ? cur_tab->sql.page_size : configured_limit);
-
-    const std::string running_status = loc.Get(app::strings::sql_running);
-    workspace.Update([tab_id, running_status](WorkspaceModel& ws) {
-      if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-        target->sql.running = true;
-        target->sql.error.clear();
-        target->sql.status = running_status;
-      }
-    });
-
-    tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_dialect,
-                  session_is_redis, text, target_database, active_limit, clamped_page,
-                  from_editor, loc]() -> Task<void> {
-      if (session_is_redis || IsSqlReadStatement(text)) {
-        const SqlLimitRewriteResult rewritten =
-            session_is_redis
-                ? SqlLimitRewriteResult{}
-                : ApplyImplicitSqlLimit(session_dialect, text, active_limit, clamped_page);
-        const std::string exec_sql = rewritten.applied ? rewritten.sql : text;
-        const std::size_t max_rows =
-            session_is_redis
-                ? kMaxQueryRows
-                : (rewritten.applied
-                       ? static_cast<std::size_t>(rewritten.effective_limit)
-                       : std::max<std::size_t>(kMaxQueryRows,
-                                               static_cast<std::size_t>(active_limit)));
-        AdbcQueryResult result =
-            co_await ExecuteQueryAsync(adbc, exec_sql, true, max_rows, target_database);
-        if (result.connection_lost) {
-          const std::string message = result.error;
-          workspace.Update([tab_id](WorkspaceModel& ws) {
-            if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-              target->sql.running = false;
-              target->sql.error.clear();
-              target->sql.status.clear();
-            }
-          });
-          HandleSessionDisconnected(app, workspace, tasks, session_id, message, notify);
-          co_return;
-        }
-        if (!result.error.empty()) {
-          const std::string message = result.error;
-          workspace.Update([tab_id](WorkspaceModel& ws) {
-            if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-              target->sql.running = false;
-              target->sql.error.clear();
-              target->sql.status.clear();
-            }
-          });
-          if (notify) {
-            notify(loc.Fmt(session_is_redis ? app::strings::sql_cmd_failed
-                                            : app::strings::sql_query_failed,
-                           message));
-          }
-          co_return;
-        }
-        auto query = std::make_shared<QueryResult>();
-        query->columns = std::move(result.columns);
-        query->snapshot = std::make_shared<const GridSnapshot>(
-            GridSnapshot{.rows = std::move(result.rows)});
-        query->truncated = result.truncated;
-        std::unordered_map<std::string, float> auto_widths;
-        auto_widths.reserve(query->columns.size());
-        for (std::size_t i = 0; i < query->columns.size(); ++i) {
-          auto_widths.emplace("result-" + std::to_string(i),
-                              ComputeAutoColumnWidth(query->columns[i], i, query->snapshot.get()));
-        }
-        const std::size_t rows = query->snapshot->rows.size();
-        const std::string returned_status =
-            rewritten.applied
-                ? loc.Fmt(query->truncated ? app::strings::sql_returned_rows_page_more
-                                           : app::strings::sql_returned_rows_page,
-                          rows, clamped_page + 1)
-                : loc.Fmt(query->truncated ? app::strings::sql_returned_rows_truncated
-                                           : app::strings::sql_returned_rows,
-                          rows);
-        const std::string redis_current_db =
-            (session_is_redis && adbc && adbc->redis)
-                ? ("db" + std::to_string(adbc->redis->CurrentDb()))
-                : std::string{};
-        workspace.Update([tab_id, query, returned_status, redis_current_db, rewritten, clamped_page,
-                          from_editor, text, target_database,
-                          auto_widths = std::move(auto_widths)](WorkspaceModel& ws) mutable {
-          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-            query->id = target->sql.next_result_id++;
-            const bool keep_widths = !from_editor && target->sql.result &&
-                                     target->sql.result->columns == query->columns;
-            target->sql.result = query;
-            if (!keep_widths) {
-              target->sql.column_widths = std::move(auto_widths);
-            }
-            target->sql.page = rewritten.applied ? clamped_page : 0;
-            target->sql.paginated = rewritten.applied;
-            target->sql.has_next_page = rewritten.applied && query->truncated;
-            target->sql.last_sql = rewritten.applied ? text : std::string{};
-            target->sql.last_database = rewritten.applied ? target_database : std::string{};
-            target->sql.running = false;
-            target->sql.error.clear();
-            target->sql.status = returned_status;
-            if (!redis_current_db.empty()) {
-              target->sql.target_database = redis_current_db;
-            }
-          }
-        });
-        if (session_is_redis && !IsReadStatement(Dialect::Redis, text)) {
-          RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
-        }
-        co_return;
-      }
-
-      AdbcQueryResult executed =
-          co_await ExecuteQueryAsync(adbc, text, false, 0, target_database);
-      if (executed.connection_lost) {
-        const std::string message = executed.error;
-        workspace.Update([tab_id](WorkspaceModel& ws) {
-          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-            target->sql.running = false;
-            target->sql.error.clear();
-            target->sql.status.clear();
-          }
-        });
-        HandleSessionDisconnected(app, workspace, tasks, session_id, message, notify);
-        co_return;
-      }
-      if (!executed.error.empty()) {
-        const std::string message = executed.error;
-        workspace.Update([tab_id](WorkspaceModel& ws) {
-          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-            target->sql.running = false;
-            target->sql.error.clear();
-            target->sql.status.clear();
-          }
-        });
-        if (notify) {
-          notify(loc.Fmt(app::strings::sql_query_failed, message));
-        }
-        co_return;
-      }
-
-      const std::string done_status =
-          executed.affected >= 0
-              ? loc.Fmt(app::strings::sql_affected_rows, executed.affected)
-              : loc.Get(app::strings::sql_exec_done);
-      workspace.Update([tab_id, done_status](WorkspaceModel& ws) {
-        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-          target->sql.result.reset();
-          target->sql.column_widths.clear();
-          target->sql.page = 0;
-          target->sql.paginated = false;
-          target->sql.has_next_page = false;
-          target->sql.last_sql.clear();
-          target->sql.last_database.clear();
-          target->sql.running = false;
-          target->sql.error.clear();
-          target->sql.status = done_status;
-        }
-      });
-      RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
-      if (notify) {
-        notify(loc.Fmt(app::strings::sql_toast_affected, executed.affected));
-      }
-    });
+    ExecuteSqlTabQuery(app, workspace, settings, tab_id, tasks, notify, loc, requested_page,
+                       from_editor, override_page_size);
   };
   const auto run = [execute_query] { execute_query(0, true, 0); };
 
@@ -5116,28 +5190,35 @@ struct SidebarConnectionEntry {
                   Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
                   limit_anchor, Enabled{!sql_model.running})
             .OnClick([limit_popup, limit_anchor, workspace, tab_id, settings, execute_query,
-                      effective_page_size, session_connected, theme_config, language_mode,
-                      system_dark] {
-              const auto apply_limit = [workspace, tab_id, settings, execute_query,
-                                        effective_page_size,
-                                        session_connected](std::int64_t next_size) {
+                      effective_page_size, theme_config, language_mode, system_dark] {
+              const auto apply_limit = [workspace, tab_id, settings,
+                                        execute_query](std::int64_t next_size) {
                 const std::int64_t clamped = std::clamp(next_size, kMinPageSize, kMaxPageSize);
-                bool should_reload = false;
-                workspace.Update([tab_id, clamped, effective_page_size,
-                                  &should_reload](WorkspaceModel& ws) {
+                enum class ReloadKind { None, LastSql, EditorSql };
+                ReloadKind reload_kind = ReloadKind::None;
+                workspace.Update([tab_id, clamped, &reload_kind](WorkspaceModel& ws) {
                   if (WorkspaceTab* target = ws.FindTab(tab_id);
                       target != nullptr && target->kind == WorkspaceTabKind::Sql) {
                     target->sql.page_size = clamped;
-                    should_reload = target->sql.paginated && !target->sql.last_sql.empty() &&
-                                    !target->sql.running &&
-                                    (effective_page_size != clamped || target->sql.page != 0);
+                    if (!target->sql.running) {
+                      if (target->sql.paginated && !target->sql.last_sql.empty()) {
+                        reload_kind = ReloadKind::LastSql;
+                      } else if (target->sql.result != nullptr) {
+                        const std::string editor_sql = TrimmedSql(target->sql.editor.text);
+                        if (!editor_sql.empty() && IsSqlReadStatement(editor_sql)) {
+                          reload_kind = ReloadKind::EditorSql;
+                        }
+                      }
+                    }
                   }
                 });
                 if (settings) {
                   (void)settings->SetDefaultPageSize(clamped);
                 }
-                if (should_reload && session_connected) {
+                if (reload_kind == ReloadKind::LastSql) {
                   execute_query(0, false, clamped);
+                } else if (reload_kind == ReloadKind::EditorSql) {
+                  execute_query(0, true, clamped);
                 }
               };
               limit_popup.Show(
@@ -5165,9 +5246,11 @@ struct SidebarConnectionEntry {
   View sql_footer =
       !is_redis
           ? Row{
-                MutedText(status_display),
+                AuditDurationBadge(sql_model.last_elapsed_us),
+                MutedText(status_display).With(LayoutPriority(1.0F)),
+                AuditSqlBadge(sql_model.last_executed_sql, notify),
                 Spacer(),
-                std::move(sql_limit_selector),
+                std::move(sql_limit_selector).With(LayoutPriority(1.0F)),
                 ActionButton(Button(app::strings::table_prev_page)
                                  .OnClick([execute_query, sql_model] {
                                    if (sql_model.paginated && sql_model.page > 0) {
@@ -5175,7 +5258,8 @@ struct SidebarConnectionEntry {
                                    }
                                  }))
                     .With(Enabled{!sql_model.running && session_connected &&
-                                  sql_model.paginated && sql_model.page > 0}),
+                                  sql_model.paginated && sql_model.page > 0},
+                          LayoutPriority(1.0F)),
                 ActionButton(Button(app::strings::table_next_page)
                                  .OnClick([execute_query, sql_model] {
                                    if (sql_model.paginated && sql_model.has_next_page) {
@@ -5183,10 +5267,13 @@ struct SidebarConnectionEntry {
                                    }
                                  }))
                     .With(Enabled{!sql_model.running && session_connected &&
-                                  sql_model.paginated && sql_model.has_next_page}),
+                                  sql_model.paginated && sql_model.has_next_page},
+                          LayoutPriority(1.0F)),
             }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F})
           : Row{
-                MutedText(status_display),
+                AuditDurationBadge(sql_model.last_elapsed_us),
+                MutedText(status_display).With(LayoutPriority(1.0F)),
+                AuditSqlBadge(sql_model.last_executed_sql, notify),
                 Spacer(),
             }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
 
@@ -5207,7 +5294,7 @@ struct SidebarConnectionEntry {
           TextField(sql_model.editor)
               .Label(is_redis ? app::strings::sql_label_redis : app::strings::sql_label_sql)
               .Placeholder(is_redis ? StringVariant(app::strings::sql_ph_redis)
-                                    : StringVariant("SELECT * FROM table LIMIT 100;"))
+                                    : StringVariant("SELECT * FROM table;"))
               .Variant(TextFieldVariant::Outlined)
               .LineLimits(TextFieldLineLimits::MultiLine(6, 12))
               .OnChanged([workspace, tab_id](const TextEditingValue& value) {
@@ -5312,7 +5399,8 @@ struct SidebarConnectionEntry {
          Border{semantic.border_subtle, 1.0F}, Padding{EdgeInsets::Symmetric(12.0F, 12.0F)});
 }
 
-[[huxerui::composable]] View SettingsPage(NotifyFn notify) {
+[[huxerui::composable]] View SettingsPage(NotifyFn notify,
+                                          std::function<void(std::int64_t)> on_page_size_applied = {}) {
   const auto settings = UseService<SettingsModel>();
   const auto mcp_service = UseService<McpServerService>();
   const LocalizedCatalog loc{UseService<Resources>(), settings};
@@ -5485,7 +5573,8 @@ struct SidebarConnectionEntry {
         Divider(),
         Caption(UseString(app::strings::settings_section_query)),
         [&]() -> View {
-          const auto apply_page_size = [settings, page_size_input, notify, loc] {
+          const auto apply_page_size = [settings, page_size_input, notify, loc,
+                                        on_page_size_applied] {
             const std::optional<std::int64_t> parsed =
                 TryParsePageSize(page_size_input.Get().text);
             if (!parsed.has_value()) {
@@ -5496,6 +5585,9 @@ struct SidebarConnectionEntry {
             }
             (void)settings->SetDefaultPageSize(*parsed);
             page_size_input = TextEditingValue::FromText(std::to_string(*parsed));
+            if (on_page_size_applied) {
+              on_page_size_applied(*parsed);
+            }
             if (notify) {
               notify(loc.Fmt(app::strings::toast_page_size_applied, *parsed));
             }
@@ -6153,7 +6245,45 @@ struct SidebarConnectionEntry {
     if (active_tab == nullptr) {
       active_body = TableEmptyState(app::strings::empty_select_object);
     } else if (active_tab->kind == WorkspaceTabKind::Settings) {
-      active_body = SettingsPage(notify).Key("tab-body-settings");
+      const auto apply_global_page_size = [app, workspace, settings_model, tasks, notify,
+                                           loc](std::int64_t next_size) {
+        const std::int64_t clamped = std::clamp(next_size, kMinPageSize, kMaxPageSize);
+        app.Update([clamped](AppModel& m) { m.default_page_size = clamped; });
+        struct PendingTableReload {
+          std::uint64_t tab_id = 0;
+          std::optional<DataTableSort> sort;
+          std::string filter;
+        };
+        std::vector<PendingTableReload> table_reloads;
+        std::vector<std::uint64_t> sql_reloads;
+        workspace.Update([clamped, &table_reloads, &sql_reloads](WorkspaceModel& w) {
+          for (WorkspaceTab& tab : w.tabs) {
+            if (tab.kind == WorkspaceTabKind::Table) {
+              if (tab.table.pending_inserts.empty()) {
+                table_reloads.push_back(PendingTableReload{
+                    .tab_id = tab.id,
+                    .sort = tab.table.sort,
+                    .filter = tab.table.filter,
+                });
+              }
+            } else if (tab.kind == WorkspaceTabKind::Sql) {
+              tab.sql.page_size = clamped;
+              if (!tab.sql.running && tab.sql.paginated && !tab.sql.last_sql.empty()) {
+                sql_reloads.push_back(tab.id);
+              }
+            }
+          }
+        });
+        for (const PendingTableReload& item : table_reloads) {
+          RequestLoadTable(app, workspace, tasks, item.tab_id, 0, item.sort, item.filter, false,
+                           notify, clamped);
+        }
+        for (const std::uint64_t sql_tab_id : sql_reloads) {
+          ExecuteSqlTabQuery(app, workspace, settings_model, sql_tab_id, tasks, notify, loc, 0,
+                             false, clamped);
+        }
+      };
+      active_body = SettingsPage(notify, apply_global_page_size).Key("tab-body-settings");
     } else if (active_tab->kind == WorkspaceTabKind::Table) {
       active_body = TableBrowserPage(app, workspace, active_tab->id, tasks, notify,
                                      theme_config, language_mode, system_dark)

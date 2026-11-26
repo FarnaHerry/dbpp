@@ -1555,8 +1555,16 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
     result.error = Tr("Connection is closed", "连接已关闭");
     return result;
   }
+  const auto started = std::chrono::steady_clock::now();
+  const auto elapsed_micros = [started]() -> std::int64_t {
+    return std::max<std::int64_t>(
+        0, std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - started)
+               .count());
+  };
   if (session.dialect == Dialect::Redis && session.redis) {
     AdbcQueryResult result = ExecuteRedisCommandBlocking(*session.redis, sql, max_rows);
+    result.elapsed_us = elapsed_micros();
     if (!result.error.empty() &&
         (!session.redis->IsConnected() || IsConnectionLostError(0, result.error))) {
       result.connection_lost = true;
@@ -1586,6 +1594,7 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
         (!session.connection_created || IsConnectionLostError(status, result.error) ||
          !session.IsAlive())) {
       result.connection_lost = true;
+      result.elapsed_us = elapsed_micros();
       session.alive.store(false, std::memory_order_release);
       return result;
     }
@@ -1593,6 +1602,7 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
   if (result.error.empty()) {
     session.alive.store(true, std::memory_order_release);
   }
+  result.elapsed_us = elapsed_micros();
   return result;
 }
 

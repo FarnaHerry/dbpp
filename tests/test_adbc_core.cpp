@@ -901,13 +901,17 @@ void TestSqlFilterNormalizationAndFiltering(const fs::path& dir, const std::stri
   const dbpp::TableModel page0 =
       dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, 2, std::nullopt, {});
   Expect(page0.error.empty() && page0.total == 3 && page0.page == 0 && page0.page_size == 2 &&
-             page0.snapshot && page0.snapshot->rows.size() == 2,
-         "Page 0 with page_size=2 should return 2 rows");
+             page0.snapshot && page0.snapshot->rows.size() == 2 &&
+             page0.elapsed_us >= 0 &&
+             page0.executed_sql.find("LIMIT 2 OFFSET 0") != std::string::npos,
+         "Page 0 with page_size=2 should return 2 rows and populate audit SQL/duration");
   const dbpp::TableModel page1 =
       dbpp::LoadTableBlocking(*opened.session, 1, obj, 1, 2, std::nullopt, {});
   Expect(page1.error.empty() && page1.total == 3 && page1.page == 1 && page1.page_size == 2 &&
-             page1.snapshot && page1.snapshot->rows.size() == 1,
-         "Page 1 with page_size=2 should return 1 row");
+             page1.snapshot && page1.snapshot->rows.size() == 1 &&
+             page1.elapsed_us >= 0 &&
+             page1.executed_sql.find("LIMIT 2 OFFSET 2") != std::string::npos,
+         "Page 1 with page_size=2 should return 1 row and populate audit SQL/duration");
   const dbpp::TableModel default_page =
       dbpp::LoadTableBlocking(*opened.session, 1, obj, 0, dbpp::kPageSize, std::nullopt, {});
   Expect(default_page.error.empty() && default_page.page_size == 100 &&
@@ -1207,6 +1211,18 @@ void TestImplicitSqlLimitAndExecution(const fs::path& dir, const std::string& dr
            "INSERT item failed");
   }
 
+  Expect(dbpp::FormatExecutionDuration(-1).empty(), "Negative duration should format empty");
+  Expect(dbpp::FormatExecutionDuration(0) == "0.0 ms" &&
+             dbpp::FormatExecutionDuration(420) == "0.4 ms" &&
+             dbpp::FormatExecutionDuration(12340) == "12 ms" &&
+             dbpp::FormatExecutionDuration(1250000) == "1.25 s",
+         "FormatExecutionDuration unit formatting mismatch");
+  Expect(dbpp::CompactSqlPreview("SELECT *\n  FROM items\nLIMIT 6 OFFSET 5") ==
+             "SELECT * FROM items LIMIT 6 OFFSET 5",
+         "CompactSqlPreview whitespace normalization mismatch");
+  Expect(dbpp::CompactSqlPreview("SELECT abcdefghij", 10) == "SELECT abc...",
+         "CompactSqlPreview byte truncation mismatch");
+
   const auto limited =
       dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 5);
   Expect(limited.applied && limited.effective_offset == 0 &&
@@ -1214,7 +1230,7 @@ void TestImplicitSqlLimitAndExecution(const fs::path& dir, const std::string& dr
          "Expected implicit LIMIT 5 on page 0");
   const dbpp::AdbcQueryResult five =
       dbpp::ExecuteBlocking(*opened.session, limited.sql, true, 5);
-  Expect(five.error.empty() && five.rows.size() == 5 && five.truncated &&
+  Expect(five.error.empty() && five.elapsed_us >= 0 && five.rows.size() == 5 && five.truncated &&
              five.rows.front().values.front().text == "1" &&
              five.rows.back().values.front().text == "5",
          "Expected 5 rows (1..5) with truncated=true under implicit LIMIT 5 page 0");
@@ -1226,8 +1242,8 @@ void TestImplicitSqlLimitAndExecution(const fs::path& dir, const std::string& dr
          "Expected implicit LIMIT 5 OFFSET 5 on page 1");
   const dbpp::AdbcQueryResult five_p1 =
       dbpp::ExecuteBlocking(*opened.session, page1.sql, true, 5);
-  Expect(five_p1.error.empty() && five_p1.rows.size() == 5 && five_p1.truncated &&
-             five_p1.rows.front().values.front().text == "6" &&
+  Expect(five_p1.error.empty() && five_p1.elapsed_us >= 0 && five_p1.rows.size() == 5 &&
+             five_p1.truncated && five_p1.rows.front().values.front().text == "6" &&
              five_p1.rows.back().values.front().text == "10",
          "Expected 5 rows (6..10) with truncated=true under implicit LIMIT 5 page 1");
 

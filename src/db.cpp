@@ -414,6 +414,8 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
 
   AdbcQueryResult data = ExecuteBlocking(session, data_sql, true,
                                          static_cast<std::size_t>(model.page_size));
+  model.executed_sql = data_sql;
+  model.elapsed_us = data.elapsed_us;
   if (!data.error.empty() && data.rows.empty()) {
     model.connection_lost = data.connection_lost;
     model.error = data.error;
@@ -947,6 +949,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
     }
     target->table.loading = true;
     target->table.error.clear();
+    target->table.page_size = effective_page_size;
     if (!keep_selection) {
       target->selected_cell = std::nullopt;
     }
@@ -1479,6 +1482,8 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
   if (resolved_db.empty()) {
     resolved_db = DefaultSessionDatabase(*session);
   }
+  const std::int64_t initial_page_size =
+      app.Get().default_page_size > 0 ? app.Get().default_page_size : kPageSize;
   std::uint64_t created_id = 0;
   workspace.Update([&](WorkspaceModel& ws) {
     WorkspaceTab tab;
@@ -1497,6 +1502,7 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
         initial_sql.empty() ? std::string{is_redis ? "PING" : "SELECT 1;"}
                             : std::move(initial_sql));
     tab.sql.target_database = std::move(resolved_db);
+    tab.sql.page_size = initial_page_size;
     ws.tabs.push_back(std::move(tab));
     ws.active_tab_id = created_id;
   });
@@ -1539,6 +1545,8 @@ bool SwitchSqlTabSession(const State<AppModel>& app, const State<WorkspaceModel>
     target->sql.has_next_page = false;
     target->sql.last_sql.clear();
     target->sql.last_database.clear();
+    target->sql.last_executed_sql.clear();
+    target->sql.last_elapsed_us = -1;
     target->sql.error.clear();
     target->sql.status.clear();
     const std::string trimmed = TrimAsciiCopy(target->sql.editor.text);
@@ -1579,6 +1587,8 @@ bool SwitchSqlTabDatabase(const State<AppModel>& app, const State<WorkspaceModel
     target->sql.has_next_page = false;
     target->sql.last_sql.clear();
     target->sql.last_database.clear();
+    target->sql.last_executed_sql.clear();
+    target->sql.last_elapsed_us = -1;
     target->sql.error.clear();
     switched = true;
   });
@@ -2668,6 +2678,66 @@ SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect, std::string_view sq
       .effective_limit = limit,
       .effective_offset = offset,
   };
+}
+
+std::string FormatExecutionDuration(std::int64_t elapsed_us) {
+  if (elapsed_us < 0) {
+    return {};
+  }
+  if (elapsed_us < 10000) {
+    const std::int64_t tenths = (elapsed_us + 50) / 100;
+    if (tenths >= 100) {
+      return std::to_string(tenths / 10) + " ms";
+    }
+    return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10) + " ms";
+  }
+  if (elapsed_us < 1000000) {
+    const std::int64_t millis = (elapsed_us + 500) / 1000;
+    if (millis >= 1000) {
+      return "1.00 s";
+    }
+    return std::to_string(millis) + " ms";
+  }
+  const std::int64_t hundredths = (elapsed_us + 5000) / 10000;
+  const std::int64_t secs = hundredths / 100;
+  const std::int64_t frac = hundredths % 100;
+  std::string frac_str = std::to_string(frac);
+  if (frac < 10) {
+    frac_str = "0" + frac_str;
+  }
+  return std::to_string(secs) + "." + frac_str + " s";
+}
+
+std::string CompactSqlPreview(std::string_view sql, std::size_t max_bytes) {
+  std::string out;
+  out.reserve(std::min<std::size_t>(sql.size(), max_bytes == 0 ? 0 : max_bytes + 3));
+  bool prev_space = true;
+  for (const unsigned char ch : sql) {
+    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\v' || ch == '\f') {
+      if (!prev_space) {
+        out.push_back(' ');
+        prev_space = true;
+      }
+      continue;
+    }
+    out.push_back(static_cast<char>(ch));
+    prev_space = false;
+  }
+  if (!out.empty() && out.back() == ' ') {
+    out.pop_back();
+  }
+  if (max_bytes > 0 && out.size() > max_bytes) {
+    std::size_t cut = max_bytes;
+    while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0U) == 0x80U) {
+      --cut;
+    }
+    out.resize(cut);
+    while (!out.empty() && out.back() == ' ') {
+      out.pop_back();
+    }
+    out += "...";
+  }
+  return out;
 }
 
 } // namespace dbpp

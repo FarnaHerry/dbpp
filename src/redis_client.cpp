@@ -2431,6 +2431,7 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
   model.sort = sort;
   model.filter = filter;
 
+  const auto started = std::chrono::steady_clock::now();
   const std::int64_t req_page = std::max<std::int64_t>(0, page);
   const std::int64_t req_offset =
       (req_page > 0 && model.page_size > std::numeric_limits<std::int64_t>::max() / req_page)
@@ -2438,6 +2439,7 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
           : req_page * model.page_size;
   RedisPageResult page_res =
       LoadRedisKeysPageBlocking(client, object, req_offset, model.page_size, sort, filter);
+  std::int64_t effective_offset = req_offset;
   if (!page_res.error.empty()) {
     model.error = page_res.error;
     model.connection_lost = !client.IsConnected();
@@ -2454,6 +2456,7 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
          model.page_size > std::numeric_limits<std::int64_t>::max() / clamped_page)
             ? std::numeric_limits<std::int64_t>::max()
             : clamped_page * model.page_size;
+    effective_offset = clamped_offset;
     page_res =
         LoadRedisKeysPageBlocking(client, object, clamped_offset, model.page_size, sort, filter);
     if (!page_res.error.empty()) {
@@ -2463,6 +2466,14 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
     }
     model.total = page_res.total;
   }
+  model.elapsed_us = std::max<std::int64_t>(
+      0, std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - started)
+             .count());
+  model.executed_sql = "SCAN " + object.name +
+                       (filter.empty() ? std::string{} : " MATCH " + filter) +
+                       " LIMIT " + std::to_string(model.page_size) +
+                       " OFFSET " + std::to_string(effective_offset);
   model.page = clamped_page;
   model.snapshot = std::make_shared<const GridSnapshot>(GridSnapshot{.rows = std::move(page_res.rows)});
   model.message = TrFmt("{0} keys · Page {1} / {2}", "{0} 个键 · 第 {1} / {2} 页",
