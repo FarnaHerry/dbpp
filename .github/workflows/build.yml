@@ -482,7 +482,7 @@ jobs:
           print(f'{plan["name"]}\t{plan["target"]}\t{plan["version"]}\t{plan["installComponent"]}')
           PY
           )
-          package_root=".huxerui/package/macos/release"
+          package_root="$PWD/.huxerui/package/macos/release"
           staging="$package_root/staging"
           dmg_path="$package_root/${app_target}-${app_version}.dmg"
           cmake -E rm -rf "$staging"
@@ -494,7 +494,7 @@ jobs:
           test -x "$bundle/Contents/MacOS/${app_target}"
           test -f "$bundle/Contents/Resources/HuxerUI/huxerui/resources.bin"
           test -f "$bundle/Contents/Resources/AppIcon.icns"
-          find "$bundle/Contents/Frameworks" -maxdepth 1 -name 'libhuxerui*.dylib' | grep -q .
+          ls "$bundle/Contents/Frameworks"/libhuxerui*.dylib >/dev/null
           ls "$bundle/Contents/Frameworks"/libadbc_driver_manager*.dylib >/dev/null
           ls "$bundle/Contents/Frameworks"/libadbc_driver_sqlite*.dylib >/dev/null
           codesign --verify --deep --strict "$bundle"
