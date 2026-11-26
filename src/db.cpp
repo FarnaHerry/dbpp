@@ -4,7 +4,6 @@ module;
 #include <huxerui/http.h>
 #include <huxerui/huxerui.h>
 #include <huxerui/task.h>
-#include <sqlite3.h>
 
 module dbpp.db;
 
@@ -337,7 +336,7 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     return model.columns[left].primary_key_order < model.columns[right].primary_key_order;
   });
 
-  if (session.dialect == Dialect::Sqlite && !object.is_view) {
+  if (session.dialect == Dialect::Sqlite && !object.is_view && model.key_columns.empty()) {
     const AdbcQueryResult probe = ExecuteBlocking(
         session, "SELECT rowid FROM " + model.qualified_name + " LIMIT 0", true, 0);
     model.uses_rowid = probe.error.empty();
@@ -368,19 +367,8 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
           ? std::numeric_limits<std::int64_t>::max()
           : model.page * model.page_size;
 
-  std::string select_list;
-  if (model.uses_rowid) {
-    select_list = "rowid AS \"__dbpp_rowid\"";
-  }
-  for (const ColumnMeta& column : model.columns) {
-    if (!select_list.empty()) {
-      select_list += ", ";
-    }
-    select_list += QuoteIdentifier(session.dialect, column.name);
-  }
-  if (select_list.empty()) {
-    select_list = "*";
-  }
+  const std::string select_list =
+      model.uses_rowid ? std::string{"rowid AS \"__dbpp_rowid\", *"} : std::string{"*"};
 
   std::string order;
   if (model.sort.has_value() && !model.sort->column_id.empty()) {
@@ -446,13 +434,52 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   if (!data.error.empty()) {
     model.error = data.error;
   }
-  model.message = TrFmt("{0} rows · Page {1} / {2}", "{0} 行 · 第 {1} / {2} 页",
-                        {std::to_string(model.total), std::to_string(model.page + 1),
-                         std::to_string(page_count)});
+  model.message = TrFmt("{0} rows · {1} pages", "{0} 行 · 共 {1} 页",
+                        {std::to_string(model.total), std::to_string(page_count)});
   return model;
 }
 
+
 namespace {
+
+std::string SqlPlaceholder(Dialect dialect, std::size_t one_based_index) {
+  if (dialect == Dialect::Postgresql) {
+    return "$" + std::to_string(one_based_index);
+  }
+  return "?";
+}
+
+bool BuildParameterizedWhere(Dialect dialect, const TableModel& model, const GridRow& row,
+                             std::string& where_out, std::vector<PreparedParamValue>& params_out,
+                             std::vector<std::string>& types_out, std::size_t& next_param_idx) {
+  where_out.clear();
+  if (model.uses_rowid && row.rowid.has_value()) {
+    where_out = "rowid = " + SqlPlaceholder(dialect, next_param_idx++);
+    params_out.push_back(PreparedParamValue{.text = std::to_string(*row.rowid), .is_null = false});
+    types_out.emplace_back("INTEGER");
+    return true;
+  }
+  for (std::size_t key_index = 0; key_index < model.key_columns.size(); ++key_index) {
+    const std::size_t column_index = model.key_columns[key_index];
+    if (column_index >= model.columns.size() || key_index >= row.key_values.size()) {
+      return false;
+    }
+    if (!where_out.empty()) {
+      where_out += " AND ";
+    }
+    const ColumnMeta& column = model.columns[column_index];
+    const CellValue& key = row.key_values[key_index];
+    where_out += QuoteIdentifier(dialect, column.name);
+    if (key.is_null) {
+      where_out += " IS NULL";
+    } else {
+      where_out += " = " + SqlPlaceholder(dialect, next_param_idx++);
+      params_out.push_back(PreparedParamValue{.text = key.text, .is_null = false});
+      types_out.push_back(column.type);
+    }
+  }
+  return !where_out.empty();
+}
 
 AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model,
                                    std::size_t row_index, std::size_t column_index,
@@ -471,13 +498,41 @@ AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model
     return result;
   }
   const GridRow& row = model.snapshot->rows[row_index];
+  const ColumnMeta& column = model.columns[column_index];
+  const bool is_null = text.empty() || EqualsIgnoreCaseAscii(text, "NULL");
+
+  std::size_t next_idx = 1;
+  std::vector<PreparedParamValue> params;
+  std::vector<std::string> param_types;
+  const std::string set_placeholder = SqlPlaceholder(session.dialect, next_idx++);
+  params.push_back(PreparedParamValue{.text = is_null ? std::string{} : text, .is_null = is_null});
+  param_types.push_back(column.type);
+
+  std::string param_where;
+  if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
+                              next_idx)) {
+    const std::string param_sql = "UPDATE " + model.qualified_name + " SET " +
+                                  QuoteIdentifier(session.dialect, column.name) + " = " +
+                                  set_placeholder + " WHERE " + param_where;
+    int prep_status = 0;
+    AdbcQueryResult prep_res;
+    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
+      return prep_res;
+    }
+    if (!prep_res.error.empty() && prep_status != 2 /* ADBC_STATUS_NOT_IMPLEMENTED */) {
+      // Fall through only when driver does not implement prepared bind; report real errors directly
+      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
+        prep_res.connection_lost = true;
+      }
+      return prep_res;
+    }
+  }
+
   const std::string where = BuildWhere(session.dialect, model, row);
   if (where.empty()) {
     result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
     return result;
   }
-  const ColumnMeta& column = model.columns[column_index];
-  const bool is_null = text.empty() || EqualsIgnoreCaseAscii(text, "NULL");
   const std::string value = SqlLiteral(session.dialect, text, column.type, is_null);
   const std::string sql = "UPDATE " + model.qualified_name + " SET " +
                           QuoteIdentifier(session.dialect, column.name) + " = " + value +
@@ -500,6 +555,27 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
     return result;
   }
   const GridRow& row = model.snapshot->rows[row_index];
+
+  std::size_t next_idx = 1;
+  std::vector<PreparedParamValue> params;
+  std::vector<std::string> param_types;
+  std::string param_where;
+  if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
+                              next_idx)) {
+    const std::string param_sql = "DELETE FROM " + model.qualified_name + " WHERE " + param_where;
+    int prep_status = 0;
+    AdbcQueryResult prep_res;
+    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
+      return prep_res;
+    }
+    if (!prep_res.error.empty() && prep_status != 2 /* ADBC_STATUS_NOT_IMPLEMENTED */) {
+      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
+        prep_res.connection_lost = true;
+      }
+      return prep_res;
+    }
+  }
+
   const std::string where = BuildWhere(session.dialect, model, row);
   if (where.empty()) {
     result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
@@ -522,7 +598,11 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
   }
 
   std::string columns;
-  std::string placeholders;
+  std::string param_placeholders;
+  std::string literal_placeholders;
+  std::vector<PreparedParamValue> params;
+  std::vector<std::string> param_types;
+  std::size_t next_idx = 1;
   for (std::size_t index = 0; index < model.columns.size() && index < values.size();
        ++index) {
     if (values[index].empty()) {
@@ -530,12 +610,35 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
     }
     if (!columns.empty()) {
       columns += ", ";
-      placeholders += ", ";
+      param_placeholders += ", ";
+      literal_placeholders += ", ";
     }
     columns += QuoteIdentifier(session.dialect, model.columns[index].name);
     const bool is_null = EqualsIgnoreCaseAscii(values[index], "NULL");
-    placeholders += SqlLiteral(session.dialect, values[index], model.columns[index].type,
-                               is_null);
+    param_placeholders += SqlPlaceholder(session.dialect, next_idx++);
+    params.push_back(PreparedParamValue{
+        .text = is_null ? std::string{} : values[index],
+        .is_null = is_null,
+    });
+    param_types.push_back(model.columns[index].type);
+    literal_placeholders += SqlLiteral(session.dialect, values[index], model.columns[index].type,
+                                       is_null);
+  }
+
+  if (!columns.empty()) {
+    const std::string param_sql = "INSERT INTO " + model.qualified_name + " (" + columns +
+                                  ") VALUES (" + param_placeholders + ")";
+    int prep_status = 0;
+    AdbcQueryResult prep_res;
+    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
+      return prep_res;
+    }
+    if (!prep_res.error.empty() && prep_status != 2 /* ADBC_STATUS_NOT_IMPLEMENTED */) {
+      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
+        prep_res.connection_lost = true;
+      }
+      return prep_res;
+    }
   }
 
   std::string sql;
@@ -545,7 +648,7 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
               : "INSERT INTO " + model.qualified_name + " DEFAULT VALUES";
   } else {
     sql = "INSERT INTO " + model.qualified_name + " (" + columns + ") VALUES (" +
-          placeholders + ")";
+          literal_placeholders + ")";
   }
   return ExecuteBlocking(session, sql, false, 0);
 }
@@ -556,11 +659,14 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
                         NotifyFn notify,
                         std::function<void(std::uint64_t)> on_opened = {}) {
   if (!opened.session) {
+    const std::string fail_key = ConnectionFailureKey(request.driver_path, request.uri);
+    const std::string fail_detail = opened.error;
     const std::string message =
         TrFmt("Connection failed: {0}", "连接失败: {0}", {opened.error});
-    app.Update([](AppModel& model) {
+    app.Update([&fail_key, &fail_detail](AppModel& model) {
       model.status.clear();
       model.error.clear();
+      model.failed_connections[fail_key] = fail_detail;
     });
     if (notify) {
       notify(message);
@@ -576,7 +682,8 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
   session->driver_path = request.driver_path;
   session->dialect = opened.session->dialect;
   session->sqlite = opened.session->dialect == Dialect::Sqlite;
-  session->read_only = false;
+  session->read_only = opened.session->read_only;
+  session->connection_info = opened.session->connection_info;
   session->session = std::move(opened.session);
   session->objects = std::move(objects.objects);
 
@@ -609,7 +716,9 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
     is_view_out = s.objects[first_idx].is_view;
   };
 
+  const std::string connected_fail_key = ConnectionFailureKey(request.driver_path, request.uri);
   app.Update([&](AppModel& model) {
+    model.failed_connections.erase(connected_fail_key);
     for (DbSession& existing : model.sessions) {
       if (existing.uri == session->uri && existing.dialect == session->dialect) {
         model.active_session = existing.id;
@@ -731,92 +840,6 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
 
 } // namespace
 
-Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
-                                        std::string sql, bool want_rows,
-                                        std::size_t max_rows,
-                                        std::string target_database) {
-  if (!session || session->IsClosed()) {
-    AdbcQueryResult result;
-    result.connection_lost = true;
-    result.error = Tr("Connection is closed", "连接已关闭");
-    co_return result;
-  }
-  co_return co_await session->sequence.Run(
-      [session, sql = std::move(sql), want_rows, max_rows,
-       target_database = std::move(target_database)](std::stop_token) mutable {
-        const std::string trimmed_db = TrimAsciiCopy(target_database);
-        if (!trimmed_db.empty()) {
-          if (session->dialect == Dialect::Redis && session->redis) {
-            if (const auto db_idx = ParseRedisTargetDbIndex(trimmed_db)) {
-              std::string err;
-              if (!session->redis->EnsureDb(*db_idx, err)) {
-                AdbcQueryResult result;
-                result.connection_lost = !session->redis->IsConnected();
-                result.error = std::move(err);
-                return result;
-              }
-            }
-          } else {
-            const std::string switch_sql =
-                BuildSwitchDatabaseSql(session->dialect, trimmed_db);
-            if (!switch_sql.empty()) {
-              AdbcQueryResult sw = ExecuteBlocking(*session, switch_sql, false, 0);
-              if (sw.connection_lost) {
-                return sw;
-              }
-              if (!sw.error.empty() &&
-                  !(session->dialect == Dialect::Generic && trimmed_db == "default")) {
-                return sw;
-              }
-            }
-          }
-        }
-        return ExecuteBlocking(*session, std::move(sql), want_rows, max_rows);
-      });
-}
-
-Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session, TableModel model,
-                                      std::size_t row_index, std::size_t column_index,
-                                      std::string text) {
-  if (!session || session->IsClosed()) {
-    AdbcQueryResult result;
-    result.connection_lost = true;
-    result.error = Tr("Connection is closed", "连接已关闭");
-    co_return result;
-  }
-  co_return co_await session->sequence.Run(
-      [session, model = std::move(model), row_index, column_index, text = std::move(text)](
-          std::stop_token) mutable {
-        if (session->IsClosed()) {
-          AdbcQueryResult res;
-          res.connection_lost = true;
-          res.error = Tr("Connection is closed", "连接已关闭");
-          return res;
-        }
-        return UpdateCellBlocking(*session, model, row_index, column_index, text);
-      });
-}
-
-Task<AdbcQueryResult> DeleteRowAsync(std::shared_ptr<AdbcSession> session, TableModel model,
-                                     std::size_t row_index) {
-  if (!session || session->IsClosed()) {
-    AdbcQueryResult result;
-    result.connection_lost = true;
-    result.error = Tr("Connection is closed", "连接已关闭");
-    co_return result;
-  }
-  co_return co_await session->sequence.Run(
-      [session, model = std::move(model), row_index](std::stop_token) mutable {
-        if (session->IsClosed()) {
-          AdbcQueryResult res;
-          res.connection_lost = true;
-          res.error = Tr("Connection is closed", "连接已关闭");
-          return res;
-        }
-        return DeleteRowBlocking(*session, model, row_index);
-      });
-}
-
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows) {
   if (session.IsClosed()) {
@@ -846,17 +869,11 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
                            session.dialect == Dialect::Postgresql ||
                            session.dialect == Dialect::Mysql ||
                            session.dialect == Dialect::Duckdb;
-  bool in_tx = false;
-  if (supports_tx) {
-    const AdbcQueryResult begin_res = ExecuteBlocking(session, "BEGIN", false, 0);
-    if (begin_res.connection_lost) {
-      return BatchInsertResult{.inserted = 0,
-                               .rolled_back = true,
-                               .connection_lost = true,
-                               .error = begin_res.error};
-    }
-    if (begin_res.error.empty()) {
-      in_tx = true;
+  bool managed_tx = false;
+  if (supports_tx && !session.in_transaction) {
+    std::string tx_err;
+    if (SetAutocommitBlocking(session, false, tx_err)) {
+      managed_tx = true;
     }
   }
 
@@ -865,1879 +882,95 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
     if (!result.error.empty()) {
       const std::string msg = TrFmt("Row {0} insert failed: {1}", "第 {0} 行插入失败: {1}",
                                     {std::to_string(i + 1), result.error});
-      if (in_tx && !result.connection_lost) {
-        (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
+      if (managed_tx && !result.connection_lost) {
+        std::string rb_err;
+        (void)RollbackTransactionBlocking(session, rb_err);
+        (void)SetAutocommitBlocking(session, true, rb_err);
         return BatchInsertResult{.inserted = 0,
                                  .rolled_back = true,
                                  .connection_lost = false,
                                  .error = msg};
       }
-      return BatchInsertResult{.inserted = result.connection_lost && in_tx ? 0 : i,
-                               .rolled_back = result.connection_lost && in_tx,
+      return BatchInsertResult{.inserted = result.connection_lost && managed_tx ? 0 : i,
+                               .rolled_back = result.connection_lost && managed_tx,
                                .connection_lost = result.connection_lost,
                                .error = msg};
     }
   }
 
-  if (in_tx) {
-    AdbcQueryResult committed = ExecuteBlocking(session, "COMMIT", false, 0);
-    if (!committed.error.empty()) {
-      if (!committed.connection_lost) {
-        (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
-      }
+  if (managed_tx) {
+    std::string commit_err;
+    if (!CommitTransactionBlocking(session, commit_err)) {
+      std::string rb_err;
+      (void)RollbackTransactionBlocking(session, rb_err);
+      (void)SetAutocommitBlocking(session, true, rb_err);
       return BatchInsertResult{
           .inserted = 0,
           .rolled_back = true,
-          .connection_lost = committed.connection_lost,
+          .connection_lost = IsConnectionLostError(0, commit_err),
           .error = TrFmt("Failed to commit transaction: {0}", "提交事务失败: {0}",
-                         {committed.error})};
+                         {commit_err})};
     }
+    std::string ac_err;
+    (void)SetAutocommitBlocking(session, true, ac_err);
   }
 
   return BatchInsertResult{.inserted = rows.size(), .rolled_back = false, .error = {}};
 }
 
-void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                      const TaskScope& tasks, std::uint64_t tab_id, std::int64_t page,
-                      std::optional<DataTableSort> sort, std::string filter,
-                      bool keep_selection, NotifyFn notify, std::int64_t page_size) {
-  const WorkspaceModel& ws_snapshot = workspace.Get();
-  const WorkspaceTab* tab = ws_snapshot.FindTab(tab_id);
-  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
-    return;
-  }
+namespace detail {
 
-  const std::uint64_t session_id = tab->session_id;
-  const std::string object_name = tab->object_name;
-  const std::string object_schema = tab->object_schema;
-  const std::int64_t effective_page_size =
-      page_size > 0 ? page_size
-                    : (tab->table.page_size > 0 ? tab->table.page_size : kPageSize);
-
-  const AppModel& model = app.Get();
-  const DbSession* session = FindSession(model, session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-      return;
-    }
-    workspace.Update([&](WorkspaceModel& ws) {
-      WorkspaceTab* target = ws.FindTab(tab_id);
-      if (target != nullptr && target->kind == WorkspaceTabKind::Table) {
-        target->table = TableModel{};
-        target->selected_cell = std::nullopt;
-      }
-    });
-    return;
-  }
-  const DbObject* object = FindObject(*session, object_name, object_schema);
-  if (object == nullptr) {
-    workspace.Update([&](WorkspaceModel& ws) {
-      WorkspaceTab* target = ws.FindTab(tab_id);
-      if (target != nullptr && target->kind == WorkspaceTabKind::Table) {
-        target->table = TableModel{};
-        target->selected_cell = std::nullopt;
-      }
-    });
-    return;
-  }
-
-  workspace.Update([&](WorkspaceModel& ws) {
-    WorkspaceTab* target = ws.FindTab(tab_id);
-    if (target == nullptr || target->kind != WorkspaceTabKind::Table) {
-      return;
-    }
-    target->table.loading = true;
-    target->table.error.clear();
-    target->table.page_size = effective_page_size;
-    if (!keep_selection) {
-      target->selected_cell = std::nullopt;
-    }
-  });
-
-  auto adbc_session = session->session;
-  DbObject object_copy = *object;
-
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session, tab_id, session_id,
-                object_copy = std::move(object_copy), object_name, object_schema, page,
-                effective_page_size, sort, filter]() mutable -> Task<void> {
-    TableModel result = co_await adbc_session->sequence.Run(
-        [adbc_session, session_id, object_copy = std::move(object_copy), page,
-         effective_page_size, sort, filter](std::stop_token) mutable {
-          return LoadTableBlocking(*adbc_session, session_id, std::move(object_copy), page,
-                                   effective_page_size, sort, filter);
-        });
-
-    const bool load_lost = result.connection_lost;
-    const std::string load_error = result.error;
-    const bool has_snapshot = result.snapshot != nullptr;
-    if (load_lost) {
-      workspace.Update([&](WorkspaceModel& ws) {
-        if (WorkspaceTab* target = ws.FindTab(tab_id);
-            target != nullptr && target->kind == WorkspaceTabKind::Table) {
-          target->table.loading = false;
-        }
-      });
-      HandleSessionDisconnected(app, workspace, tasks, session_id, load_error, notify);
-      co_return;
-    }
-    bool tab_matches = false;
-    workspace.Update([&](WorkspaceModel& ws) {
-      WorkspaceTab* target = ws.FindTab(tab_id);
-      if (target == nullptr || target->kind != WorkspaceTabKind::Table ||
-          target->session_id != session_id || target->object_name != object_name ||
-          target->object_schema != object_schema) {
-        return;
-      }
-      tab_matches = true;
-      if (!load_error.empty() && !has_snapshot) {
-        if (target->table.session_id != session_id || target->table.object != object_name) {
-          target->table = TableModel{};
-          target->table.session_id = session_id;
-          target->table.object = object_name;
-          target->table.error = load_error;
-          return;
-        }
-        target->table.loading = false;
-        target->table.error = load_error;
-        return;
-      }
-      result.pending_inserts = std::move(target->table.pending_inserts);
-      result.next_draft_id = target->table.next_draft_id;
-      result.committing = target->table.committing;
-      result.column_widths = std::move(target->table.column_widths);
-      for (std::size_t i = 0; i < result.columns.size(); ++i) {
-        const std::string& col_name = result.columns[i].name;
-        if (!result.column_widths.contains(col_name)) {
-          result.column_widths.emplace(
-              col_name, ComputeAutoColumnWidth(col_name, i, result.snapshot.get()));
-        }
-      }
-      if (!result.error.empty()) {
-        result.error.clear();
-      }
-      result.snapshot_version = target->table.snapshot_version + 1;
-      target->table = std::move(result);
-      target->selected_cell = std::nullopt;
-    });
-
-    if (!tab_matches) {
-      co_return;
-    }
-    if (!load_error.empty() && !has_snapshot) {
-      if (notify) {
-        notify(TrFmt("Failed to load: {0}", "加载失败: {0}", {load_error}));
-      }
-      co_return;
-    }
-    if (!load_error.empty() && notify) {
-      notify(TrFmt("Load warning: {0}", "加载警告: {0}", {load_error}));
-    }
-  });
+std::string DbTrimAscii(std::string_view text) { return TrimAsciiCopy(text); }
+std::string DbLowerAscii(std::string_view text) { return LowerAsciiCopy(text); }
+std::string DbUpperAscii(std::string_view text) { return UpperAsciiCopy(text); }
+std::optional<int> DbParseRedisTargetDbIndex(std::string_view text) {
+  return ParseRedisTargetDbIndex(text);
+}
+bool DbSessionHasMultipleCatalogs(const DbSession& session) {
+  return SessionHasMultipleCatalogsCopy(session);
+}
+std::string DbSessionObjectBucket(const DbSession& session, const DbObject& object,
+                                  bool multi_catalog) {
+  return SessionObjectBucketCopy(session, object, multi_catalog);
+}
+const DbSession* DbFindSession(const AppModel& model, std::uint64_t id) {
+  return FindSession(model, id);
+}
+const DbObject* DbFindObject(const DbSession& session, std::string_view name,
+                             std::string_view db_schema) {
+  return FindObject(session, name, db_schema);
+}
+std::string DbFormatTabTitle(const DbSession& session, std::string_view object,
+                             std::string_view db_schema) {
+  return FormatTabTitle(session, object, db_schema);
+}
+void DbSyncAppFromActiveTab(AppModel& model, const WorkspaceModel& ws) {
+  SyncAppFromActiveTab(model, ws);
+}
+std::size_t DbParseRowIndex(std::string_view id) { return ParseRowIndex(id); }
+bool DbEqualsIgnoreCaseAscii(std::string_view left, std::string_view right) {
+  return EqualsIgnoreCaseAscii(left, right);
+}
+void DbCloseSessionAsync(std::shared_ptr<AdbcSession> adbc, const TaskScope& tasks) {
+  CloseSessionAsync(std::move(adbc), tasks);
+}
+AdbcQueryResult DbUpdateCellBlocking(AdbcSession& session, const TableModel& model,
+                                     std::size_t row_index, std::size_t column_index,
+                                     const std::string& text) {
+  return UpdateCellBlocking(session, model, row_index, column_index, text);
+}
+AdbcQueryResult DbDeleteRowBlocking(AdbcSession& session, const TableModel& model,
+                                    std::size_t row_index) {
+  return DeleteRowBlocking(session, model, row_index);
+}
+void DbApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                          const TaskScope& tasks, AdbcOpenResult opened,
+                          ConnectionRequest request, AdbcObjectsResult objects,
+                          NotifyFn notify, std::function<void(std::uint64_t)> on_opened) {
+  ApplyOpenedSession(app, workspace, tasks, std::move(opened), std::move(request),
+                     std::move(objects), std::move(notify), std::move(on_opened));
 }
 
-void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                     const TaskScope& tasks, std::uint64_t tab_id,
-                     const DataTableEditRequest& edit, NotifyFn notify) {
-  if (edit.cell_id.row_id.starts_with("draft:")) {
-    return;
-  }
-  const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
-  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
-    return;
-  }
-  const DbSession* session = FindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
-    }
-    return;
-  }
-  TableModel table_value = tab->table;
-  if (!table_value.snapshot) {
-    return;
-  }
-  const std::size_t row_index = ParseRowIndex(edit.cell_id.row_id);
-  if (row_index >= table_value.snapshot->rows.size()) {
-    return;
-  }
-  std::size_t column_index = table_value.columns.size();
-  for (std::size_t i = 0; i < table_value.columns.size(); ++i) {
-    if (table_value.columns[i].name == edit.cell_id.column_id) {
-      column_index = i;
-      break;
-    }
-  }
-  if (column_index >= table_value.columns.size()) {
-    return;
-  }
-  const CellValue& current = table_value.snapshot->rows[row_index].values[column_index];
-  if (!current.is_null && current.text == edit.text) {
-    return;
-  }
-  if (current.is_null && EqualsIgnoreCaseAscii(edit.text, "NULL")) {
-    return;
-  }
-
-  auto adbc_session = session->session;
-  const std::uint64_t session_id = session->id;
-  const std::string object_name = table_value.object;
-
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session,
-                table_value = std::move(table_value), tab_id, session_id, object_name,
-                row_index, column_index, text = edit.text]() mutable -> Task<void> {
-    AdbcQueryResult result =
-        co_await UpdateCellAsync(adbc_session, table_value, row_index, column_index, text);
-    if (result.connection_lost) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, result.error, notify);
-      co_return;
-    }
-    if (!result.error.empty()) {
-      const std::string message = result.error;
-      if (notify) {
-        notify(TrFmt("Failed to save: {0}", "保存失败: {0}", {message}));
-      }
-      co_return;
-    }
-    const WorkspaceTab* current_tab = workspace.Get().FindTab(tab_id);
-    if (current_tab == nullptr || current_tab->kind != WorkspaceTabKind::Table ||
-        current_tab->session_id != session_id || current_tab->object_name != object_name) {
-      co_return;
-    }
-    RequestLoadTable(app, workspace, tasks, tab_id, table_value.page, table_value.sort,
-                     table_value.filter, true, notify);
-  });
-}
-
-void RequestDeleteSelected(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                           const TaskScope& tasks, std::uint64_t tab_id, NotifyFn notify) {
-  const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
-  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table || !tab->selected_cell.has_value()) {
-    return;
-  }
-  if (tab->selected_cell->row_id.starts_with("draft:")) {
-    return;
-  }
-  const DbSession* session = FindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
-    }
-    return;
-  }
-  TableModel table_value = tab->table;
-  if (!table_value.snapshot) {
-    return;
-  }
-  const std::size_t row_index = ParseRowIndex(tab->selected_cell->row_id);
-  if (row_index >= table_value.snapshot->rows.size()) {
-    return;
-  }
-  auto adbc_session = session->session;
-  const std::uint64_t session_id = session->id;
-  const std::string object_name = table_value.object;
-  const std::int64_t page = table_value.page;
-  const std::int64_t remaining = static_cast<std::int64_t>(table_value.snapshot->rows.size());
-
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session,
-                table_value = std::move(table_value), tab_id, session_id, object_name,
-                row_index, page, remaining]() mutable -> Task<void> {
-    AdbcQueryResult result = co_await DeleteRowAsync(adbc_session, table_value, row_index);
-    if (result.connection_lost) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, result.error, notify);
-      co_return;
-    }
-    if (!result.error.empty()) {
-      const std::string message = result.error;
-      if (notify) {
-        notify(TrFmt("Failed to delete: {0}", "删除失败: {0}", {message}));
-      }
-      co_return;
-    }
-    const WorkspaceTab* current_tab = workspace.Get().FindTab(tab_id);
-    if (current_tab == nullptr || current_tab->kind != WorkspaceTabKind::Table ||
-        current_tab->session_id != session_id || current_tab->object_name != object_name) {
-      co_return;
-    }
-    const std::int64_t next_page = remaining <= 1 && page > 0 ? page - 1 : page;
-    RequestLoadTable(app, workspace, tasks, tab_id, next_page, table_value.sort,
-                     table_value.filter, false, notify);
-    if (notify) {
-      notify(std::string(Tr("Deleted 1 row", "已删除 1 行")));
-    }
-  });
-}
-
-void RequestCommitPendingInserts(const State<AppModel>& app,
-                                 const State<WorkspaceModel>& workspace,
-                                 const TaskScope& tasks, std::uint64_t tab_id,
-                                 NotifyFn notify) {
-  const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
-  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table ||
-      tab->table.pending_inserts.empty() || tab->table.committing) {
-    return;
-  }
-  const DbSession* session = FindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
-    } else if (notify) {
-      notify(std::string(Tr("Connection is closed", "连接已关闭")));
-    }
-    return;
-  }
-
-  auto adbc = session->session;
-  const std::uint64_t session_id = tab->session_id;
-  const std::string object_name = tab->object_name;
-  TableModel table_copy = tab->table;
-  std::vector<PendingInsertRow> rows = tab->table.pending_inserts;
-
-  workspace.Update([&](WorkspaceModel& ws) {
-    if (WorkspaceTab* target = ws.FindTab(tab_id);
-        target != nullptr && target->kind == WorkspaceTabKind::Table) {
-      target->table.committing = true;
-    }
-  });
-
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc,
-                table_copy = std::move(table_copy), rows = std::move(rows), tab_id,
-                session_id, object_name]() mutable -> Task<void> {
-    BatchInsertResult res = co_await adbc->sequence.Run(
-        [adbc, table_copy = std::move(table_copy), rows = std::move(rows)](
-            std::stop_token) mutable { return InsertRowsBlocking(*adbc, table_copy, rows); });
-
-    if (res.connection_lost) {
-      workspace.Update([&](WorkspaceModel& ws) {
-        if (WorkspaceTab* target = ws.FindTab(tab_id);
-            target != nullptr && target->kind == WorkspaceTabKind::Table) {
-          target->table.committing = false;
-        }
-      });
-      HandleSessionDisconnected(app, workspace, tasks, session_id, res.error, notify);
-      co_return;
-    }
-
-    if (!res.error.empty()) {
-      bool partial_reload = false;
-      std::int64_t reload_page = 0;
-      std::optional<DataTableSort> reload_sort;
-      std::string reload_filter;
-      workspace.Update([&](WorkspaceModel& ws) {
-        WorkspaceTab* target = ws.FindTab(tab_id);
-        if (target == nullptr || target->kind != WorkspaceTabKind::Table ||
-            target->session_id != session_id || target->object_name != object_name) {
-          return;
-        }
-        target->table.committing = false;
-        if (!res.rolled_back && res.inserted > 0) {
-          const std::size_t remove_count =
-              std::min(res.inserted, target->table.pending_inserts.size());
-          target->table.pending_inserts.erase(target->table.pending_inserts.begin(),
-                                              target->table.pending_inserts.begin() +
-                                                  static_cast<std::ptrdiff_t>(remove_count));
-          partial_reload = true;
-          reload_page = target->table.page;
-          reload_sort = target->table.sort;
-          reload_filter = target->table.filter;
-        }
-      });
-      if (notify) {
-        notify(TrFmt("Commit failed: {0}", "提交失败: {0}", {res.error}));
-      }
-      if (partial_reload) {
-        RequestLoadTable(app, workspace, tasks, tab_id, reload_page, reload_sort,
-                         std::move(reload_filter), false, notify);
-      }
-      co_return;
-    }
-
-    bool should_reload = false;
-    std::int64_t target_page = 0;
-    std::optional<DataTableSort> reload_sort;
-    std::string reload_filter;
-    workspace.Update([&](WorkspaceModel& ws) {
-      WorkspaceTab* target = ws.FindTab(tab_id);
-      if (target == nullptr || target->kind != WorkspaceTabKind::Table ||
-          target->session_id != session_id || target->object_name != object_name) {
-        return;
-      }
-      should_reload = true;
-      target->table.pending_inserts.clear();
-      target->table.committing = false;
-      if (target->selected_cell.has_value() &&
-          target->selected_cell->row_id.starts_with("draft:")) {
-        target->selected_cell = std::nullopt;
-      }
-      reload_sort = target->table.sort;
-      reload_filter = target->table.filter;
-      if (!target->table.sort.has_value() && target->table.filter.empty()) {
-        const std::int64_t next_total =
-            target->table.total + static_cast<std::int64_t>(res.inserted);
-        const std::int64_t page_size = std::max<std::int64_t>(1, target->table.page_size);
-        target_page = std::max<std::int64_t>(0, (next_total - 1) / page_size);
-      } else {
-        target_page = target->table.page;
-      }
-    });
-
-    if (should_reload) {
-      RequestLoadTable(app, workspace, tasks, tab_id, target_page, reload_sort,
-                       std::move(reload_filter), false, notify);
-    }
-    if (notify) {
-      notify(TrFmt("Committed {0} row(s)", "已提交 {0} 行", {std::to_string(res.inserted)}));
-    }
-  });
-}
-
-void ActivateWorkspaceTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                          std::uint64_t tab_id) {
-  if (workspace.Get().FindTab(tab_id) == nullptr) {
-    return;
-  }
-  workspace.Update([tab_id](WorkspaceModel& ws) { ws.active_tab_id = tab_id; });
-  const WorkspaceModel& ws_now = workspace.Get();
-  app.Update([&ws_now](AppModel& model) { SyncAppFromActiveTab(model, ws_now); });
-}
-
-void CloseWorkspaceTabs(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                        const std::vector<std::uint64_t>& tab_ids) {
-  if (tab_ids.empty()) {
-    return;
-  }
-  workspace.Update([&tab_ids](WorkspaceModel& ws) {
-    const std::uint64_t old_active = ws.active_tab_id;
-    std::size_t old_active_index = 0;
-    for (std::size_t i = 0; i < ws.tabs.size(); ++i) {
-      if (ws.tabs[i].id == old_active) {
-        old_active_index = i;
-        break;
-      }
-    }
-    const auto should_remove = [&tab_ids](const WorkspaceTab& tab) {
-      return std::ranges::find(tab_ids, tab.id) != tab_ids.end();
-    };
-    const bool active_removed = ws.FindTab(old_active) != nullptr &&
-                                std::ranges::find(tab_ids, old_active) != tab_ids.end();
-    std::erase_if(ws.tabs, should_remove);
-    if (ws.tabs.empty()) {
-      ws.active_tab_id = 0;
-    } else if (active_removed || ws.FindTab(ws.active_tab_id) == nullptr) {
-      const std::size_t next_index = old_active_index > 0
-                                         ? std::min(old_active_index - 1, ws.tabs.size() - 1)
-                                         : 0;
-      ws.active_tab_id = ws.tabs[next_index].id;
-    }
-  });
-  const WorkspaceModel& ws_now = workspace.Get();
-  app.Update([&ws_now](AppModel& model) { SyncAppFromActiveTab(model, ws_now); });
-}
-
-std::vector<std::string> ListSessionDatabases(const DbSession& session) {
-  std::vector<std::string> databases;
-  if (session.dialect == Dialect::Redis) {
-    for (const DbObject& object : session.objects) {
-      if (!object.name.empty() &&
-          std::ranges::find(databases, object.name) == databases.end()) {
-        databases.push_back(object.name);
-      }
-    }
-    if (session.session && session.session->redis) {
-      const std::string current = "db" + std::to_string(session.session->redis->CurrentDb());
-      if (std::ranges::find(databases, current) == databases.end()) {
-        databases.insert(databases.begin(), current);
-      }
-    }
-    if (databases.empty()) {
-      databases.emplace_back("db0");
-    }
-    return databases;
-  }
-
-  const bool multi_catalog = SessionHasMultipleCatalogsCopy(session);
-  const DatabasePreset& preset = ResolvePresetForProfile(session.driver_path, session.uri);
-  const std::string uri_db = TrimAsciiCopy(DecomposePresetUri(preset, session.uri).database);
-
-  const auto add_unique = [&databases](std::string name) {
-    name = TrimAsciiCopy(name);
-    if (name.empty()) {
-      return;
-    }
-    const std::string lower = LowerAsciiCopy(name);
-    for (const std::string& existing : databases) {
-      if (LowerAsciiCopy(existing) == lower) {
-        return;
-      }
-    }
-    databases.push_back(std::move(name));
-  };
-
-  for (const DbObject& object : session.objects) {
-    add_unique(SessionObjectBucketCopy(session, object, multi_catalog));
-  }
-
-  if ((session.dialect == Dialect::Mysql || session.dialect == Dialect::Generic) &&
-      !uri_db.empty()) {
-    add_unique(uri_db);
-  }
-  if ((session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb) &&
-      databases.empty()) {
-    databases.emplace_back("main");
-  }
-  if (session.dialect == Dialect::Postgresql && databases.empty()) {
-    databases.emplace_back("public");
-  }
-
-  std::string target_lower = LowerAsciiCopy(uri_db);
-  if (target_lower.empty() &&
-      (session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb)) {
-    target_lower = "main";
-  } else if (session.dialect == Dialect::Postgresql) {
-    const bool matches_uri_db =
-        !target_lower.empty() &&
-        std::ranges::any_of(databases, [&target_lower](const std::string& db) {
-          return LowerAsciiCopy(db) == target_lower;
-        });
-    if (!matches_uri_db) {
-      target_lower = "public";
-    }
-  }
-
-  std::ranges::sort(databases, [&target_lower](const std::string& a, const std::string& b) {
-    const std::string la = LowerAsciiCopy(a);
-    const std::string lb = LowerAsciiCopy(b);
-    const bool a_target = !target_lower.empty() && la == target_lower;
-    const bool b_target = !target_lower.empty() && lb == target_lower;
-    if (a_target != b_target) {
-      return a_target;
-    }
-    const bool a_sys = IsSystemDatabaseOrSchema(a);
-    const bool b_sys = IsSystemDatabaseOrSchema(b);
-    if (a_sys != b_sys) {
-      return !a_sys;
-    }
-    return a < b;
-  });
-  return databases;
-}
-
-std::string DefaultSessionDatabase(const DbSession& session) {
-  if (session.dialect == Dialect::Redis && session.session && session.session->redis) {
-    return "db" + std::to_string(session.session->redis->CurrentDb());
-  }
-  const std::vector<std::string> databases = ListSessionDatabases(session);
-  return databases.empty() ? std::string{} : databases.front();
-}
-
-std::string BuildSwitchDatabaseSql(Dialect dialect, std::string_view target_database) {
-  const std::string trimmed = TrimAsciiCopy(target_database);
-  if (trimmed.empty() || dialect == Dialect::Sqlite || dialect == Dialect::Redis) {
-    return {};
-  }
-  if (dialect == Dialect::Mysql) {
-    return "USE " + QuoteIdentifier(Dialect::Mysql, trimmed);
-  }
-  if (dialect == Dialect::Postgresql) {
-    const std::size_t dot = trimmed.rfind('.');
-    const std::string_view schema =
-        (dot != std::string_view::npos && dot + 1 < trimmed.size())
-            ? std::string_view(trimmed).substr(dot + 1)
-            : std::string_view(trimmed);
-    return "SET search_path TO " + QuoteIdentifier(Dialect::Postgresql, schema);
-  }
-  std::string joined;
-  std::size_t pos = 0;
-  while (pos < trimmed.size()) {
-    const std::size_t next = trimmed.find('.', pos);
-    const std::string_view part =
-        next == std::string_view::npos
-            ? std::string_view(trimmed).substr(pos)
-            : std::string_view(trimmed).substr(pos, next - pos);
-    if (!part.empty()) {
-      if (!joined.empty()) {
-        joined.push_back('.');
-      }
-      joined += QuoteIdentifier(dialect, part);
-    }
-    if (next == std::string_view::npos) {
-      break;
-    }
-    pos = next + 1;
-  }
-  if (joined.empty()) {
-    return {};
-  }
-  return "USE " + joined;
-}
-
-std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                         std::uint64_t session_id, std::string initial_sql,
-                         std::string custom_title, std::string initial_database) {
-  const DbSession* session = FindSession(app.Get(), session_id);
-  if (session == nullptr) {
-    return 0;
-  }
-  std::string resolved_db = TrimAsciiCopy(initial_database);
-  if (resolved_db.empty()) {
-    resolved_db = DefaultSessionDatabase(*session);
-  }
-  const std::int64_t initial_page_size =
-      app.Get().default_page_size > 0 ? app.Get().default_page_size : kPageSize;
-  std::uint64_t created_id = 0;
-  workspace.Update([&](WorkspaceModel& ws) {
-    WorkspaceTab tab;
-    tab.id = ws.next_tab_id++;
-    created_id = tab.id;
-    tab.kind = WorkspaceTabKind::Sql;
-    tab.session_id = session_id;
-    tab.session_name = session->name;
-    tab.session_uri = session->uri;
-    const bool is_redis = session->dialect == Dialect::Redis;
-    const std::string tab_prefix = is_redis ? "Redis " : std::string(Tr("Query ", "查询 "));
-    tab.title = custom_title.empty()
-                    ? (tab_prefix + std::to_string(ws.next_sql_index++))
-                    : std::move(custom_title);
-    tab.sql.editor = TextEditingValue::FromText(
-        initial_sql.empty() ? std::string{is_redis ? "PING" : "SELECT 1;"}
-                            : std::move(initial_sql));
-    tab.sql.target_database = std::move(resolved_db);
-    tab.sql.page_size = initial_page_size;
-    ws.tabs.push_back(std::move(tab));
-    ws.active_tab_id = created_id;
-  });
-  app.Update([session_id](AppModel& model) {
-    model.active_session = session_id;
-    model.active_object.clear();
-    model.active_is_view = false;
-  });
-  return created_id;
-}
-
-bool SwitchSqlTabSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                         std::uint64_t tab_id, std::uint64_t session_id) {
-  const DbSession* session = FindSession(app.Get(), session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    return false;
-  }
-  const std::string target_name = session->name;
-  const std::string target_uri = session->uri;
-  const bool target_is_redis = session->dialect == Dialect::Redis;
-  const std::string target_db = DefaultSessionDatabase(*session);
-
-  bool switched = false;
-  bool sync_app = false;
-  workspace.Update([&](WorkspaceModel& ws) {
-    WorkspaceTab* target = ws.FindTab(tab_id);
-    if (target == nullptr || target->kind != WorkspaceTabKind::Sql || target->sql.running) {
-      return;
-    }
-    if (target->session_id == session_id && target->session_name == target_name &&
-        target->session_uri == target_uri) {
-      return;
-    }
-    target->session_id = session_id;
-    target->session_name = target_name;
-    target->session_uri = target_uri;
-    target->sql.target_database = target_db;
-    target->sql.page = 0;
-    target->sql.paginated = false;
-    target->sql.has_next_page = false;
-    target->sql.last_sql.clear();
-    target->sql.last_database.clear();
-    target->sql.last_executed_sql.clear();
-    target->sql.last_elapsed_us = -1;
-    target->sql.error.clear();
-    target->sql.status.clear();
-    const std::string trimmed = TrimAsciiCopy(target->sql.editor.text);
-    if (target_is_redis && trimmed == "SELECT 1;") {
-      target->sql.editor = TextEditingValue::FromText("PING");
-    } else if (!target_is_redis && trimmed == "PING") {
-      target->sql.editor = TextEditingValue::FromText("SELECT 1;");
-    }
-    switched = true;
-    sync_app = (ws.active_tab_id == tab_id);
-  });
-  if (switched && sync_app) {
-    app.Update([session_id](AppModel& model) {
-      model.active_session = session_id;
-      model.active_object.clear();
-      model.active_is_view = false;
-    });
-  }
-  return switched;
-}
-
-bool SwitchSqlTabDatabase(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                          std::uint64_t tab_id, std::string database) {
-  (void)app;
-  std::string next_db = TrimAsciiCopy(database);
-  bool switched = false;
-  workspace.Update([&](WorkspaceModel& ws) {
-    WorkspaceTab* target = ws.FindTab(tab_id);
-    if (target == nullptr || target->kind != WorkspaceTabKind::Sql || target->sql.running) {
-      return;
-    }
-    if (target->sql.target_database == next_db) {
-      return;
-    }
-    target->sql.target_database = std::move(next_db);
-    target->sql.page = 0;
-    target->sql.paginated = false;
-    target->sql.has_next_page = false;
-    target->sql.last_sql.clear();
-    target->sql.last_database.clear();
-    target->sql.last_executed_sql.clear();
-    target->sql.last_elapsed_us = -1;
-    target->sql.error.clear();
-    switched = true;
-  });
-  return switched;
-}
-
-std::uint64_t OpenSettingsTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace) {
-  if (const WorkspaceTab* existing = workspace.Get().FindSettingsTab()) {
-    ActivateWorkspaceTab(app, workspace, existing->id);
-    return existing->id;
-  }
-  std::uint64_t created_id = 0;
-  workspace.Update([&](WorkspaceModel& ws) {
-    if (const WorkspaceTab* existing = ws.FindSettingsTab()) {
-      created_id = existing->id;
-      ws.active_tab_id = created_id;
-      return;
-    }
-    WorkspaceTab tab;
-    tab.id = ws.next_tab_id++;
-    created_id = tab.id;
-    tab.kind = WorkspaceTabKind::Settings;
-    tab.session_id = 0;
-    tab.title = std::string(Tr("Settings", "设置"));
-    ws.tabs.push_back(std::move(tab));
-    ws.active_tab_id = created_id;
-  });
-  const WorkspaceModel& ws_now = workspace.Get();
-  app.Update([&ws_now](AppModel& model) { SyncAppFromActiveTab(model, ws_now); });
-  return created_id;
-}
-
-void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                  const TaskScope& tasks, std::uint64_t session_id, std::string object,
-                  std::string db_schema, bool is_view, NotifyFn notify) {
-  if (const WorkspaceTab* existing =
-          workspace.Get().FindTableTab(session_id, object, db_schema, is_view)) {
-    ActivateWorkspaceTab(app, workspace, existing->id);
-    return;
-  }
-  const DbSession* session = FindSession(app.Get(), session_id);
-  if (session == nullptr) {
-    return;
-  }
-
-  const std::int64_t initial_page_size =
-      app.Get().default_page_size > 0 ? app.Get().default_page_size : kPageSize;
-  std::uint64_t created_id = 0;
-  workspace.Update([&](WorkspaceModel& ws) {
-    WorkspaceTab tab;
-    tab.id = ws.next_tab_id++;
-    created_id = tab.id;
-    tab.kind = WorkspaceTabKind::Table;
-    tab.session_id = session_id;
-    tab.session_name = session->name;
-    tab.session_uri = session->uri;
-    tab.title = FormatTabTitle(*session, object, db_schema);
-    tab.object_name = std::move(object);
-    tab.object_schema = std::move(db_schema);
-    tab.is_view = is_view;
-    tab.table.page_size = initial_page_size;
-    ws.tabs.push_back(std::move(tab));
-    ws.active_tab_id = created_id;
-  });
-  const WorkspaceModel& ws_now = workspace.Get();
-  app.Update([&ws_now](AppModel& model) {
-    SyncAppFromActiveTab(model, ws_now);
-    model.error.clear();
-  });
-  RequestLoadTable(app, workspace, tasks, created_id, 0, std::nullopt, {}, false,
-                   std::move(notify), initial_page_size);
-}
-
-void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                    const TaskScope& tasks, ConnectionRequest request, NotifyFn notify,
-                    std::function<void(std::uint64_t)> on_opened) {
-  app.Update([&](AppModel& model) {
-    model.error.clear();
-    model.status =
-        TrFmt("Connecting to {0}...", "正在连接 {0}…",
-              {DisplayNameFromUri(request.uri, Tr("Database", "数据库"))});
-  });
-  tasks.Launch([app, workspace, tasks, request = std::move(request),
-                notify = std::move(notify),
-                on_opened = std::move(on_opened)]() mutable -> Task<void> {
-    AdbcOpenResult opened =
-        co_await RunWorker([request] { return OpenAdbcBlocking(request); });
-    if (!opened.session) {
-      const std::string message =
-          TrFmt("Connection failed: {0}", "连接失败: {0}", {opened.error});
-      app.Update([](AppModel& model) {
-        model.status.clear();
-        model.error.clear();
-      });
-      if (notify) {
-        notify(message);
-      }
-      co_return;
-    }
-
-    AdbcObjectsResult objects = co_await opened.session->sequence.Run(
-        [session = opened.session](std::stop_token) {
-          return LoadObjectsBlocking(*session);
-        });
-    ApplyOpenedSession(app, workspace, tasks, std::move(opened), std::move(request),
-                       std::move(objects), std::move(notify), std::move(on_opened));
-  });
-}
-
-void CloseSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                  const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify) {
-  (void)notify;
-  std::shared_ptr<AdbcSession> adbc_to_close;
-  std::vector<std::uint64_t> tabs_to_close;
-  for (const WorkspaceTab& tab : workspace.Get().tabs) {
-    if (tab.session_id == session_id) {
-      tabs_to_close.push_back(tab.id);
-    }
-  }
-  app.Update([&](AppModel& model) {
-    for (DbSession& session : model.sessions) {
-      if (session.id == session_id) {
-        adbc_to_close = std::move(session.session);
-        break;
-      }
-    }
-    std::erase_if(model.sessions, [session_id](const DbSession& session) {
-      return session.id == session_id;
-    });
-    if (model.sessions.empty()) {
-      model.active_session = 0;
-      model.active_object.clear();
-      model.active_is_view = false;
-      model.status.clear();
-    } else if (model.active_session == session_id) {
-      model.active_session = model.sessions.front().id;
-      model.active_object.clear();
-      model.active_is_view = false;
-    }
-    ++model.revision;
-  });
-  CloseSessionAsync(std::move(adbc_to_close), tasks);
-  if (!tabs_to_close.empty()) {
-    CloseWorkspaceTabs(app, workspace, tabs_to_close);
-  }
-}
-
-void HandleSessionDisconnected(const State<AppModel>& app,
-                                const State<WorkspaceModel>& workspace,
-                                const TaskScope& tasks, std::uint64_t session_id,
-                                std::string reason, NotifyFn notify) {
-  std::shared_ptr<AdbcSession> adbc_to_close;
-  std::string session_name;
-  bool removed = false;
-  app.Update([&](AppModel& model) {
-    for (auto it = model.sessions.begin(); it != model.sessions.end(); ++it) {
-      if (it->id == session_id) {
-        session_name = it->name;
-        adbc_to_close = std::move(it->session);
-        model.sessions.erase(it);
-        removed = true;
-        break;
-      }
-    }
-    if (!removed) {
-      return;
-    }
-    if (model.sessions.empty()) {
-      model.active_session = 0;
-      model.active_object.clear();
-      model.active_is_view = false;
-      model.status.clear();
-    } else if (model.active_session == session_id) {
-      model.active_session = model.sessions.front().id;
-      model.active_object.clear();
-      model.active_is_view = false;
-    }
-    ++model.revision;
-  });
-  if (!removed) {
-    return;
-  }
-  CloseSessionAsync(std::move(adbc_to_close), tasks);
-
-  // Close clean table tabs for the lost session, while keeping SQL tabs and
-  // dirty table tabs so unsaved drafts and editor queries remain intact.
-  std::vector<std::uint64_t> tabs_to_close;
-  for (const WorkspaceTab& tab : workspace.Get().tabs) {
-    if (tab.session_id == session_id && tab.kind == WorkspaceTabKind::Table &&
-        tab.table.pending_inserts.empty()) {
-      tabs_to_close.push_back(tab.id);
-    }
-  }
-  if (!tabs_to_close.empty()) {
-    CloseWorkspaceTabs(app, workspace, tabs_to_close);
-  }
-
-  if (notify) {
-    notify(reason.empty()
-               ? TrFmt("Connection {0} disconnected", "连接 {0} 已断开", {session_name})
-               : TrFmt("Connection {0} disconnected: {1}", "连接 {0} 已断开: {1}",
-                       {session_name, reason}));
-  }
-}
-
-void CloseAllSessions(const State<AppModel>& app, const TaskScope& tasks) {
-  std::vector<std::shared_ptr<AdbcSession>> closing;
-  app.Update([&](AppModel& model) {
-    closing.reserve(model.sessions.size());
-    for (DbSession& session : model.sessions) {
-      if (session.session) {
-        closing.push_back(std::move(session.session));
-      }
-    }
-    model.sessions.clear();
-    model.active_session = 0;
-    model.active_object.clear();
-    model.active_is_view = false;
-    model.status.clear();
-    ++model.revision;
-  });
-  for (std::shared_ptr<AdbcSession>& adbc : closing) {
-    CloseSessionAsync(std::move(adbc), tasks);
-  }
-}
-
-void ScheduleSessionHealthCheck(const State<AppModel>& app,
-                                const State<WorkspaceModel>& workspace,
-                                const TaskScope& tasks, NotifyFn notify) {
-  struct ProbeTarget {
-    std::uint64_t session_id = 0;
-    std::shared_ptr<AdbcSession> adbc;
-  };
-  std::vector<ProbeTarget> targets;
-  {
-    const AppModel& model = app.Get();
-    targets.reserve(model.sessions.size());
-    for (const DbSession& session : model.sessions) {
-      if (session.session && !session.session->IsClosed() &&
-          ShouldHealthCheckSession(session.dialect, session.uri)) {
-        targets.push_back(ProbeTarget{.session_id = session.id, .adbc = session.session});
-      }
-    }
-  }
-  for (ProbeTarget& target : targets) {
-    if (target.adbc->ping_in_flight.exchange(true, std::memory_order_acq_rel)) {
-      continue;
-    }
-    tasks.Launch([app, workspace, tasks, notify, session_id = target.session_id,
-                  adbc = std::move(target.adbc)]() mutable -> Task<void> {
-      struct InFlightGuard {
-        AdbcSession* ptr = nullptr;
-        ~InFlightGuard() {
-          if (ptr != nullptr) {
-            ptr->ping_in_flight.store(false, std::memory_order_release);
-          }
-        }
-      } guard{adbc.get()};
-
-      const AdbcQueryResult ping = co_await adbc->sequence.Run(
-          [adbc](std::stop_token) { return PingSessionBlocking(*adbc); });
-      if (ping.connection_lost && !adbc->IsClosed()) {
-        HandleSessionDisconnected(app, workspace, tasks, session_id, ping.error, notify);
-      }
-    });
-  }
-}
-
-void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                           const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify,
-                           bool notify_success) {
-  const AppModel& snapshot = app.Get();
-  const DbSession* session = FindSession(snapshot, session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-    }
-    return;
-  }
-
-  auto adbc = session->session;
-  std::string session_name = session->name;
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc, session_id,
-                session_name = std::move(session_name), notify_success]() mutable -> Task<void> {
-    AdbcObjectsResult objects = co_await adbc->sequence.Run(
-        [adbc](std::stop_token) { return LoadObjectsBlocking(*adbc); });
-    if (objects.connection_lost) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, objects.error, notify);
-      co_return;
-    }
-    if (!objects.error.empty()) {
-      if (notify) {
-        notify(TrFmt("Refresh failed: {0}", "刷新失败: {0}", {objects.error}));
-      }
-      co_return;
-    }
-
-    bool session_present = false;
-    const std::size_t object_count = objects.objects.size();
-    app.Update([&](AppModel& value) {
-      for (DbSession& open : value.sessions) {
-        if (open.id != session_id) {
-          continue;
-        }
-        session_present = true;
-        open.objects = std::move(objects.objects);
-        ++value.revision;
-        break;
-      }
-    });
-
-    if (!session_present) {
-      co_return;
-    }
-
-    const DbSession* refreshed = FindSession(app.Get(), session_id);
-    std::vector<std::uint64_t> stale_tabs;
-    if (refreshed != nullptr) {
-      for (const WorkspaceTab& tab : workspace.Get().tabs) {
-        if (tab.session_id == session_id && tab.kind == WorkspaceTabKind::Table &&
-            FindObject(*refreshed, tab.object_name, tab.object_schema) == nullptr) {
-          stale_tabs.push_back(tab.id);
-        }
-      }
-    }
-    if (!stale_tabs.empty()) {
-      CloseWorkspaceTabs(app, workspace, stale_tabs);
-    }
-
-    const WorkspaceTab* active_tab = workspace.Get().ActiveTab();
-    if (active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Table &&
-        active_tab->session_id == session_id && active_tab->table.pending_inserts.empty()) {
-      RequestLoadTable(app, workspace, tasks, active_tab->id, active_tab->table.page,
-                       active_tab->table.sort, active_tab->table.filter, true, notify);
-    }
-    if (notify && notify_success) {
-      notify(TrFmt("Refreshed {0} ({1} objects)", "已刷新 {0}（{1} 个对象）",
-                   {session_name, std::to_string(object_count)}));
-    }
-  });
-}
-
-namespace {
-
-std::string EncodeProfileField(std::string_view text) {
-  std::string result;
-  result.reserve(text.size());
-  for (const char c : text) {
-    switch (c) {
-      case '%': result += "%25"; break;
-      case '\t': result += "%09"; break;
-      case '\n': result += "%0A"; break;
-      case '\r': result += "%0D"; break;
-      default: result.push_back(c); break;
-    }
-  }
-  return result;
-}
-
-std::string DecodeProfileField(std::string_view text) {
-  const auto hex_value = [](char c) -> int {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-  };
-  std::string result;
-  result.reserve(text.size());
-  for (std::size_t i = 0; i < text.size(); ++i) {
-    if (text[i] == '%' && i + 2 < text.size()) {
-      const int high = hex_value(text[i + 1]);
-      const int low = hex_value(text[i + 2]);
-      if (high >= 0 && low >= 0) {
-        result.push_back(static_cast<char>((high << 4) | low));
-        i += 2;
-        continue;
-      }
-    }
-    result.push_back(text[i]);
-  }
-  return result;
-}
-
-bool IsWideDisplayCodepoint(std::uint32_t cp) {
-  return (cp >= 0x1100U && cp <= 0x115FU) || (cp >= 0x2E80U && cp <= 0x303EU) ||
-         (cp >= 0x3040U && cp <= 0x33FFU) || (cp >= 0x3400U && cp <= 0x4DBFU) ||
-         (cp >= 0x4E00U && cp <= 0x9FFFU) || (cp >= 0xA960U && cp <= 0xA97FU) ||
-         (cp >= 0xAC00U && cp <= 0xD7A3U) || (cp >= 0xF900U && cp <= 0xFAFFU) ||
-         (cp >= 0xFE10U && cp <= 0xFE6FU) || (cp >= 0xFF00U && cp <= 0xFF60U) ||
-         (cp >= 0xFFE0U && cp <= 0xFFE6U) || cp >= 0x1F000U;
-}
-
-std::size_t Utf8CodepointLength(std::string_view text, std::size_t index, std::uint32_t* codepoint) {
-  const auto b0 = static_cast<unsigned char>(text[index]);
-  if (b0 < 0x80U) {
-    if (codepoint != nullptr) {
-      *codepoint = b0;
-    }
-    return 1;
-  }
-  const auto is_cont = [&](std::size_t pos) {
-    return pos < text.size() && (static_cast<unsigned char>(text[pos]) & 0xC0U) == 0x80U;
-  };
-  if ((b0 & 0xE0U) == 0xC0U && is_cont(index + 1)) {
-    if (codepoint != nullptr) {
-      *codepoint = ((static_cast<std::uint32_t>(b0 & 0x1FU)) << 6U) |
-                   static_cast<std::uint32_t>(static_cast<unsigned char>(text[index + 1]) & 0x3FU);
-    }
-    return 2;
-  }
-  if ((b0 & 0xF0U) == 0xE0U && is_cont(index + 1) && is_cont(index + 2)) {
-    if (codepoint != nullptr) {
-      *codepoint =
-          ((static_cast<std::uint32_t>(b0 & 0x0FU)) << 12U) |
-          ((static_cast<std::uint32_t>(static_cast<unsigned char>(text[index + 1]) & 0x3FU)) << 6U) |
-          static_cast<std::uint32_t>(static_cast<unsigned char>(text[index + 2]) & 0x3FU);
-    }
-    return 3;
-  }
-  if ((b0 & 0xF8U) == 0xF0U && is_cont(index + 1) && is_cont(index + 2) && is_cont(index + 3)) {
-    if (codepoint != nullptr) {
-      *codepoint =
-          ((static_cast<std::uint32_t>(b0 & 0x07U)) << 18U) |
-          ((static_cast<std::uint32_t>(static_cast<unsigned char>(text[index + 1]) & 0x3FU)) << 12U) |
-          ((static_cast<std::uint32_t>(static_cast<unsigned char>(text[index + 2]) & 0x3FU)) << 6U) |
-          static_cast<std::uint32_t>(static_cast<unsigned char>(text[index + 3]) & 0x3FU);
-    }
-    return 4;
-  }
-  if (codepoint != nullptr) {
-    *codepoint = b0;
-  }
-  return 1;
-}
-
-float EstimateDisplayUnits(std::string_view text, float stop_units) {
-  float units = 0.0F;
-  std::size_t i = 0;
-  while (i < text.size()) {
-    std::uint32_t cp = 0;
-    const std::size_t len = Utf8CodepointLength(text, i, &cp);
-    if (cp < 0x80U) {
-      units += 1.0F;
-    } else if (IsWideDisplayCodepoint(cp)) {
-      units += 1.8F;
-    } else {
-      units += 1.1F;
-    }
-    if (units >= stop_units) {
-      return stop_units;
-    }
-    i += len;
-  }
-  return units;
-}
-
-} // namespace
-
-std::string SingleLineCellPreview(std::string_view text) {
-  std::string sanitized;
-  if (!IsValidUtf8(text)) {
-    sanitized = SanitizeUtf8(text);
-    text = sanitized;
-  }
-  constexpr std::size_t kMaxPreviewBytes = 1024;
-  std::string out;
-  out.reserve(std::min(text.size(), kMaxPreviewBytes));
-  bool truncated = false;
-  std::size_t i = 0;
-  while (i < text.size()) {
-    const char c = text[i];
-    if (c == '\r' || c == '\n' || c == '\t') {
-      if (c == '\r' && i + 1 < text.size() && text[i + 1] == '\n') {
-        ++i;
-      }
-      if (out.empty() || out.back() != ' ') {
-        if (out.size() + 1 > kMaxPreviewBytes) {
-          truncated = true;
-          break;
-        }
-        out.push_back(' ');
-      }
-      ++i;
-      continue;
-    }
-    const std::size_t len = Utf8CodepointLength(text, i, nullptr);
-    if (out.size() + len > kMaxPreviewBytes) {
-      truncated = true;
-      break;
-    }
-    out.append(text.substr(i, len));
-    i += len;
-  }
-  if (truncated) {
-    out += "…";
-  }
-  return out;
-}
-
-float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
-                             const GridSnapshot* snapshot) {
-  constexpr std::size_t kMaxSampleRows = 50;
-  constexpr float kMaxMeasuredUnits = 64.0F;
-  const float header_units =
-      EstimateDisplayUnits(SingleLineCellPreview(header), kMaxMeasuredUnits);
-  const float header_px = header_units * 8.5F + 44.0F;
-
-  float content_px = 0.0F;
-  if (snapshot != nullptr && !snapshot->rows.empty()) {
-    float max_cell_units = 0.0F;
-    const std::size_t row_limit = std::min(snapshot->rows.size(), kMaxSampleRows);
-    for (std::size_t row_idx = 0; row_idx < row_limit; ++row_idx) {
-      const GridRow& row = snapshot->rows[row_idx];
-      if (col_index >= row.values.size()) {
-        continue;
-      }
-      const CellValue& cell = row.values[col_index];
-      const float units =
-          cell.is_null ? 4.0F
-                       : EstimateDisplayUnits(SingleLineCellPreview(cell.text), kMaxMeasuredUnits);
-      max_cell_units = std::max(max_cell_units, units);
-      if (max_cell_units >= kMaxMeasuredUnits) {
-        break;
-      }
-    }
-    content_px = max_cell_units * 8.2F + 26.0F;
-  }
-
-  const float raw_width = std::max(header_px, content_px);
-  return std::round(std::clamp(raw_width, kAutoMinColumnWidth, kAutoMaxColumnWidth));
-}
-
-std::vector<ConnectionProfile> LoadConnectionProfilesFromTsv(const std::string& path) {
-  std::vector<ConnectionProfile> profiles;
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    return profiles;
-  }
-  std::string line;
-  while (std::getline(input, line)) {
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-    if (line.empty() || line.front() == '#') {
-      continue;
-    }
-    std::vector<std::string_view> fields;
-    std::size_t start = 0;
-    while (start <= line.size() && fields.size() < 5) {
-      const std::size_t tab = line.find('\t', start);
-      if (tab == std::string::npos) {
-        fields.emplace_back(line.data() + start, line.size() - start);
-        break;
-      }
-      fields.emplace_back(line.data() + start, tab - start);
-      start = tab + 1;
-    }
-    // Accept both legacy 4-column rows (no password) and 5-column rows (with password).
-    if (fields.size() != 4 && fields.size() != 5) {
-      continue;
-    }
-    ConnectionProfile profile;
-    profile.name = DecodeProfileField(fields[0]);
-    profile.driver_path = DecodeProfileField(fields[1]);
-    profile.uri = DecodeProfileField(fields[2]);
-    profile.username = DecodeProfileField(fields[3]);
-    if (fields.size() == 5) {
-      profile.password = DecodeProfileField(fields[4]);
-    }
-    if (!profile.driver_path.empty() && !profile.uri.empty()) {
-      profiles.push_back(std::move(profile));
-    }
-  }
-  return profiles;
-}
-
-bool SaveConnectionProfilesToTsv(const std::string& path,
-                                 const std::vector<ConnectionProfile>& profiles) {
-  const std::filesystem::path file_path(path);
-  if (file_path.has_parent_path()) {
-    std::error_code error;
-    std::filesystem::create_directories(file_path.parent_path(), error);
-  }
-  const std::filesystem::path temp_path =
-      file_path.parent_path() / (file_path.filename().string() + ".tmp");
-  {
-    std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      return false;
-    }
-    output << "# db++ adbc connections v2\n";
-    for (const ConnectionProfile& profile : profiles) {
-      output << EncodeProfileField(profile.name) << '\t'
-             << EncodeProfileField(profile.driver_path) << '\t'
-             << EncodeProfileField(profile.uri) << '\t'
-             << EncodeProfileField(profile.username) << '\t'
-             << EncodeProfileField(profile.password) << '\n';
-    }
-    output.flush();
-    if (!output) {
-      std::error_code ec;
-      std::filesystem::remove(temp_path, ec);
-      return false;
-    }
-  }
-#if !defined(_WIN32)
-  {
-    std::error_code perm_ec;
-    std::filesystem::permissions(
-        temp_path,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace, perm_ec);
-  }
-#endif
-  std::error_code error;
-  std::filesystem::rename(temp_path, file_path, error);
-  if (error) {
-    std::error_code remove_ec;
-    std::filesystem::remove(file_path, remove_ec);
-    error.clear();
-    std::filesystem::rename(temp_path, file_path, error);
-    if (error) {
-      std::error_code cleanup_ec;
-      std::filesystem::remove(temp_path, cleanup_ec);
-      return false;
-    }
-  }
-  return true;
-}
-
-struct SqliteDbGuard {
-  sqlite3* db = nullptr;
-  SqliteDbGuard() = default;
-  SqliteDbGuard(const SqliteDbGuard&) = delete;
-  SqliteDbGuard& operator=(const SqliteDbGuard&) = delete;
-  ~SqliteDbGuard() {
-    if (db != nullptr) {
-      sqlite3_close_v2(db);
-      db = nullptr;
-    }
-  }
-};
-
-struct SqliteStmtGuard {
-  sqlite3_stmt* stmt = nullptr;
-  SqliteStmtGuard() = default;
-  SqliteStmtGuard(const SqliteStmtGuard&) = delete;
-  SqliteStmtGuard& operator=(const SqliteStmtGuard&) = delete;
-  ~SqliteStmtGuard() {
-    if (stmt != nullptr) {
-      sqlite3_finalize(stmt);
-      stmt = nullptr;
-    }
-  }
-};
-
-std::string ColumnTextString(sqlite3_stmt* stmt, int col) {
-  const unsigned char* ptr = sqlite3_column_text(stmt, col);
-  const int bytes = sqlite3_column_bytes(stmt, col);
-  if (ptr == nullptr || bytes <= 0) {
-    return {};
-  }
-  return std::string(reinterpret_cast<const char*>(ptr), static_cast<std::size_t>(bytes));
-}
-
-std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
-  if (path.empty()) {
-    return {};
-  }
-  if (detail::IsLegacyTsvPath(path)) {
-    return LoadConnectionProfilesFromTsv(path);
-  }
-
-  std::error_code ec;
-  const std::filesystem::path target(path);
-  const bool db_exists = std::filesystem::is_regular_file(target, ec);
-  const std::filesystem::path legacy_tsv = target.parent_path() / "connections.tsv";
-  const std::filesystem::path legacy_settings_tsv = target.parent_path() / "settings.tsv";
-  if (!db_exists) {
-    if (std::filesystem::is_regular_file(legacy_tsv, ec) ||
-        std::filesystem::is_regular_file(legacy_settings_tsv, ec)) {
-      if (!detail::EnsureConfigSqliteSync(path)) {
-        return LoadConnectionProfilesFromTsv(legacy_tsv.string());
-      }
-    } else {
-      return {};
-    }
-  }
-
-  SqliteDbGuard db_guard;
-  if (sqlite3_open_v2(path.c_str(), &db_guard.db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
-      db_guard.db == nullptr) {
-    return {};
-  }
-  sqlite3_busy_timeout(db_guard.db, 5000);
-
-  SqliteStmtGuard stmt_guard;
-  std::vector<ConnectionProfile> profiles;
-  if (sqlite3_prepare_v2(
-          db_guard.db,
-          "SELECT name, driver_path, uri, username, password "
-          "FROM connections ORDER BY sort_order ASC, id ASC;",
-          -1, &stmt_guard.stmt, nullptr) == SQLITE_OK) {
-    while (sqlite3_step(stmt_guard.stmt) == SQLITE_ROW) {
-      ConnectionProfile profile;
-      profile.name = ColumnTextString(stmt_guard.stmt, 0);
-      profile.driver_path = ColumnTextString(stmt_guard.stmt, 1);
-      profile.uri = ColumnTextString(stmt_guard.stmt, 2);
-      profile.username = ColumnTextString(stmt_guard.stmt, 3);
-      profile.password = ColumnTextString(stmt_guard.stmt, 4);
-      if (!profile.driver_path.empty() && !profile.uri.empty()) {
-        profiles.push_back(std::move(profile));
-      }
-    }
-  }
-  return profiles;
-}
-
-bool SaveConnectionProfiles(const std::string& path,
-                            const std::vector<ConnectionProfile>& profiles) {
-  if (path.empty()) {
-    return false;
-  }
-  if (detail::IsLegacyTsvPath(path)) {
-    return SaveConnectionProfilesToTsv(path, profiles);
-  }
-  if (!detail::EnsureConfigSqliteSync(path)) {
-    return false;
-  }
-
-  bool ok = false;
-  {
-    SqliteDbGuard db_guard;
-    if (sqlite3_open_v2(path.c_str(), &db_guard.db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK ||
-        db_guard.db == nullptr) {
-      return false;
-    }
-    sqlite3_busy_timeout(db_guard.db, 5000);
-
-    ok = sqlite3_exec(db_guard.db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
-    if (ok) {
-      ok = sqlite3_exec(db_guard.db, "DELETE FROM connections;", nullptr, nullptr, nullptr) ==
-           SQLITE_OK;
-    }
-    if (ok && !profiles.empty()) {
-      SqliteStmtGuard stmt_guard;
-      if (sqlite3_prepare_v2(
-              db_guard.db,
-              "INSERT INTO connections "
-              "(sort_order, name, driver_path, uri, username, password) "
-              "VALUES (?, ?, ?, ?, ?, ?);",
-              -1, &stmt_guard.stmt, nullptr) != SQLITE_OK) {
-        ok = false;
-      } else {
-        for (std::size_t i = 0; i < profiles.size(); ++i) {
-          const auto& p = profiles[i];
-          sqlite3_reset(stmt_guard.stmt);
-          sqlite3_clear_bindings(stmt_guard.stmt);
-          sqlite3_bind_int64(stmt_guard.stmt, 1, static_cast<sqlite3_int64>(i));
-          sqlite3_bind_text(stmt_guard.stmt, 2, p.name.data(), static_cast<int>(p.name.size()),
-                            SQLITE_TRANSIENT);
-          sqlite3_bind_text(stmt_guard.stmt, 3, p.driver_path.data(),
-                            static_cast<int>(p.driver_path.size()), SQLITE_TRANSIENT);
-          sqlite3_bind_text(stmt_guard.stmt, 4, p.uri.data(), static_cast<int>(p.uri.size()),
-                            SQLITE_TRANSIENT);
-          sqlite3_bind_text(stmt_guard.stmt, 5, p.username.data(),
-                            static_cast<int>(p.username.size()), SQLITE_TRANSIENT);
-          sqlite3_bind_text(stmt_guard.stmt, 6, p.password.data(),
-                            static_cast<int>(p.password.size()), SQLITE_TRANSIENT);
-          if (sqlite3_step(stmt_guard.stmt) != SQLITE_DONE) {
-            ok = false;
-            break;
-          }
-        }
-      }
-    }
-    if (ok) {
-      ok = sqlite3_exec(db_guard.db, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK;
-    }
-    if (!ok) {
-      sqlite3_exec(db_guard.db, "ROLLBACK;", nullptr, nullptr, nullptr);
-    }
-  }
-  if (ok) {
-    detail::RestrictConfigFilePermissions(path);
-  }
-  return ok;
-}
-
-std::vector<std::string> OrderConnectionKeys(const std::vector<std::string>& natural_keys,
-                                             const std::vector<std::string>& custom_order) {
-  std::vector<std::string> ordered;
-  ordered.reserve(natural_keys.size());
-  for (const std::string& key : custom_order) {
-    if (std::ranges::find(natural_keys, key) != natural_keys.end() &&
-        std::ranges::find(ordered, key) == ordered.end()) {
-      ordered.push_back(key);
-    }
-  }
-  for (const std::string& key : natural_keys) {
-    if (std::ranges::find(ordered, key) == ordered.end()) {
-      ordered.push_back(key);
-    }
-  }
-  return ordered;
-}
-
-std::vector<std::string> ReorderConnectionKeys(const std::vector<std::string>& natural_keys,
-                                               const std::vector<std::string>& custom_order,
-                                               std::string_view from_key,
-                                               std::string_view to_key) {
-  std::vector<std::string> ordered = OrderConnectionKeys(natural_keys, custom_order);
-  const auto from_it = std::ranges::find(ordered, from_key);
-  const auto to_it = std::ranges::find(ordered, to_key);
-  if (from_it == ordered.end() || to_it == ordered.end() || from_it == to_it) {
-    return ordered;
-  }
-  const std::size_t from_idx = static_cast<std::size_t>(from_it - ordered.begin());
-  const std::size_t to_idx = static_cast<std::size_t>(to_it - ordered.begin());
-  std::string moved = std::move(ordered[from_idx]);
-  ordered.erase(ordered.begin() + static_cast<std::ptrdiff_t>(from_idx));
-  ordered.insert(ordered.begin() + static_cast<std::ptrdiff_t>(to_idx), std::move(moved));
-  return ordered;
-}
-
-SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect, std::string_view sql,
-                                            std::int64_t page_size, std::int64_t page) {
-  if (dialect == Dialect::Redis || page_size <= 0) {
-    return {std::string(sql), false, 0, 0};
-  }
-
-  struct Depth0Token {
-    bool is_word = false;
-    std::string upper;
-  };
-  std::vector<Depth0Token> depth0_tokens;
-  int depth = 0;
-  bool seen_semicolon = false;
-  std::size_t body_end = 0;
-  std::size_t i = 0;
-  const std::size_t n = sql.size();
-
-  const auto is_word_start = [](unsigned char ch) {
-    return std::isalpha(ch) != 0 || ch == '_';
-  };
-  const auto is_word_char = [](unsigned char ch) {
-    return std::isalnum(ch) != 0 || ch == '_';
-  };
-
-  while (i < n) {
-    const unsigned char ch = static_cast<unsigned char>(sql[i]);
-    if (std::isspace(ch) != 0) {
-      ++i;
-      continue;
-    }
-    if (ch == '-' && i + 1 < n && sql[i + 1] == '-') {
-      i += 2;
-      while (i < n && sql[i] != '\n') {
-        ++i;
-      }
-      continue;
-    }
-    if (ch == '/' && i + 1 < n && sql[i + 1] == '*') {
-      i += 2;
-      while (i + 1 < n && !(sql[i] == '*' && sql[i + 1] == '/')) {
-        ++i;
-      }
-      i = (i + 1 < n) ? (i + 2) : n;
-      continue;
-    }
-
-    if (depth == 0 && ch == ';') {
-      seen_semicolon = true;
-      ++i;
-      continue;
-    }
-    if (seen_semicolon) {
-      return {std::string(sql), false, 0};
-    }
-
-    if (ch == '\'') {
-      ++i;
-      while (i < n) {
-        if (dialect == Dialect::Mysql && sql[i] == '\\' && i + 1 < n) {
-          i += 2;
-          continue;
-        }
-        if (sql[i] == '\'') {
-          if (i + 1 < n && sql[i + 1] == '\'') {
-            i += 2;
-            continue;
-          }
-          ++i;
-          break;
-        }
-        ++i;
-      }
-      body_end = i;
-      if (depth == 0) {
-        depth0_tokens.push_back({false, {}});
-      }
-      continue;
-    }
-
-    if (ch == '"' || ch == '`') {
-      const char quote = static_cast<char>(ch);
-      ++i;
-      while (i < n) {
-        if (sql[i] == quote) {
-          if (i + 1 < n && sql[i + 1] == quote) {
-            i += 2;
-            continue;
-          }
-          ++i;
-          break;
-        }
-        ++i;
-      }
-      body_end = i;
-      if (depth == 0) {
-        depth0_tokens.push_back({false, {}});
-      }
-      continue;
-    }
-
-    if (ch == '[') {
-      ++i;
-      while (i < n) {
-        if (sql[i] == ']') {
-          if (i + 1 < n && sql[i + 1] == ']') {
-            i += 2;
-            continue;
-          }
-          ++i;
-          break;
-        }
-        ++i;
-      }
-      body_end = i;
-      if (depth == 0) {
-        depth0_tokens.push_back({false, {}});
-      }
-      continue;
-    }
-
-    if (ch == '$') {
-      std::size_t tag_end = i + 1;
-      while (tag_end < n && is_word_char(static_cast<unsigned char>(sql[tag_end]))) {
-        ++tag_end;
-      }
-      if (tag_end < n && sql[tag_end] == '$') {
-        const std::string_view tag = sql.substr(i, tag_end - i + 1);
-        const std::size_t close_pos = sql.find(tag, tag_end + 1);
-        if (close_pos != std::string_view::npos) {
-          i = close_pos + tag.size();
-          body_end = i;
-          if (depth == 0) {
-            depth0_tokens.push_back({false, {}});
-          }
-          continue;
-        }
-      }
-    }
-
-    if (ch == '(') {
-      if (depth == 0) {
-        depth0_tokens.push_back({false, {}});
-      }
-      ++depth;
-      ++i;
-      body_end = i;
-      continue;
-    }
-
-    if (ch == ')') {
-      if (depth > 0) {
-        --depth;
-      }
-      ++i;
-      body_end = i;
-      if (depth == 0) {
-        depth0_tokens.push_back({false, {}});
-      }
-      continue;
-    }
-
-    if (is_word_start(ch)) {
-      const std::size_t start = i;
-      ++i;
-      while (i < n && is_word_char(static_cast<unsigned char>(sql[i]))) {
-        ++i;
-      }
-      body_end = i;
-      if (depth == 0) {
-        depth0_tokens.push_back({true, UpperAsciiCopy(sql.substr(start, i - start))});
-      }
-      continue;
-    }
-
-    ++i;
-    body_end = i;
-    if (depth == 0) {
-      depth0_tokens.push_back({false, {}});
-    }
-  }
-
-  if (depth0_tokens.empty() || !depth0_tokens.front().is_word || body_end == 0) {
-    return {std::string(sql), false, 0};
-  }
-
-  const auto is_select_top = [&](std::size_t select_index) {
-    if (select_index + 1 >= depth0_tokens.size() || !depth0_tokens[select_index + 1].is_word) {
-      return false;
-    }
-    const std::string& next = depth0_tokens[select_index + 1].upper;
-    if (next == "TOP") {
-      return true;
-    }
-    if ((next == "DISTINCT" || next == "ALL") && select_index + 2 < depth0_tokens.size() &&
-        depth0_tokens[select_index + 2].is_word &&
-        depth0_tokens[select_index + 2].upper == "TOP") {
-      return true;
-    }
-    return false;
-  };
-
-  const std::string& first = depth0_tokens.front().upper;
-  if (first == "SELECT") {
-    if (is_select_top(0)) {
-      return {std::string(sql), false, 0};
-    }
-  } else if (first == "WITH") {
-    bool found_read_verb = false;
-    for (std::size_t idx = 1; idx < depth0_tokens.size(); ++idx) {
-      if (!depth0_tokens[idx].is_word) {
-        continue;
-      }
-      const std::string& word = depth0_tokens[idx].upper;
-      if (word == "SELECT" || word == "TABLE" || word == "VALUES") {
-        if (word == "SELECT" && is_select_top(idx)) {
-          return {std::string(sql), false, 0};
-        }
-        found_read_verb = true;
-        break;
-      }
-      if (word == "INSERT" || word == "UPDATE" || word == "DELETE" || word == "MERGE") {
-        return {std::string(sql), false, 0};
-      }
-    }
-    if (!found_read_verb) {
-      return {std::string(sql), false, 0};
-    }
-  } else if (first != "TABLE") {
-    return {std::string(sql), false, 0};
-  }
-
-  for (const Depth0Token& token : depth0_tokens) {
-    if (!token.is_word) {
-      continue;
-    }
-    if (token.upper == "LIMIT" || token.upper == "FETCH" || token.upper == "OFFSET" ||
-        token.upper == "FOR" || token.upper == "INTO" || token.upper == "LOCK") {
-      return {std::string(sql), false, 0};
-    }
-  }
-
-  const std::int64_t limit = std::clamp(page_size, kMinPageSize, kMaxPageSize);
-  const std::int64_t clamped_page = std::max<std::int64_t>(0, page);
-  const std::int64_t offset =
-      (clamped_page > 0 && limit > std::numeric_limits<std::int64_t>::max() / clamped_page)
-          ? std::numeric_limits<std::int64_t>::max()
-          : clamped_page * limit;
-  std::string_view body = sql.substr(0, body_end);
-  while (!body.empty() && std::isspace(static_cast<unsigned char>(body.back())) != 0) {
-    body.remove_suffix(1);
-  }
-  if (body.empty()) {
-    return {std::string(sql), false, 0, 0};
-  }
-  std::string rewritten_sql = std::string(body) + "\nLIMIT " + std::to_string(limit + 1);
-  if (offset > 0) {
-    rewritten_sql += " OFFSET " + std::to_string(offset);
-  }
-  return SqlLimitRewriteResult{
-      .sql = std::move(rewritten_sql),
-      .applied = true,
-      .effective_limit = limit,
-      .effective_offset = offset,
-  };
-}
-
-std::string FormatExecutionDuration(std::int64_t elapsed_us) {
-  if (elapsed_us < 0) {
-    return {};
-  }
-  if (elapsed_us < 10000) {
-    const std::int64_t tenths = (elapsed_us + 50) / 100;
-    if (tenths >= 100) {
-      return std::to_string(tenths / 10) + " ms";
-    }
-    return std::to_string(tenths / 10) + "." + std::to_string(tenths % 10) + " ms";
-  }
-  if (elapsed_us < 1000000) {
-    const std::int64_t millis = (elapsed_us + 500) / 1000;
-    if (millis >= 1000) {
-      return "1.00 s";
-    }
-    return std::to_string(millis) + " ms";
-  }
-  const std::int64_t hundredths = (elapsed_us + 5000) / 10000;
-  const std::int64_t secs = hundredths / 100;
-  const std::int64_t frac = hundredths % 100;
-  std::string frac_str = std::to_string(frac);
-  if (frac < 10) {
-    frac_str = "0" + frac_str;
-  }
-  return std::to_string(secs) + "." + frac_str + " s";
-}
-
-std::string CompactSqlPreview(std::string_view sql, std::size_t max_bytes) {
-  std::string out;
-  out.reserve(std::min<std::size_t>(sql.size(), max_bytes == 0 ? 0 : max_bytes + 3));
-  bool prev_space = true;
-  for (const unsigned char ch : sql) {
-    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\v' || ch == '\f') {
-      if (!prev_space) {
-        out.push_back(' ');
-        prev_space = true;
-      }
-      continue;
-    }
-    out.push_back(static_cast<char>(ch));
-    prev_space = false;
-  }
-  if (!out.empty() && out.back() == ' ') {
-    out.pop_back();
-  }
-  if (max_bytes > 0 && out.size() > max_bytes) {
-    std::size_t cut = max_bytes;
-    while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0U) == 0x80U) {
-      --cut;
-    }
-    out.resize(cut);
-    while (!out.empty() && out.back() == ' ') {
-      out.pop_back();
-    }
-    out += "...";
-  }
-  return out;
-}
+} // namespace detail
 
 } // namespace dbpp

@@ -5,8 +5,8 @@ import dbpp.settings;
 import dbpp.types;
 import dbpp.adbc;
 
-#include "theme_palette.h"
-#include "theme.h"
+#include "ui/theme_palette.h"
+#include "ui/theme.h"
 
 #include <algorithm>
 #include <chrono>
@@ -114,13 +114,12 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
             Background{VisualFill{background}}, Border{border, 1.0F});
 }
 
-[[huxerui::composable]] View ActionButton(View action, ButtonTone tone) {
-  const ThemeSpec& spec = UseTheme();
-  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
-  ButtonStyle style = UseEnvironment<ButtonStyle>();
-  style.corner_radii = CornerRadii{6.0F};
+namespace {
 
-  Color border_color = semantic.border_subtle;
+huxerui::Color ConfigureActionButtonStyle(ButtonStyle& style, ButtonTone tone,
+                                          const ThemeSpec& spec,
+                                          const SemanticColors& semantic, float font_size_px) {
+  huxerui::Color border_color = semantic.border_subtle;
   switch (tone) {
     case ButtonTone::Primary: {
       const bool light_ink = semantic.on_primary_button.red > 0.5F;
@@ -130,7 +129,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
                                     : Color::Rgb(0, 0, 0, 0.14F);
       style.background = semantic.primary_button_fill;
       style.label_style =
-          TextStyle{Font::System(font_size::kBody).WithWeight(FontWeight::Medium),
+          TextStyle{Font::System(font_size_px).WithWeight(FontWeight::Medium),
                     semantic.on_primary_button};
       style.indication = TintedIndication(hover, press, spec.colors.primary);
       border_color = Color::Transparent();
@@ -139,7 +138,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
     case ButtonTone::Danger:
       style.background = VisualFill{semantic.danger_container};
       style.label_style =
-          TextStyle{Font::System(font_size::kBody).WithWeight(FontWeight::Medium), semantic.danger};
+          TextStyle{Font::System(font_size_px).WithWeight(FontWeight::Medium), semantic.danger};
       style.indication = TintedIndication(WithAlpha(semantic.danger, 0.12F),
                                           WithAlpha(semantic.danger, 0.20F), semantic.danger);
       border_color = WithAlpha(semantic.danger, 0.45F);
@@ -147,7 +146,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
     case ButtonTone::DangerSolid:
       style.background = VisualFill{semantic.danger_solid};
       style.label_style =
-          TextStyle{Font::System(font_size::kBody).WithWeight(FontWeight::SemiBold),
+          TextStyle{Font::System(font_size_px).WithWeight(FontWeight::SemiBold),
                     semantic.on_danger};
       style.indication = TintedIndication(Color::Rgb(255, 255, 255, 0.14F),
                                           Color::Rgb(255, 255, 255, 0.22F), semantic.danger_solid);
@@ -156,7 +155,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
     case ButtonTone::Subtle:
       style.background = VisualFill{Color::Transparent()};
       style.label_style =
-          TextStyle{Font::System(font_size::kBody), spec.colors.on_surface_variant};
+          TextStyle{Font::System(font_size_px), spec.colors.on_surface_variant};
       style.indication =
           TintedIndication(semantic.hover_fill, semantic.press_fill, spec.colors.primary);
       border_color = Color::Transparent();
@@ -164,16 +163,92 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
     case ButtonTone::Default:
     default:
       style.background = VisualFill{spec.colors.surface};
-      style.label_style = TextStyle{Font::System(font_size::kBody), spec.colors.on_surface};
+      style.label_style = TextStyle{Font::System(font_size_px), spec.colors.on_surface};
       style.indication =
           TintedIndication(semantic.hover_fill, semantic.press_fill, spec.colors.primary);
       border_color = semantic.border_subtle;
       break;
   }
+  return border_color;
+}
+
+} // namespace
+
+[[huxerui::composable]] View ActionButton(View action, ButtonTone tone) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  ButtonStyle style = UseEnvironment<ButtonStyle>();
+  style.corner_radii = CornerRadii{6.0F};
+  const Color border_color =
+      ConfigureActionButtonStyle(style, tone, spec, semantic, font_size::kBody);
 
   ThemeDefinition definition = OverrideButtonStyle(std::move(style));
   View button = action;
   button = std::move(button).With(Border{border_color, 1.0F}, CornerRadius{6.0F});
+  return Theme(std::move(definition), std::move(button));
+}
+
+[[huxerui::composable]] View CompactActionButton(View action, ButtonTone tone, float height,
+                                                 float horizontal_padding) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  ButtonStyle style = UseEnvironment<ButtonStyle>();
+  style.corner_radii = CornerRadii{6.0F};
+  style.minimum_height = height;
+  style.padding = EdgeInsets::Symmetric(horizontal_padding, 0.0F);
+  const Color border_color =
+      ConfigureActionButtonStyle(style, tone, spec, semantic, font_size::kChip);
+
+  ThemeDefinition definition = OverrideButtonStyle(std::move(style));
+  View button = action;
+  button = std::move(button).With(
+      Frame{.height = height, .min_height = height, .max_height = height},
+      Border{border_color, 1.0F}, CornerRadius{6.0F});
+  return Theme(std::move(definition), std::move(button));
+}
+
+[[huxerui::composable]] View CompactTextField(View field, float height, float horizontal_padding,
+                                              float font_size_px) {
+  TextFieldStyle style = UseEnvironment<TextFieldStyle>();
+  style.show_label = false;
+  style.outlined.minimum_height = height;
+  style.outlined.corner_radii = CornerRadii{6.0F};
+  style.text_style.font = Font::System(font_size_px);
+  style.placeholder_style.font = Font::System(font_size_px);
+  style.padding = EdgeInsets::Symmetric(horizontal_padding, 0.0F);
+  ThemeDefinition definition = OverrideTextFieldStyle(std::move(style));
+  View wrapped = field;
+  wrapped = std::move(wrapped).With(
+      Frame{.height = height, .min_height = height, .max_height = height});
+  return Theme(std::move(definition), std::move(wrapped));
+}
+
+[[huxerui::composable]] View CompactPagerButton(std::string label, std::function<void()> on_click,
+                                                bool enabled, float height,
+                                                std::optional<StringVariant> tooltip) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  ButtonStyle style = UseEnvironment<ButtonStyle>();
+  style.minimum_height = height;
+  style.padding = EdgeInsets::Symmetric(6.0F, 0.0F);
+  style.corner_radii = CornerRadii{5.0F};
+  style.background = VisualFill{Color::Transparent()};
+  style.label_style =
+      TextStyle{Font::Monospace(font_size::kCaption).WithWeight(FontWeight::Medium),
+                spec.colors.on_surface};
+  style.indication =
+      TintedIndication(semantic.hover_fill, semantic.press_fill, spec.colors.primary);
+
+  ThemeDefinition definition = OverrideButtonStyle(std::move(style));
+  View button = Button(label)
+                    .OnClick(on_click)
+                    .With(Enabled{enabled},
+                          Frame{.height = height, .min_width = 24.0F, .min_height = height,
+                                .max_height = height},
+                          CornerRadius{5.0F});
+  if (tooltip.has_value()) {
+    button = std::move(button).With(Tooltip(*tooltip));
+  }
   return Theme(std::move(definition), std::move(button));
 }
 
@@ -315,31 +390,41 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
                      : (options.active_hint ? WithAlpha(spec.colors.primary, 0.28F)
                                             : Color::Transparent()));
 
-  const float left_padding = 8.0F + static_cast<float>(std::max(0, options.indent_level)) * 12.0F;
+  constexpr float kBaseLeftPadding = 6.0F;
+  constexpr float kIndentStep = 14.0F;
+  constexpr float kChevronSlot = 12.0F;
+  const float left_padding =
+      kBaseLeftPadding + static_cast<float>(std::max(0, options.indent_level)) * kIndentStep;
 
-  Views children;
+  Views main_children;
   if (options.expanded.has_value()) {
     const Color p_color = options.selected
                               ? spec.colors.primary
                               : options.prefix_color.value_or(secondary);
-    children.Add(
+    main_children.Add(
         TintedIcon(*options.expanded ? app::images::chevron_down : app::images::chevron_right,
-                   p_color, 12.0F));
+                   p_color, kChevronSlot));
   } else if (!options.prefix.empty()) {
     const Color p_color = options.selected
                               ? spec.colors.primary
                               : options.prefix_color.value_or(secondary);
-    children.Add(Text(options.prefix)
-                     .Style(TextStyle{Font::System(font_size::kCaption), p_color})
-                     .Align(TextAlign::Center)
-                     .LineLimit(1)
-                     .With(Frame{.width = 12.0F}));
+    main_children.Add(Text(options.prefix)
+                          .Style(TextStyle{Font::System(font_size::kCaption), p_color})
+                          .Align(TextAlign::Center)
+                          .LineLimit(1)
+                          .With(Frame{.width = kChevronSlot, .min_width = kChevronSlot,
+                                      .max_width = kChevronSlot}));
+  } else {
+    main_children.Add(Spacer().With(
+        Grow(0.0F),
+        Frame{.width = kChevronSlot, .height = kChevronSlot, .min_width = kChevronSlot,
+              .max_width = kChevronSlot, .min_height = kChevronSlot, .max_height = kChevronSlot}));
   }
   const bool has_leading_icon = static_cast<bool>(options.leading_icon);
   if (options.leading_icon) {
-    children.Add(std::move(options.leading_icon));
+    main_children.Add(options.leading_icon);
   } else if (options.status_dot.has_value()) {
-    children.Add(AccentDot(*options.status_dot, 7.0F));
+    main_children.Add(AccentDot(*options.status_dot, 7.0F));
   }
 
   const float font_px =
@@ -347,33 +432,50 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
   const Font label_font = (options.emphasize || options.selected)
                               ? Font::System(font_px).WithWeight(FontWeight::SemiBold)
                               : Font::System(font_px);
-  children.Add(Text(options.label)
-                   .Style(TextStyle{label_font, foreground})
-                   .LineLimit(1)
-                   .Overflow(TextOverflow::Ellipsis)
-                   .With(Grow(1.0F)));
+  main_children.Add(Text(options.label)
+                        .Style(TextStyle{label_font, foreground})
+                        .LineLimit(1)
+                        .Overflow(TextOverflow::Ellipsis)
+                        .With(Grow(1.0F)));
 
   if (has_leading_icon && options.status_dot.has_value()) {
-    children.Add(AccentDot(*options.status_dot, 6.0F));
+    main_children.Add(AccentDot(*options.status_dot, 6.0F));
   }
 
   if (!options.trailing_text.empty()) {
-    children.Add(Text(options.trailing_text)
-                     .Style(TextStyle{Font::System(font_size::kCaption), secondary})
-                     .LineLimit(1));
+    main_children.Add(Text(options.trailing_text)
+                          .Style(TextStyle{Font::System(font_size::kCaption), secondary})
+                          .LineLimit(1));
   }
 
-  View row = Row{std::move(children)}.With(
-      Frame{.min_height = 26.0F},
-      Padding{EdgeInsets{.top = 4.0F, .right = 8.0F, .bottom = 4.0F, .left = left_padding}},
-      Spacing{5.0F}, CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+  const bool has_trailing_action = static_cast<bool>(options.trailing_action);
+  View main_area =
+      Row{std::move(main_children)}
+          .With(Grow(1.0F),
+                Padding{EdgeInsets{.top = 3.0F,
+                                   .right = has_trailing_action ? 2.0F : 6.0F,
+                                   .bottom = 3.0F,
+                                   .left = left_padding}},
+                Spacing{4.0F}, CrossAlign{CrossAxisAlignment::Center});
+  if (on_click) {
+    main_area = std::move(main_area).OnClick(std::move(on_click));
+  }
+
+  Views outer_children;
+  outer_children.Add(std::move(main_area));
+  if (has_trailing_action) {
+    outer_children.Add(options.trailing_action);
+  }
+
+  return Row{std::move(outer_children)}.With(
+      Frame{.min_height = 24.0F},
+      Padding{EdgeInsets{.top = 0.0F,
+                         .right = has_trailing_action ? 3.0F : 0.0F,
+                         .bottom = 0.0F,
+                         .left = 0.0F}},
+      Spacing{0.0F}, CrossAlign{CrossAxisAlignment::Center}, CornerRadius{5.0F},
       Background{VisualFill{bg_color}}, Border{border_color, 1.0F},
       InteractionSink{interaction});
-
-  if (on_click) {
-    return std::move(row).OnClick(std::move(on_click));
-  }
-  return row;
 }
 
 [[huxerui::composable]] View WorkspaceTabItem(WorkspaceTabItemOptions options,

@@ -7,7 +7,7 @@
 
 import dbpp.settings;
 
-#include "theme_palette.h"
+#include "ui/theme_palette.h"
 
 namespace dbpp::ui {
 
@@ -42,6 +42,29 @@ LinearGradient TriGradient(Color a, Color b, Color c) {
   };
 }
 
+LinearGradient QuadGradient(Color a, Color b, Color c, Color d) {
+  return LinearGradient{
+      .start = {0.0F, 0.5F},
+      .end = {1.0F, 0.5F},
+      .stops =
+          {
+              GradientStop{.offset = 0.0F, .color = a},
+              GradientStop{.offset = 0.34F, .color = b},
+              GradientStop{.offset = 0.67F, .color = c},
+              GradientStop{.offset = 1.0F, .color = d},
+          },
+      .transform = {},
+  };
+}
+
+inline constexpr Color kGeminiBlue = Color::Rgb(66, 133, 244);
+inline constexpr Color kGeminiBlueDark = Color::Rgb(106, 166, 255);
+inline constexpr Color kGeminiRed = Color::Rgb(234, 67, 53);
+inline constexpr Color kGeminiRedDark = Color::Rgb(242, 108, 96);
+inline constexpr Color kGeminiYellow = Color::Rgb(251, 188, 5);
+inline constexpr Color kGeminiYellowLight = Color::Rgb(244, 180, 0);
+inline constexpr Color kGeminiGreen = Color::Rgb(52, 168, 83);
+
 RadialGradient SoftGlow(Color inner, Color mid) {
   return RadialGradient{
       .center = {0.5F, 0.36F},
@@ -72,12 +95,11 @@ const std::vector<ThemePresetMeta>& AvailableThemePresets() {
       ThemePresetMeta{
           .preset = ThemePreset::GeminiSpark,
           .name = "Gemini 星光",
-          .subtitle = "蓝紫珊瑚渐变 · 四色语义高光",
-          .swatch_a = Color::Rgb(66, 133, 244),
-          .swatch_b = Color::Rgb(155, 114, 203),
-          .swatch_c = Color::Rgb(217, 101, 112),
-          .swatch_bar = TriGradient(Color::Rgb(66, 133, 244), Color::Rgb(155, 114, 203),
-                                    Color::Rgb(217, 101, 112)),
+          .subtitle = "蓝红黄绿四色渐变 · 基础语义高光",
+          .swatch_a = kGeminiBlue,
+          .swatch_b = kGeminiGreen,
+          .swatch_c = kGeminiYellow,
+          .swatch_bar = QuadGradient(kGeminiBlue, kGeminiRed, kGeminiYellow, kGeminiGreen),
       },
       ThemePresetMeta{
           .preset = ThemePreset::Emerald,
@@ -168,9 +190,9 @@ ThemeSpec BuildThemeSpec(ThemePreset preset, bool dark) {
         c.inverse_surface = Color::Rgb(236, 241, 250);
         c.inverse_on_surface = Color::Rgb(18, 24, 38);
         c.scrim = Color::Rgb(5, 8, 16, 0.58F);
-        c.error = Color::Rgb(248, 113, 113);
+        c.error = kGeminiRedDark;
       } else {
-        c.primary = Color::Rgb(66, 133, 244);
+        c.primary = kGeminiBlue;
         c.on_primary = Color::Rgb(255, 255, 255);
         c.primary_container = Color::Rgb(226, 238, 255);
         c.on_primary_container = Color::Rgb(22, 68, 150);
@@ -192,7 +214,7 @@ ThemeSpec BuildThemeSpec(ThemePreset preset, bool dark) {
         c.inverse_surface = Color::Rgb(28, 36, 54);
         c.inverse_on_surface = Color::Rgb(245, 247, 252);
         c.scrim = Color::Rgb(15, 20, 36, 0.42F);
-        c.error = Color::Rgb(217, 63, 76);
+        c.error = kGeminiRed;
       }
       break;
 
@@ -415,26 +437,34 @@ ThemeSpec BuildThemeSpec(ThemePreset preset, bool dark) {
 SemanticColors BuildSemanticColors(ThemePreset preset, bool dark) {
   SemanticColors sem;
   if (dark) {
-    sem.success = Color::Rgb(74, 222, 128);
+    sem.success = Color::Rgb(74, 210, 112);
     sem.success_container = Color::Rgb(20, 56, 36);
-    sem.warning = Color::Rgb(251, 191, 36);
+    sem.warning = kGeminiYellow;
     sem.warning_container = Color::Rgb(62, 46, 18);
-    sem.danger = Color::Rgb(248, 113, 113);
-    sem.danger_solid = Color::Rgb(220, 53, 69);
+    sem.danger = kGeminiRedDark;
+    sem.danger_solid = kGeminiRed;
     sem.on_danger = Color::Rgb(255, 255, 255);
     sem.danger_container = Color::Rgb(68, 28, 34);
     sem.on_primary_button = Color::Rgb(255, 255, 255);
   } else {
-    sem.success = Color::Rgb(24, 148, 92);
+    sem.success = kGeminiGreen;
     sem.success_container = Color::Rgb(220, 248, 232);
-    sem.warning = Color::Rgb(194, 114, 0);
+    sem.warning = Color::Rgb(214, 152, 0);
     sem.warning_container = Color::Rgb(254, 243, 214);
-    sem.danger = Color::Rgb(217, 63, 76);
-    sem.danger_solid = Color::Rgb(217, 63, 76);
+    sem.danger = kGeminiRed;
+    sem.danger_solid = kGeminiRed;
     sem.on_danger = Color::Rgb(255, 255, 255);
     sem.danger_container = Color::Rgb(254, 232, 234);
     sem.on_primary_button = Color::Rgb(255, 255, 255);
   }
+  sem.status_connected = kGeminiGreen;
+  sem.status_failed = kGeminiRed;
+
+  sem.accent_database = dark ? kGeminiYellow : kGeminiYellowLight;
+  sem.accent_table = kGeminiGreen;
+  sem.accent_view = dark ? kGeminiBlueDark : kGeminiBlue;
+  sem.accent_sql = dark ? kGeminiRedDark : kGeminiRed;
+  sem.accent_external = sem.accent_database;
 
   switch (preset) {
     case ThemePreset::GeminiSpark:
@@ -446,30 +476,19 @@ SemanticColors BuildSemanticColors(ThemePreset preset, bool dark) {
           dark ? Color::Rgb(128, 168, 255, 0.11F) : Color::Rgb(66, 133, 244, 0.08F);
       sem.press_fill =
           dark ? Color::Rgb(128, 168, 255, 0.18F) : Color::Rgb(66, 133, 244, 0.14F);
-      sem.accent_table = dark ? Color::Rgb(106, 166, 255) : Color::Rgb(66, 133, 244);
-      sem.accent_view = dark ? Color::Rgb(182, 146, 246) : Color::Rgb(139, 92, 246);
-      sem.accent_sql = dark ? Color::Rgb(240, 138, 149) : Color::Rgb(155, 114, 203);
-      sem.accent_external = sem.warning;
-      sem.category_local = sem.success;
-      sem.category_relational = sem.accent_table;
-      sem.category_analytics = sem.accent_view;
-      sem.category_custom = sem.warning;
+      sem.category_local = kGeminiGreen;
+      sem.category_relational = dark ? kGeminiBlueDark : kGeminiBlue;
+      sem.category_analytics = sem.accent_sql;
+      sem.category_custom = sem.accent_database;
       sem.null_text = dark ? Color::Rgb(138, 152, 186) : Color::Rgb(124, 136, 164);
-      sem.draft_accent = sem.warning;
-      sem.accent_gradient = dark
-                                ? TriGradient(Color::Rgb(96, 165, 250), Color::Rgb(182, 146, 246),
-                                              Color::Rgb(240, 138, 149))
-                                : TriGradient(Color::Rgb(66, 133, 244), Color::Rgb(155, 114, 203),
-                                              Color::Rgb(217, 101, 112));
+      sem.draft_accent = sem.accent_database;
+      sem.accent_gradient = QuadGradient(kGeminiBlue, kGeminiRed, kGeminiYellow, kGeminiGreen);
       sem.primary_button_fill =
-          dark ? TriGradient(Color::Rgb(58, 120, 240), Color::Rgb(131, 92, 230),
-                             Color::Rgb(179, 100, 158))
-               : TriGradient(Color::Rgb(56, 125, 244), Color::Rgb(124, 99, 224),
-                             Color::Rgb(166, 106, 178));
-      sem.hero_glow = dark ? SoftGlow(Color::Rgb(96, 165, 250, 0.13F),
-                                      Color::Rgb(182, 146, 246, 0.08F))
-                           : SoftGlow(Color::Rgb(66, 133, 244, 0.10F),
-                                      Color::Rgb(155, 114, 203, 0.06F));
+          HorizontalGradient(Color::Rgb(56, 125, 244), Color::Rgb(42, 108, 226));
+      sem.hero_glow = dark ? SoftGlow(WithAlpha(kGeminiBlue, 0.13F),
+                                      WithAlpha(kGeminiGreen, 0.08F))
+                           : SoftGlow(WithAlpha(kGeminiBlue, 0.10F),
+                                      WithAlpha(kGeminiGreen, 0.06F));
       sem.uses_gradient_chrome = true;
       break;
 
@@ -482,10 +501,6 @@ SemanticColors BuildSemanticColors(ThemePreset preset, bool dark) {
           dark ? Color::Rgb(45, 212, 191, 0.11F) : Color::Rgb(13, 148, 136, 0.08F);
       sem.press_fill =
           dark ? Color::Rgb(45, 212, 191, 0.18F) : Color::Rgb(13, 148, 136, 0.14F);
-      sem.accent_table = dark ? Color::Rgb(45, 212, 191) : Color::Rgb(13, 148, 136);
-      sem.accent_view = dark ? Color::Rgb(56, 189, 248) : Color::Rgb(2, 132, 199);
-      sem.accent_sql = dark ? Color::Rgb(74, 222, 128) : Color::Rgb(16, 185, 129);
-      sem.accent_external = sem.warning;
       sem.category_local = sem.success;
       sem.category_relational = sem.accent_view;
       sem.category_analytics = sem.accent_table;
@@ -513,10 +528,6 @@ SemanticColors BuildSemanticColors(ThemePreset preset, bool dark) {
           dark ? Color::Rgb(245, 158, 11, 0.11F) : Color::Rgb(202, 106, 6, 0.08F);
       sem.press_fill =
           dark ? Color::Rgb(245, 158, 11, 0.18F) : Color::Rgb(202, 106, 6, 0.14F);
-      sem.accent_table = dark ? Color::Rgb(245, 158, 11) : Color::Rgb(202, 106, 6);
-      sem.accent_view = dark ? Color::Rgb(251, 146, 60) : Color::Rgb(234, 88, 12);
-      sem.accent_sql = dark ? Color::Rgb(248, 113, 113) : Color::Rgb(220, 82, 60);
-      sem.accent_external = sem.warning;
       sem.category_local = sem.success;
       sem.category_relational = dark ? Color::Rgb(96, 165, 250) : Color::Rgb(37, 99, 235);
       sem.category_analytics = sem.accent_view;
@@ -543,10 +554,6 @@ SemanticColors BuildSemanticColors(ThemePreset preset, bool dark) {
           dark ? Color::Rgb(167, 139, 250, 0.11F) : Color::Rgb(109, 40, 217, 0.08F);
       sem.press_fill =
           dark ? Color::Rgb(167, 139, 250, 0.18F) : Color::Rgb(109, 40, 217, 0.14F);
-      sem.accent_table = dark ? Color::Rgb(167, 139, 250) : Color::Rgb(109, 40, 217);
-      sem.accent_view = dark ? Color::Rgb(244, 114, 182) : Color::Rgb(219, 39, 119);
-      sem.accent_sql = dark ? Color::Rgb(129, 140, 248) : Color::Rgb(79, 70, 229);
-      sem.accent_external = sem.warning;
       sem.category_local = sem.success;
       sem.category_relational = dark ? Color::Rgb(129, 140, 248) : Color::Rgb(79, 70, 229);
       sem.category_analytics = sem.accent_view;
@@ -576,6 +583,7 @@ SemanticColors BuildSemanticColors(ThemePreset preset, bool dark) {
       sem.press_fill =
           dark ? Color::Rgb(255, 255, 255, 0.14F) : Color::Rgb(0, 0, 0, 0.12F);
       sem.on_primary_button = dark ? Color::Rgb(18, 18, 20) : Color::Rgb(255, 255, 255);
+      sem.accent_database = subtle_ink;
       sem.accent_table = accent;
       sem.accent_view = subtle_ink;
       sem.accent_sql = accent;

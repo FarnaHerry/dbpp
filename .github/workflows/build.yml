@@ -181,6 +181,10 @@ jobs:
           test "${#rpm_files[@]}" -eq 1
           rpm_arch="$(rpm -qp --qf '%{ARCH}' "${rpm_files[0]}")"
           test "$rpm_arch" = "$expected_rpm_arch"
+          if rpm -qpl "${rpm_files[0]}" | grep -q '/usr/lib/\.build-id/'; then
+            echo "RPM must not ship global /usr/lib/.build-id/ links" >&2
+            exit 1
+          fi
           elf_info="$(file dist-src/dbpp)"
           if [[ "$expected_rpm_arch" == "aarch64" ]]; then
             [[ "$elf_info" == *"ARM aarch64"* ]]

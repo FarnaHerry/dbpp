@@ -198,7 +198,10 @@ void TestMcpServerEndToEnd() {
   Expect(list_res.body.find("list_profiles") != std::string::npos &&
              list_res.body.find("list_tables") != std::string::npos &&
              list_res.body.find("describe_table") != std::string::npos &&
-             list_res.body.find("run_query") != std::string::npos,
+             list_res.body.find("run_query") != std::string::npos &&
+             list_res.body.find("get_connection_info") != std::string::npos &&
+             list_res.body.find("get_table_stats") != std::string::npos &&
+             list_res.body.find("inspect_query_schema") != std::string::npos,
          "tools/list missing expected tools");
 
   const HttpResult prof_res = SendHttp(
@@ -220,6 +223,24 @@ void TestMcpServerEndToEnd() {
       R"({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"describe_table","arguments":{"profile":"LocalSample","table":"items"}}})");
   Expect(desc_res.status == 200 && desc_res.body.find("qty") != std::string::npos,
          "describe_table should list columns");
+
+  const HttpResult info_res = SendHttp(
+      port, "POST", "/mcp",
+      R"({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_connection_info","arguments":{"profile":"LocalSample"}}})");
+  Expect(info_res.status == 200 && info_res.body.find("SQLite") != std::string::npos,
+         "get_connection_info should include SQLite vendor");
+
+  const HttpResult stats_res = SendHttp(
+      port, "POST", "/mcp",
+      R"({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"get_table_stats","arguments":{"profile":"LocalSample","table":"items"}}})");
+  Expect(stats_res.status == 200 && stats_res.body.find("items") != std::string::npos,
+         "get_table_stats should succeed");
+
+  const HttpResult inspect_res = SendHttp(
+      port, "POST", "/mcp",
+      R"({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"inspect_query_schema","arguments":{"profile":"LocalSample","sql":"SELECT id, name FROM items"}}})");
+  Expect(inspect_res.status == 200 && inspect_res.body.find("name") != std::string::npos,
+         "inspect_query_schema should return output columns");
 
   const HttpResult sel_res = SendHttp(
       port, "POST", "/mcp",

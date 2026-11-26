@@ -27,6 +27,10 @@ struct SemanticColors {
   huxerui::Color danger_container;
   huxerui::Color on_primary_button;
 
+  huxerui::Color status_connected;
+  huxerui::Color status_failed;
+
+  huxerui::Color accent_database;
   huxerui::Color accent_table;
   huxerui::Color accent_view;
   huxerui::Color accent_sql;

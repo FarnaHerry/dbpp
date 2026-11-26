@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.3.6 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.4.0 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -123,9 +123,19 @@ endif ()
 
 # ---- dbpp GUI + platform sources (领域层改由 C++23 模块库 dbpp_core 提供) ----
 set(DBPP_SOURCES
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/app.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/theme.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/tray.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/adbc_manager_dialog.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/app_shell.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/connect_dialog.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/connection_dialogs.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/schema_dialogs.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/settings_page.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sidebar.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sidebar_groups.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sql_page.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_browser_page.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/tray.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/ui_common.cpp"
 )
 
 if (WIN32)
@@ -189,14 +199,35 @@ add_library(dbpp_core STATIC
         src/settings.cpp
         src/i18n.cpp
         src/redis_client.cpp
+        src/redis_client_wire.cpp
+        src/redis_client_json.cpp
+        src/redis_client_domain.cpp
+        src/redis_client_write.cpp
         src/adbc_session.cpp
+        src/adbc_session_exec.cpp
+        src/adbc_arrow.cpp
+        src/adbc_metadata.cpp
+        src/adbc_prepared.cpp
+        src/adbc_ingest.cpp
+        src/adbc_session_sql.cpp
+        src/adbc_session_presets.cpp
         src/driver_installer.cpp
+        src/driver_installer_registry.cpp
         src/instance.cpp
         src/db.cpp
+        src/db_async.cpp
+        src/db_workspace.cpp
+        src/db_profiles_limit.cpp
         src/mcp_server.cpp
+        src/mcp_server_rpc.cpp
+        src/mcp_server_tools.cpp
         src/config_db.cpp
         src/cli.cpp
-        src/theme_palette.cpp
+        src/cli_format.cpp
+        src/cli_admin.cpp
+        src/cli_data.cpp
+        src/cli_adbc.cpp
+        src/ui/theme_palette.cpp
 )
 target_sources(dbpp_core PUBLIC
         FILE_SET CXX_MODULES
@@ -376,6 +407,8 @@ file(CREATE_LINK "/opt/dbpp/dbpp" "$ENV{DESTDIR}/usr/bin/dbpp" SYMBOLIC)
     set(CPACK_RPM_PACKAGE_LICENSE "MIT")
     set(CPACK_RPM_PACKAGE_GROUP "Applications/Databases")
     set(CPACK_RPM_PACKAGE_ARCHITECTURE "${DBPP_LINUX_RPM_ARCH}")
+    set(CPACK_RPM_PACKAGE_AUTOREQPROV "no")
+    set(CPACK_RPM_SPEC_MORE_DEFINE "%define _build_id_links none")
     set(CPACK_COMPONENTS_ALL "${DBPP_APP_INSTALL_COMPONENT}")
     set(CPACK_COMPONENTS_GROUPING ALL_COMPONENTS_IN_ONE)
     set(CPACK_INSTALL_CMAKE_PROJECTS "${CMAKE_BINARY_DIR};dbpp;${DBPP_APP_INSTALL_COMPONENT};/")
@@ -386,8 +419,8 @@ endif ()
 if (DBPP_BUILD_TESTS)
     enable_testing()
 
-    function(dbpp_add_module_test target test_name source_file)
-        add_executable("${target}" "${source_file}")
+    function(dbpp_add_module_test target test_name)
+        add_executable("${target}" ${ARGN})
         set_target_properties("${target}" PROPERTIES
                 CXX_MODULE_STD ON
                 CXX_SCAN_FOR_MODULES ON
@@ -422,10 +455,10 @@ if (DBPP_BUILD_TESTS)
         add_test(NAME "${test_name}" COMMAND "${target}")
     endfunction()
 
-    dbpp_add_module_test(test_adbc_core adbc_core tests/test_adbc_core.cpp)
-    dbpp_add_module_test(test_cli cli tests/test_cli.cpp)
+    dbpp_add_module_test(test_adbc_core adbc_core tests/test_adbc_core.cpp tests/test_adbc_core_extra.cpp tests/test_adbc_capabilities.cpp)
+    dbpp_add_module_test(test_cli cli tests/test_cli.cpp tests/test_cli_commands.cpp)
     dbpp_add_module_test(test_instance instance tests/test_instance.cpp)
-    dbpp_add_module_test(test_redis redis tests/test_redis.cpp)
+    dbpp_add_module_test(test_redis redis tests/test_redis.cpp tests/test_redis_mock.cpp)
     dbpp_add_module_test(test_mcp mcp tests/test_mcp.cpp)
 endif ()
 

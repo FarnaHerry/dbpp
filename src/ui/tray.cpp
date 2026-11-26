@@ -23,9 +23,9 @@ import dbpp.mcp;
 import dbpp.config_db;
 import dbpp.instance;
 
-#include "theme_palette.h"
-#include "tray.h"
-#include "root.h"
+#include "ui/theme_palette.h"
+#include "ui/tray.h"
+#include "ui/root.h"
 
 #include <chrono>
 #include <cstdio>

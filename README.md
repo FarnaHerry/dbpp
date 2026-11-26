@@ -144,11 +144,9 @@ src/adbc_session.*     ADBC 句柄、Arrow 流读取、URI 拆解/拼装、多�
 src/redis_client.*     内置零依赖 Redis RESP2/RESP3 客户端、键浏览器与命令控制台适配
 src/driver_installer.* ADBC Driver Registry 目录拉取、SHA-256 校验与安全安装/卸载
 src/db.*               表格分页、行编辑/删除/插入、SQL 异步封装
-src/app.cpp            HuxerUI 壳、四层数据库侧栏、统一连接/编辑表单、数据表、SQL 页、设置页
+src/ui/                HuxerUI 壳、四层数据库侧栏、统一连接/编辑表单、数据表、SQL 页、设置页、主题色板与托盘运行时
 src/i18n.*             中/英双语解析（跟随系统 / 手动覆盖）与后端消息翻译
-src/theme.*            主题预设（theme_palette.*）、SemanticColors 分层 Token 与共享控件（PasswordField 等）
 src/instance.*         跨平台 GUI 单实例锁与唤出/文件转发通道
-src/tray.*             托盘运行时：图标/菜单（含深浅色原生菜单同步）、关闭策略、轻量级模式
 src/settings.*         dbpp.sqlite3 / 旧版 settings.tsv 读写与应用级 SettingsModel
 resources/             运行时资源包（数据库/密码显隐 SVG、logo、托盘图标、中/英双语 strings/*.properties）
 assets/                平台二进制图标（Linux icon.png、Windows icon.ico）

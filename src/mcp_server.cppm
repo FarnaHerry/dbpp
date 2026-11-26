@@ -68,3 +68,31 @@ struct McpServerService {
 [[nodiscard]] std::string BuildMcpClientConfigJson(std::string_view endpoint_url);
 
 } // namespace dbpp
+
+namespace dbpp::detail {
+
+struct McpHttpResponse {
+  int status_code = 200;
+  std::string status_text = "OK";
+  std::string content_type = "application/json; charset=utf-8";
+  std::string body;
+};
+
+[[nodiscard]] std::string McpLowerAscii(std::string_view text);
+[[nodiscard]] std::string_view McpTrimView(std::string_view text);
+struct McpExtendedToolOutput {
+  bool handled = false;
+  bool is_error = false;
+  std::string payload_json;
+};
+
+[[nodiscard]] McpExtendedToolOutput McpHandleExtendedToolCall(
+    std::string_view tool_name, AdbcSession& session, std::string_view table_name,
+    std::string_view schema_name, std::string_view sql, bool approximate,
+    bool read_only = true, std::int64_t max_rows = 200);
+
+[[nodiscard]] std::string McpBuildHealthJson(bool read_only);
+[[nodiscard]] McpHttpResponse HandleMcpJsonRpcBody(const McpServerConfig& config,
+                                                   std::string_view body);
+
+} // namespace dbpp::detail

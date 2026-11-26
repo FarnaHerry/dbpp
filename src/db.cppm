@@ -24,6 +24,7 @@ struct DbSession {
   Dialect dialect = Dialect::Generic;
   bool sqlite = false;
   bool read_only = false;
+  AdbcConnectionInfo connection_info;
   std::shared_ptr<AdbcSession> session;
   std::vector<DbObject> objects;
 };
@@ -35,6 +36,7 @@ struct AppModel {
   bool active_is_view = false;
   std::string status;
   std::string error;
+  std::unordered_map<std::string, std::string> failed_connections;
   std::uint64_t next_session_id = 1;
   std::int64_t default_page_size = kPageSize;
   int revision = 0;
@@ -119,6 +121,10 @@ huxerui::Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> se
                                                  std::string sql, bool want_rows,
                                                  std::size_t max_rows,
                                                  std::string target_database = {});
+huxerui::Task<AdbcQueryResult> ExecutePreparedQueryAsync(
+    std::shared_ptr<AdbcSession> session, std::string sql,
+    std::vector<PreparedParamValue> params, bool want_rows, std::size_t max_rows,
+    std::string target_database = {});
 huxerui::Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session,
                                                TableModel model, std::size_t row_index,
                                                std::size_t column_index, std::string text);
@@ -169,6 +175,8 @@ void ActivateWorkspaceTab(const huxerui::State<AppModel>& app,
 void CloseWorkspaceTabs(const huxerui::State<AppModel>& app,
                         const huxerui::State<WorkspaceModel>& workspace,
                         const std::vector<std::uint64_t>& tab_ids);
+[[nodiscard]] std::string ConnectionFailureKey(std::string_view driver_path,
+                                               std::string_view uri);
 void OpenConnection(const huxerui::State<AppModel>& app,
                     const huxerui::State<WorkspaceModel>& workspace,
                     const huxerui::TaskScope& tasks, ConnectionRequest request,
@@ -192,3 +200,35 @@ void ScheduleSessionHealthCheck(const huxerui::State<AppModel>& app,
 void CloseAllSessions(const huxerui::State<AppModel>& app, const huxerui::TaskScope& tasks);
 
 } // namespace dbpp
+
+namespace dbpp::detail {
+
+std::string DbTrimAscii(std::string_view text);
+std::string DbLowerAscii(std::string_view text);
+std::string DbUpperAscii(std::string_view text);
+std::optional<int> DbParseRedisTargetDbIndex(std::string_view text);
+bool DbSessionHasMultipleCatalogs(const DbSession& session);
+std::string DbSessionObjectBucket(const DbSession& session, const DbObject& object,
+                                  bool multi_catalog);
+const DbSession* DbFindSession(const AppModel& model, std::uint64_t id);
+const DbObject* DbFindObject(const DbSession& session, std::string_view name,
+                             std::string_view db_schema);
+std::string DbFormatTabTitle(const DbSession& session, std::string_view object,
+                             std::string_view db_schema);
+void DbSyncAppFromActiveTab(AppModel& model, const WorkspaceModel& ws);
+std::size_t DbParseRowIndex(std::string_view id);
+bool DbEqualsIgnoreCaseAscii(std::string_view left, std::string_view right);
+void DbCloseSessionAsync(std::shared_ptr<AdbcSession> adbc, const huxerui::TaskScope& tasks);
+AdbcQueryResult DbUpdateCellBlocking(AdbcSession& session, const TableModel& model,
+                                     std::size_t row_index, std::size_t column_index,
+                                     const std::string& text);
+AdbcQueryResult DbDeleteRowBlocking(AdbcSession& session, const TableModel& model,
+                                    std::size_t row_index);
+void DbApplyOpenedSession(const huxerui::State<AppModel>& app,
+                          const huxerui::State<WorkspaceModel>& workspace,
+                          const huxerui::TaskScope& tasks, AdbcOpenResult opened,
+                          ConnectionRequest request, AdbcObjectsResult objects,
+                          NotifyFn notify,
+                          std::function<void(std::uint64_t)> on_opened = {});
+
+} // namespace dbpp::detail

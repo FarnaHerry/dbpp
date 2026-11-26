@@ -134,3 +134,34 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
                                           const std::vector<PendingInsertRow>& rows);
 
 } // namespace dbpp
+
+namespace dbpp::detail {
+
+inline constexpr std::size_t kRedisMaxScanKeys = 10000;
+inline constexpr std::size_t kRedisMaxCollectionPreview = 200;
+inline constexpr std::size_t kRedisMaxListZsetPreview = 100;
+inline constexpr std::size_t kRedisMaxStreamPreview = 20;
+
+std::string RedisLowerAscii(std::string_view text);
+std::string RedisUpperAscii(std::string_view text);
+std::string_view RedisTrimAscii(std::string_view text);
+bool RedisEqualsIgnoreCase(std::string_view left, std::string_view right);
+std::optional<std::int64_t> RedisParseStrictInt64(std::string_view text);
+int RedisHexDigit(char c);
+std::string RedisPercentDecode(std::string_view text);
+
+std::string RedisFormatJsonArrayOfStrings(const std::vector<RedisValue>& elements,
+                                          std::size_t cap);
+std::string RedisFormatJsonHashPairs(const std::vector<RedisValue>& elements,
+                                     std::size_t max_pairs);
+std::string RedisFormatJsonZsetPairs(const std::vector<RedisValue>& elements,
+                                     std::size_t max_pairs);
+std::string RedisFormatJsonStreamEntries(const std::vector<RedisValue>& elements);
+bool RedisBuildWriteCommandArgs(std::string_view type, std::string_view value_text,
+                                std::vector<std::string>& args_out, std::string& error_out);
+
+CellValue RedisTextCell(std::string text);
+CellValue RedisNullCell();
+CellValue RedisReplyToCell(const RedisValue& val);
+
+} // namespace dbpp::detail

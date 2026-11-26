@@ -11,6 +11,14 @@ enum class ButtonTone {
 };
 
 huxerui::View ActionButton(huxerui::View action, ButtonTone tone = ButtonTone::Default);
+huxerui::View CompactActionButton(huxerui::View action, ButtonTone tone = ButtonTone::Default,
+                                  float height = 30.0F, float horizontal_padding = 10.0F);
+huxerui::View CompactTextField(huxerui::View field, float height = 30.0F,
+                               float horizontal_padding = 8.0F,
+                               float font_size_px = dbpp::ui::font_size::kChip);
+huxerui::View CompactPagerButton(
+    std::string label, std::function<void()> on_click, bool enabled, float height = 24.0F,
+    std::optional<huxerui::StringVariant> tooltip = std::nullopt);
 huxerui::View AccentDot(huxerui::Color color, float size = 7.0F);
 huxerui::View TintedIcon(const huxerui::ImageResource& resource, huxerui::Color color,
                          float size = 14.0F);
@@ -41,6 +49,7 @@ struct TreeRowOptions {
   std::optional<huxerui::Color> status_dot{};
   huxerui::View leading_icon{};
   std::optional<bool> expanded{};
+  huxerui::View trailing_action{};
 };
 
 huxerui::View TreeRow(TreeRowOptions options, std::function<void()> on_click = {});

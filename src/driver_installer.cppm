@@ -60,3 +60,18 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
     const RegistryDriverInfo& driver, const std::filesystem::path& user_drivers_dir = {});
 
 } // namespace dbpp
+
+namespace dbpp::detail {
+
+std::string InstallerNextUniqueSuffix();
+std::string InstallerLowerAscii(std::string_view text);
+std::string_view InstallerTrimAscii(std::string_view text);
+std::string InstallerNormalizeSha256(std::string_view input);
+void InstallerRemoveFileQuiet(const std::filesystem::path& path);
+std::optional<std::filesystem::path> InstallerParseFileUrlPath(std::string_view url);
+bool InstallerDownloadUrlToFileBlocking(std::string_view url,
+                                        const std::filesystem::path& dest_path,
+                                        std::string_view accept_header, int max_time_seconds,
+                                        std::string& error_out);
+
+} // namespace dbpp::detail

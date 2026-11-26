@@ -48,12 +48,39 @@ enum class DatabaseBrand {
   Custom,
 };
 
+struct ForeignKeyMeta {
+  std::string constraint_name;
+  std::vector<std::string> columns;
+  std::string fk_catalog;
+  std::string fk_db_schema;
+  std::string fk_table;
+  std::vector<std::string> fk_columns;
+
+  bool operator==(const ForeignKeyMeta&) const = default;
+};
+
+struct TableConstraintMeta {
+  std::string name;
+  std::string type;
+  std::vector<std::string> columns;
+
+  bool operator==(const TableConstraintMeta&) const = default;
+};
+
 struct ColumnMeta {
   std::string name;
   std::string type;
   bool nullable = true;
   bool primary_key = false;
   int primary_key_order = 0;
+  std::string default_expr;
+  std::string remarks;
+  std::optional<std::int32_t> column_size;
+  std::optional<std::int16_t> decimal_digits;
+  bool unique = false;
+  bool autoincrement = false;
+  bool generated = false;
+  std::string extension_name;
 
   [[nodiscard]] bool NotNull() const { return !nullable; }
   bool operator==(const ColumnMeta&) const = default;
@@ -75,6 +102,8 @@ struct DbObject {
   std::optional<std::int64_t> item_count;
   std::vector<std::string> primary_key;
   std::vector<ColumnMeta> columns;
+  std::vector<ForeignKeyMeta> foreign_keys;
+  std::vector<TableConstraintMeta> constraints;
 };
 
 struct ConnectionRequest {
@@ -83,6 +112,7 @@ struct ConnectionRequest {
   std::string username;
   std::string password;
   std::string title;
+  bool read_only = false;
 };
 
 /// User-saved ADBC/Redis connection (persisted in `dbpp.sqlite3`, including optional password).
@@ -338,16 +368,79 @@ struct WorkspaceModel {
   }
 };
 
+struct AdbcConnectionInfo {
+  std::string vendor_name;
+  std::string vendor_version;
+  std::string vendor_arrow_version;
+  std::optional<bool> vendor_sql;
+  std::optional<bool> vendor_substrait;
+  std::string driver_name;
+  std::string driver_version;
+  std::string driver_arrow_version;
+  std::optional<std::int64_t> driver_adbc_version;
+  bool supported = false;
+};
+
+struct ColumnStatistic {
+  std::string column_name;
+  std::string statistic_name;
+  std::int16_t statistic_key = 0;
+  std::string value_text;
+  bool approximate = false;
+};
+
+struct TableStatisticsResult {
+  std::optional<std::int64_t> row_count;
+  bool row_count_approximate = false;
+  std::vector<ColumnStatistic> statistics;
+  bool supported = false;
+  bool connection_lost = false;
+  std::string error;
+};
+
+struct QueryParameterMeta {
+  std::string name;
+  std::string type;
+  bool nullable = true;
+  std::size_t ordinal = 0;
+};
+
+struct PreparedParamValue {
+  std::string text;
+  bool is_null = false;
+};
+
+enum class ExportFormat {
+  Csv,
+  Jsonl,
+};
+
+enum class IngestMode {
+  Create,
+  Append,
+  Replace,
+  CreateAppend,
+};
+
+struct BulkIngestResult {
+  std::int64_t rows_affected = -1;
+  bool connection_lost = false;
+  std::string error;
+};
+
 struct AdbcObjectsResult {
   std::vector<DbObject> objects;
   bool connection_lost = false;
   std::string error;
+  std::string sqlstate;
 };
 
 struct AdbcSchemaResult {
   std::vector<ColumnMeta> columns;
   bool connection_lost = false;
   std::string error;
+  std::string sqlstate;
+  std::vector<std::pair<std::string, std::string>> error_details;
 };
 
 struct AdbcQueryResult {
@@ -358,6 +451,10 @@ struct AdbcQueryResult {
   bool truncated = false;
   bool connection_lost = false;
   std::string error;
+  std::string sqlstate;
+  std::int32_t vendor_code = 0;
+  bool cancelled = false;
+  std::vector<std::pair<std::string, std::string>> error_details;
 };
 
 } // namespace dbpp
