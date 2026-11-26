@@ -9,6 +9,8 @@ enable_language(C)
 enable_language(CXX)
 if (WIN32)
     enable_language(RC)
+elseif (APPLE)
+    enable_language(OBJCXX)
 endif ()
 
 if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_GENERATOR MATCHES "^Ninja")
@@ -168,6 +170,7 @@ if (APPLE AND NOT IOS)
             PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     target_sources(dbpp PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/AppIcon.icns")
+    target_link_libraries(dbpp PRIVATE "-framework AppKit")
 endif ()
 
 huxerui_use_library(dbpp
