@@ -1,25 +1,6 @@
-#include "cli.h"
+module;
 
-#include "adbc_session.h"
-#include "driver_installer.h"
-#include "model.h"
-#include "redis_client.h"
-
-#include <algorithm>
-#include <cctype>
-#include <charconv>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <optional>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+#include <huxerui/datatable.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -34,6 +15,17 @@
 #ifndef DBPP_VERSION
 #define DBPP_VERSION "0.2.3"
 #endif
+
+#include <cstdlib>
+
+module dbpp.cli;
+
+import std;
+import dbpp.types;
+import dbpp.adbc;
+import dbpp.redis;
+import dbpp.driver_installer;
+import dbpp.db;
 
 namespace dbpp {
 

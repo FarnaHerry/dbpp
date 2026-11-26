@@ -1,15 +1,21 @@
-#include "model.h"
-#include "config_db.h"
-#include "theme.h"
-#include "adbc_session.h"
-#include "driver_installer.h"
-#include "root.h"
-#include "settings.h"
-#include "tray.h"
-#include "app_resources.h"
-
 #include <huxerui/datatable.h>
 #include <huxerui/huxerui.h>
+#include "app_resources.h"
+
+import dbpp.settings;
+import dbpp.i18n;
+import dbpp.types;
+import dbpp.adbc;
+import dbpp.redis;
+import dbpp.driver_installer;
+import dbpp.db;
+import dbpp.config_db;
+import dbpp.instance;
+
+#include "theme_palette.h"
+#include "theme.h"
+#include "root.h"
+#include "tray.h"
 
 #include <algorithm>
 #include <cctype>
@@ -200,7 +206,7 @@ std::string_view StripLeadingV(std::string_view text) {
 }
 
 std::string UriDisplayName(std::string_view uri) {
-  return DisplayNameFromUri(uri, "ADBC 连接");
+  return DisplayNameFromUri(uri, Tr("ADBC Connection", "ADBC 连接"));
 }
 
 std::string TrimmedSql(std::string_view text) {
@@ -262,7 +268,18 @@ bool IsLikelyErrorMessage(std::string_view text) {
          text.find("未提供") != std::string_view::npos ||
          text.find("不可用") != std::string_view::npos ||
          text.find("不支持") != std::string_view::npos ||
-         text.find("没有") != std::string_view::npos;
+         text.find("没有") != std::string_view::npos ||
+         ContainsIgnoreCaseAscii(text, "failed") ||
+         ContainsIgnoreCaseAscii(text, "error") ||
+         ContainsIgnoreCaseAscii(text, "cannot") ||
+         ContainsIgnoreCaseAscii(text, "unable") ||
+         ContainsIgnoreCaseAscii(text, "not found") ||
+         ContainsIgnoreCaseAscii(text, "unavailable") ||
+         ContainsIgnoreCaseAscii(text, "unsupported") ||
+         ContainsIgnoreCaseAscii(text, "invalid") ||
+         ContainsIgnoreCaseAscii(text, "missing") ||
+         ContainsIgnoreCaseAscii(text, "timed out") ||
+         ContainsIgnoreCaseAscii(text, "timeout");
 }
 
 NotifyFn MakeNotify(ToastHandle toast,
@@ -326,13 +343,123 @@ std::vector<DataTableColumn> BuildReadOnlyColumns(
   return columns;
 }
 
-View WithDialogTheme(const AppThemeConfig& config, bool system_dark, View content) {
-  return Theme(AppThemeDefinition(ResolveTheme(config, system_dark)), std::move(content));
+struct LocalizedCatalog {
+  std::shared_ptr<Resources> resources;
+  std::shared_ptr<SettingsModel> settings;
+
+  [[nodiscard]] ResourceConfiguration Config() const {
+    const LanguageMode mode = settings ? settings->language.Get() : LanguageMode::System;
+    const Locale platform =
+        resources ? resources->Configuration().locale : Locale::Default();
+    return ResourceConfiguration{.locale = EffectiveLocale(mode, platform)};
+  }
+
+  [[nodiscard]] std::string Get(const StringVariant& value) const {
+    if (!resources) {
+      return {};
+    }
+    return resources->GetString(value, Config());
+  }
+
+  template <class... Args>
+  [[nodiscard]] std::string Fmt(StringResource resource, Args&&... args) const {
+    return Get(StringVariant::Format(std::move(resource), std::forward<Args>(args)...));
+  }
+};
+
+struct LocalizedPresetStrings {
+  StringResource name;
+  StringResource subtitle;
+  std::optional<StringResource> uri_placeholder;
+};
+
+LocalizedPresetStrings DatabasePresetStrings(const DatabasePreset& preset) {
+  if (preset.id == "sqlite") {
+    return {app::strings::db_preset_sqlite_name, app::strings::db_preset_sqlite_sub,
+            app::strings::db_preset_sqlite_ph};
+  }
+  if (preset.id == "postgresql") {
+    return {app::strings::db_preset_postgresql_name, app::strings::db_preset_postgresql_sub,
+            std::nullopt};
+  }
+  if (preset.id == "mysql") {
+    return {app::strings::db_preset_mysql_name, app::strings::db_preset_mysql_sub, std::nullopt};
+  }
+  if (preset.id == "mariadb") {
+    return {app::strings::db_preset_mariadb_name, app::strings::db_preset_mariadb_sub,
+            std::nullopt};
+  }
+  if (preset.id == "duckdb") {
+    return {app::strings::db_preset_duckdb_name, app::strings::db_preset_duckdb_sub,
+            app::strings::db_preset_duckdb_ph};
+  }
+  if (preset.id == "redis") {
+    return {app::strings::db_preset_redis_name, app::strings::db_preset_redis_sub, std::nullopt};
+  }
+  if (preset.id == "mssql") {
+    return {app::strings::db_preset_mssql_name, app::strings::db_preset_mssql_sub, std::nullopt};
+  }
+  if (preset.id == "clickhouse") {
+    return {app::strings::db_preset_clickhouse_name, app::strings::db_preset_clickhouse_sub,
+            std::nullopt};
+  }
+  if (preset.id == "flightsql") {
+    return {app::strings::db_preset_flightsql_name, app::strings::db_preset_flightsql_sub,
+            std::nullopt};
+  }
+  if (preset.id == "snowflake") {
+    return {app::strings::db_preset_snowflake_name, app::strings::db_preset_snowflake_sub,
+            std::nullopt};
+  }
+  if (preset.id == "bigquery") {
+    return {app::strings::db_preset_bigquery_name, app::strings::db_preset_bigquery_sub,
+            std::nullopt};
+  }
+  if (preset.id == "trino") {
+    return {app::strings::db_preset_trino_name, app::strings::db_preset_trino_sub, std::nullopt};
+  }
+  if (preset.id == "databricks") {
+    return {app::strings::db_preset_databricks_name, app::strings::db_preset_databricks_sub,
+            std::nullopt};
+  }
+  if (preset.id == "redshift") {
+    return {app::strings::db_preset_redshift_name, app::strings::db_preset_redshift_sub,
+            std::nullopt};
+  }
+  return {app::strings::db_preset_custom_name, app::strings::db_preset_custom_sub, std::nullopt};
 }
 
-View TableEmptyState(const std::string& text) {
+std::pair<StringResource, StringResource> ThemePresetStrings(ThemePreset preset) {
+  switch (preset) {
+    case ThemePreset::Emerald:
+      return {app::strings::theme_preset_emerald_name, app::strings::theme_preset_emerald_sub};
+    case ThemePreset::WarmAmber:
+      return {app::strings::theme_preset_warm_amber_name,
+              app::strings::theme_preset_warm_amber_sub};
+    case ThemePreset::VioletDusk:
+      return {app::strings::theme_preset_violet_dusk_name,
+              app::strings::theme_preset_violet_dusk_sub};
+    case ThemePreset::Monochrome:
+      return {app::strings::theme_preset_monochrome_name,
+              app::strings::theme_preset_monochrome_sub};
+    case ThemePreset::GeminiSpark:
+    default:
+      return {app::strings::theme_preset_gemini_name, app::strings::theme_preset_gemini_sub};
+  }
+}
+
+View WithDialogTheme(const AppThemeConfig& config, LanguageMode language_mode, bool system_dark,
+                     View content) {
+  View themed = Theme(AppThemeDefinition(ResolveTheme(config, system_dark)), std::move(content));
+  if (auto override_locale = EffectiveLocaleOverride(language_mode)) {
+    return ProvideEnvironment(*override_locale, std::move(themed));
+  }
+  return themed;
+}
+
+[[huxerui::composable]] View TableEmptyState(StringVariant text) {
   return Column{
-      MutedText(text),
+      MutedText(UseString(std::move(text))),
   }.With(Grow(1.0F), MainAlign{MainAxisAlignment::Center},
          CrossAlign{CrossAxisAlignment::Center});
 }
@@ -352,8 +479,9 @@ View TableEmptyState(const std::string& text) {
                     Frame{.width = 84.0F, .height = 3.5F, .min_width = 84.0F, .max_width = 84.0F,
                           .min_height = 3.5F, .max_height = 3.5F},
                     CornerRadius{2.0F}, Background{semantic.accent_gradient}),
-      MutedText("ADBC 数据管理器"),
-      ActionButton(Button("新建连接…").OnClick(std::move(open_new)), ButtonTone::Primary),
+      MutedText(UseString(app::strings::app_subtitle)),
+      ActionButton(Button(app::strings::empty_new_connection).OnClick(std::move(open_new)),
+                   ButtonTone::Primary),
   }.With(Grow(1.0F), MainAlign{MainAxisAlignment::Center},
          CrossAlign{CrossAxisAlignment::Center}, Spacing{12.0F},
          Background{semantic.hero_glow});
@@ -390,6 +518,262 @@ bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config
   return !profiles_path.empty() && SaveConnectionProfiles(profiles_path, list);
 }
 
+struct ConnectionFormStates {
+  State<std::string> driver_slug;
+  State<TextEditingValue> driver;
+  State<TextEditingValue> uri;
+  State<TextEditingValue> host;
+  State<TextEditingValue> port;
+  State<TextEditingValue> database;
+  State<TextEditingValue> username;
+  State<TextEditingValue> password;
+  State<TextEditingValue> title;
+  State<std::string> extra_query;
+  State<std::size_t> input_mode;
+};
+
+[[huxerui::composable]] View ConnectionFormFields(
+    const DatabasePreset& preset, const std::string& active_preset_placeholder,
+    const ConnectionFormStates& form, const std::vector<AdbcDriverInfo>& driver_list,
+    bool can_pick_file, std::function<void()> pick_local_file,
+    std::function<void()> on_password_submit, StringVariant name_placeholder) {
+  Views form_fields;
+  if (preset.form_kind == ConnectionFormKind::File) {
+    form_fields.Add(
+        Row{
+            TextField(form.uri)
+                .Label(app::strings::connect_file_label)
+                .Placeholder(active_preset_placeholder)
+                .Variant(TextFieldVariant::Outlined)
+                .LineLimits(TextFieldLineLimits::SingleLine())
+                .OnChanged([uri = form.uri](const TextEditingValue& value) { uri = value; })
+                .With(Grow(1.0F)),
+            ActionButton(Button(app::strings::connect_browse_btn).OnClick(std::move(pick_local_file)))
+                .With(Enabled{can_pick_file}),
+        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}));
+    form_fields.Add(
+        TextField(form.title)
+            .Label(app::strings::connect_name_label)
+            .Placeholder(std::move(name_placeholder))
+            .Variant(TextFieldVariant::Outlined)
+            .LineLimits(TextFieldLineLimits::SingleLine())
+            .OnChanged([title = form.title](const TextEditingValue& value) { title = value; }));
+    form_fields.Add(
+        MonospaceField(
+            TextField(form.driver)
+                .Label(app::strings::connect_driver_label)
+                .Variant(TextFieldVariant::Outlined)
+                .LineLimits(TextFieldLineLimits::SingleLine())
+                .OnChanged([driver = form.driver](const TextEditingValue& value) { driver = value; })));
+    return Column{std::move(form_fields)}
+        .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+  }
+
+  if (preset.form_kind == ConnectionFormKind::HostPort) {
+    form_fields.Add(
+        SegmentedButton({app::strings::connect_mode_form, app::strings::connect_mode_uri},
+                        form.input_mode.Get())
+            .OnChanged([form, preset](std::size_t idx) {
+              if (idx == 1 && form.input_mode.Get() == 0) {
+                form.uri = TextEditingValue::FromText(
+                    ComposePresetUri(preset, form.host.Get().text, form.port.Get().text,
+                                     form.database.Get().text, form.extra_query.Get()));
+              } else if (idx == 0 && form.input_mode.Get() == 1) {
+                const DecomposedPresetUri parts = DecomposePresetUri(preset, form.uri.Get().text);
+                if (parts.parsed) {
+                  form.host = TextEditingValue::FromText(parts.host);
+                  form.port = TextEditingValue::FromText(
+                      parts.port.empty() ? preset.default_port : parts.port);
+                  form.database = TextEditingValue::FromText(parts.database);
+                  form.extra_query = parts.extra_query;
+                  if (!parts.username.empty()) {
+                    form.username = TextEditingValue::FromText(parts.username);
+                  }
+                  if (!parts.password.empty()) {
+                    form.password = TextEditingValue::FromText(parts.password);
+                  }
+                }
+              }
+              form.input_mode = idx;
+            }));
+    if (form.input_mode.Get() == 0) {
+      form_fields.Add(
+          Row{
+              TextField(form.host)
+                  .Label(app::strings::connect_host_label)
+                  .Placeholder(preset.default_host)
+                  .Variant(TextFieldVariant::Outlined)
+                  .LineLimits(TextFieldLineLimits::SingleLine())
+                  .OnChanged([host = form.host](const TextEditingValue& value) { host = value; })
+                  .With(Grow(2.0F)),
+              TextField(form.port)
+                  .Label(app::strings::connect_port_label)
+                  .Placeholder(preset.default_port)
+                  .Variant(TextFieldVariant::Outlined)
+                  .LineLimits(TextFieldLineLimits::SingleLine())
+                  .OnChanged([port = form.port](const TextEditingValue& value) { port = value; })
+                  .With(Grow(1.0F)),
+          }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
+      form_fields.Add(
+          TextField(form.database)
+              .Label(preset.id == "redis" ? app::strings::connect_redis_db_label
+                                          : app::strings::connect_db_label)
+              .Placeholder(preset.default_database)
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([database = form.database](const TextEditingValue& value) { database = value; }));
+      form_fields.Add(
+          Row{
+              TextField(form.username)
+                  .Label(preset.id == "redis" ? app::strings::connect_user_acl_label
+                                              : app::strings::connect_user_label)
+                  .Variant(TextFieldVariant::Outlined)
+                  .LineLimits(TextFieldLineLimits::SingleLine())
+                  .OnChanged([username = form.username](const TextEditingValue& value) { username = value; })
+                  .With(Grow(1.0F)),
+              PasswordField(form.password, app::strings::connect_password_opt_label,
+                            on_password_submit)
+                  .With(Grow(1.0F)),
+          }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
+      const std::string preview =
+          ComposePresetUri(preset, form.host.Get().text, form.port.Get().text,
+                           form.database.Get().text, form.extra_query.Get());
+      form_fields.Add(MutedText(UseString(app::strings::connect_uri_preview, preview)));
+    } else {
+      form_fields.Add(
+          MonospaceField(
+              TextField(form.uri)
+                  .Label(app::strings::connect_uri_label)
+                  .Placeholder(active_preset_placeholder)
+                  .Variant(TextFieldVariant::Outlined)
+                  .LineLimits(TextFieldLineLimits::SingleLine())
+                  .OnChanged([uri = form.uri](const TextEditingValue& value) { uri = value; })));
+      form_fields.Add(
+          Row{
+              TextField(form.username)
+                  .Label(app::strings::connect_user_opt_label)
+                  .Variant(TextFieldVariant::Outlined)
+                  .LineLimits(TextFieldLineLimits::SingleLine())
+                  .OnChanged([username = form.username](const TextEditingValue& value) { username = value; })
+                  .With(Grow(1.0F)),
+              PasswordField(form.password, app::strings::connect_password_opt_label,
+                            on_password_submit)
+                  .With(Grow(1.0F)),
+          }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
+      form_fields.Add(
+          MonospaceField(
+              TextField(form.driver)
+                  .Label(app::strings::connect_driver_name_or_path_label)
+                  .Variant(TextFieldVariant::Outlined)
+                  .LineLimits(TextFieldLineLimits::SingleLine())
+                  .OnChanged([driver = form.driver](const TextEditingValue& value) { driver = value; })));
+    }
+    form_fields.Add(
+        TextField(form.title)
+            .Label(app::strings::connect_name_label)
+            .Placeholder(std::move(name_placeholder))
+            .Variant(TextFieldVariant::Outlined)
+            .LineLimits(TextFieldLineLimits::SingleLine())
+            .OnChanged([title = form.title](const TextEditingValue& value) { title = value; }));
+    return Column{std::move(form_fields)}
+        .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+  }
+
+  if (preset.form_kind == ConnectionFormKind::Uri) {
+    form_fields.Add(
+        MonospaceField(
+            TextField(form.uri)
+                .Label(app::strings::connect_uri_label)
+                .Placeholder(active_preset_placeholder)
+                .Variant(TextFieldVariant::Outlined)
+                .LineLimits(TextFieldLineLimits::SingleLine())
+                .OnChanged([uri = form.uri](const TextEditingValue& value) { uri = value; })));
+    form_fields.Add(
+        Row{
+            TextField(form.username)
+                .Label(app::strings::connect_user_opt_label)
+                .Variant(TextFieldVariant::Outlined)
+                .LineLimits(TextFieldLineLimits::SingleLine())
+                .OnChanged([username = form.username](const TextEditingValue& value) { username = value; })
+                .With(Grow(1.0F)),
+            PasswordField(form.password, app::strings::connect_password_opt_label,
+                          on_password_submit)
+                .With(Grow(1.0F)),
+        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
+    form_fields.Add(
+        MonospaceField(
+            TextField(form.driver)
+                .Label(app::strings::connect_driver_name_or_path_label)
+                .Variant(TextFieldVariant::Outlined)
+                .LineLimits(TextFieldLineLimits::SingleLine())
+                .OnChanged([driver = form.driver](const TextEditingValue& value) { driver = value; })));
+    form_fields.Add(
+        TextField(form.title)
+            .Label(app::strings::connect_name_label)
+            .Placeholder(std::move(name_placeholder))
+            .Variant(TextFieldVariant::Outlined)
+            .LineLimits(TextFieldLineLimits::SingleLine())
+            .OnChanged([title = form.title](const TextEditingValue& value) { title = value; }));
+    return Column{std::move(form_fields)}
+        .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+  }
+
+  Views discovered_rows;
+  discovered_rows.Reserve(driver_list.size());
+  for (const AdbcDriverInfo& info : driver_list) {
+    const std::string& detail = info.detail.empty() ? info.path : info.detail;
+    discovered_rows.Add(
+        NavItem(info.name, detail, form.driver.Get().text == info.path,
+                [driver = form.driver, info] { driver = TextEditingValue::FromText(info.path); },
+                {}, std::nullopt,
+                DatabaseIcon(DetectDatabaseBrand(info.path + " " + info.name), 18.0F))
+            .Key("custom-driver-" + info.path + "-" + detail));
+  }
+  if (discovered_rows.Size() > 0) {
+    form_fields.Add(Caption(UseString(app::strings::connect_discovered_drivers)));
+    form_fields.Add(
+        ScrollView(Column{std::move(discovered_rows)}.With(Spacing{2.0F}))
+            .With(Frame{.height = 110.0F}));
+  }
+  form_fields.Add(
+      MonospaceField(
+          TextField(form.driver)
+              .Label(app::strings::connect_driver_custom_label)
+              .Placeholder(app::strings::connect_driver_custom_placeholder)
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([driver = form.driver](const TextEditingValue& value) { driver = value; })));
+  form_fields.Add(
+      MonospaceField(
+          TextField(form.uri)
+              .Label(app::strings::adbc_uri_field_label)
+              .Placeholder(active_preset_placeholder)
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([uri = form.uri](const TextEditingValue& value) { uri = value; })));
+  form_fields.Add(
+      Row{
+          TextField(form.username)
+              .Label(app::strings::connect_user_opt_label)
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([username = form.username](const TextEditingValue& value) { username = value; })
+              .With(Grow(1.0F)),
+          PasswordField(form.password, app::strings::connect_password_opt_label,
+                        std::move(on_password_submit))
+              .With(Grow(1.0F)),
+      }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
+  form_fields.Add(
+      TextField(form.title)
+          .Label(app::strings::connect_name_label)
+          .Placeholder(std::move(name_placeholder))
+          .Variant(TextFieldVariant::Outlined)
+          .LineLimits(TextFieldLineLimits::SingleLine())
+          .OnChanged([title = form.title](const TextEditingValue& value) { title = value; }));
+  return Column{std::move(form_fields)}
+      .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+}
+
 [[huxerui::composable]] View EditConnectionProfileDialog(
     DialogContext dialog, std::optional<ConnectionProfile> original_profile,
     ConnectionProfile initial_values, std::optional<std::uint64_t> active_session_id,
@@ -397,30 +781,103 @@ bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config
     State<std::vector<ConnectionProfile>> profiles, std::string profiles_path, TaskScope tasks,
     NotifyFn notify) {
   const auto config_db = UseService<ConfigDbService>();
-  auto name = UseState(TextEditingValue::FromText(initial_values.name));
-  auto driver = UseState(TextEditingValue::FromText(initial_values.driver_path));
-  auto uri = UseState(TextEditingValue::FromText(initial_values.uri));
-  auto username = UseState(TextEditingValue::FromText(initial_values.username));
-  auto password = UseState(TextEditingValue::FromText(initial_values.password));
-  auto show_password = UseState(false);
+  const auto picker = UseService<FilePicker>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
+  auto dialog_tasks = UseTaskScope();
 
-  const auto persist_profile = [original_profile, name, driver, uri, username, password,
-                                profiles, profiles_path, config_db,
-                                notify](ConnectionProfile& out_profile) {
-    const std::string driver_text = TrimmedSql(driver.Get().text);
-    const std::string uri_raw = TrimmedSql(uri.Get().text);
+  const DatabasePreset initial_preset =
+      ResolvePresetForProfile(initial_values.driver_path, initial_values.uri);
+  const DecomposedPresetUri initial_parts =
+      DecomposePresetUri(initial_preset, initial_values.uri);
+  const std::string init_user =
+      !initial_values.username.empty() ? initial_values.username : initial_parts.username;
+  const std::string init_pass =
+      !initial_values.password.empty() ? initial_values.password : initial_parts.password;
+
+  ConnectionFormStates form{
+      .driver_slug = UseState(initial_preset.id),
+      .driver = UseState(TextEditingValue::FromText(initial_values.driver_path)),
+      .uri = UseState(TextEditingValue::FromText(initial_values.uri)),
+      .host = UseState(TextEditingValue::FromText(
+          initial_parts.parsed ? initial_parts.host : initial_preset.default_host)),
+      .port = UseState(TextEditingValue::FromText(
+          !initial_parts.port.empty() ? initial_parts.port : initial_preset.default_port)),
+      .database = UseState(TextEditingValue::FromText(
+          initial_parts.parsed ? initial_parts.database : initial_preset.default_database)),
+      .username = UseState(TextEditingValue::FromText(init_user)),
+      .password = UseState(TextEditingValue::FromText(init_pass)),
+      .title = UseState(TextEditingValue::FromText(initial_values.name)),
+      .extra_query = UseState(initial_parts.extra_query),
+      .input_mode = UseState<std::size_t>(
+          (initial_preset.form_kind == ConnectionFormKind::HostPort && initial_parts.parsed) ? 0
+                                                                                             : 1),
+  };
+
+  auto drivers = UseState(std::vector<AdbcDriverInfo>{});
+  Lifecycle([drivers] {
+    drivers = DiscoverAdbcDrivers();
+    return [] {};
+  });
+
+  const LocalizedPresetStrings preset_strings = DatabasePresetStrings(initial_preset);
+  const std::string preset_placeholder = preset_strings.uri_placeholder
+                                             ? UseString(*preset_strings.uri_placeholder)
+                                             : initial_preset.uri_placeholder;
+
+  const auto pick_local_file = [picker, dialog_tasks, initial_preset, preset_strings, form, notify,
+                                loc]() {
+    if (!picker || !picker->CanOpenFiles()) {
+      if (notify) {
+        notify(loc.Get(app::strings::connect_picker_unsupported));
+      }
+      return;
+    }
+    const std::string filter_label =
+        loc.Fmt(app::strings::connect_picker_filter, loc.Get(preset_strings.name));
+    dialog_tasks.Launch([picker, filter_label, extensions = initial_preset.file_extensions, form,
+                         notify, loc]() -> Task<void> {
+      FilePickerFilter filter;
+      filter.name = filter_label;
+      filter.extensions = extensions;
+      auto file_reference = co_await picker->OpenFileAsync(std::move(filter));
+      if (!file_reference) {
+        co_return;
+      }
+      auto file = file_reference->AsFile();
+      if (!file) {
+        if (notify) {
+          notify(loc.Get(app::strings::connect_picker_no_local_path));
+        }
+        co_return;
+      }
+      form.uri = TextEditingValue::FromText(file->Path());
+      if (form.title.Get().text.empty()) {
+        form.title = TextEditingValue::FromText(file->Name());
+      }
+    });
+  };
+
+  const auto persist_profile = [original_profile, initial_preset, form, profiles, profiles_path,
+                                config_db, loc, notify](ConnectionProfile& out_profile) {
+    const std::string driver_text = TrimmedSql(form.driver.Get().text);
+    const std::string raw_uri =
+        (initial_preset.form_kind == ConnectionFormKind::HostPort && form.input_mode.Get() == 0)
+            ? ComposePresetUri(initial_preset, form.host.Get().text, form.port.Get().text,
+                               form.database.Get().text, form.extra_query.Get())
+            : form.uri.Get().text;
+    const std::string uri_raw = TrimmedSql(raw_uri);
     if (driver_text.empty() || uri_raw.empty()) {
       if (notify) {
-        notify("ADBC 驱动与连接 URI 都不能为空");
+        notify(loc.Get(app::strings::toast_driver_uri_required));
       }
       return false;
     }
     const SanitizedUriResult sanitized = SanitizeUriCredentials(uri_raw);
-    const std::string title_text = TrimmedSql(name.Get().text);
+    const std::string title_text = TrimmedSql(form.title.Get().text);
     const std::string user_text =
-        username.Get().text.empty() ? sanitized.username : username.Get().text;
+        form.username.Get().text.empty() ? sanitized.username : form.username.Get().text;
     const std::string pass_text =
-        password.Get().text.empty() ? sanitized.password : password.Get().text;
+        form.password.Get().text.empty() ? sanitized.password : form.password.Get().text;
     out_profile = ConnectionProfile{
         .name = title_text.empty() ? UriDisplayName(sanitized.uri) : title_text,
         .driver_path = driver_text,
@@ -461,7 +918,7 @@ bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config
       }
       if (!PersistConnectionProfileList(config_db, profiles_path, list)) {
         if (notify) {
-          notify("保存连接配置失败: " + profiles_path);
+          notify(loc.Fmt(app::strings::toast_save_profiles_path_failed, profiles_path));
         }
         return false;
       }
@@ -470,14 +927,14 @@ bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config
     return true;
   };
 
-  const auto save_only = [dialog, persist_profile, notify] {
+  const auto save_only = [dialog, persist_profile, loc, notify] {
     ConnectionProfile saved;
     if (!persist_profile(saved)) {
       return;
     }
     dialog.Dismiss();
     if (notify) {
-      notify("已更新连接配置 " + saved.name);
+      notify(loc.Fmt(app::strings::toast_profile_updated, saved.name));
     }
   };
 
@@ -501,71 +958,51 @@ bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config
     dialog.Dismiss();
   };
 
-  const DatabaseBrand icon_brand = DetectDatabaseBrand(driver.Get().text, uri.Get().text);
+  const DatabaseBrand icon_brand =
+      DetectDatabaseBrand(form.driver.Get().text, form.uri.Get().text);
   return DialogCard(Column{
       Row{
           DatabaseIcon(icon_brand, 20.0F),
-          Text("编辑连接", TextRole::Title),
+          Text(app::strings::edit_conn_title, TextRole::Title),
           Spacer(),
-          ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button("保存").OnClick(save_only)),
-          ActionButton(Button(active_session_id.has_value() ? "保存并重连" : "保存并连接")
+          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button(app::strings::action_save).OnClick(save_only)),
+          ActionButton(Button(active_session_id.has_value()
+                                  ? app::strings::edit_conn_save_reconnect
+                                  : app::strings::edit_conn_save_connect)
                            .OnClick(save_and_connect),
                        ButtonTone::Primary),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      TextField(name)
-          .Label("显示名称（可选）")
-          .Placeholder("留空则自动命名")
-          .Variant(TextFieldVariant::Outlined)
-          .LineLimits(TextFieldLineLimits::SingleLine())
-          .OnChanged([name](const TextEditingValue& value) { name = value; }),
-      MonospaceField(
-          TextField(driver)
-              .Label("ADBC 驱动（短名或路径）")
-              .Placeholder("redis · postgresql · /path/to/libadbc_driver_*.so")
-              .Variant(TextFieldVariant::Outlined)
-              .LineLimits(TextFieldLineLimits::SingleLine())
-              .OnChanged([driver](const TextEditingValue& value) { driver = value; })),
-      MonospaceField(
-          TextField(uri)
-              .Label("连接 URI")
-              .Placeholder("redis://127.0.0.1:6379/0 · postgresql://127.0.0.1:5432/postgres")
-              .Variant(TextFieldVariant::Outlined)
-              .LineLimits(TextFieldLineLimits::SingleLine())
-              .OnChanged([uri](const TextEditingValue& value) { uri = value; })),
-      TextField(username)
-          .Label("用户名（可选）")
-          .Variant(TextFieldVariant::Outlined)
-          .LineLimits(TextFieldLineLimits::SingleLine())
-          .OnChanged([username](const TextEditingValue& value) { username = value; }),
-      Row{
-          TextField(password)
-              .Label("密码（可选，留空则无密码）")
-              .Variant(TextFieldVariant::Outlined)
-              .LineLimits(TextFieldLineLimits::SingleLine())
-              .Secure(!show_password.Get())
-              .OnChanged([password](const TextEditingValue& value) { password = value; })
-              .OnSubmitted([save_and_connect] { save_and_connect(); })
-              .With(Grow(1.0F)),
-          ActionButton(Button(show_password.Get() ? "隐藏" : "显示")
-                           .OnClick([show_password] { show_password = !show_password.Get(); })),
-      }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
+      ScrollView(
+          ConnectionFormFields(
+              initial_preset, preset_placeholder, form, drivers.Get(),
+              picker && picker->CanOpenFiles(), pick_local_file, save_and_connect,
+              app::strings::edit_conn_name_placeholder))
+          .With(Grow(1.0F), Frame{.max_height = 420.0F}),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-                    .With(Frame{.width = 540.0F}));
+                    .With(Frame{.width = 580.0F}));
 }
 
 struct SidebarObjectGroup {
   std::string key;
-  std::string label;
+  StringResource label;
   std::vector<const DbObject*> items;
 };
 
-std::vector<SidebarObjectGroup> GroupSessionObjects(const DbSession& session) {
-  if (session.dialect == Dialect::Redis) {
-    SidebarObjectGroup dbs{.key = "redis_dbs", .label = "数据库", .items = {}};
-    for (const DbObject& object : session.objects) {
-      dbs.items.push_back(&object);
-    }
+struct SidebarDatabaseGroup {
+  std::string name;
+  bool is_system = false;
+  bool is_target = false;
+  bool default_open = true;
+  std::size_t object_count = 0;
+  std::vector<SidebarObjectGroup> groups;
+};
+
+std::vector<SidebarObjectGroup> GroupObjectItems(
+    Dialect dialect, const std::vector<const DbObject*>& items) {
+  if (dialect == Dialect::Redis) {
+    SidebarObjectGroup dbs{
+        .key = "redis_dbs", .label = app::strings::sidebar_group_redis_dbs, .items = items};
     std::vector<SidebarObjectGroup> groups;
     if (!dbs.items.empty()) {
       groups.push_back(std::move(dbs));
@@ -573,22 +1010,26 @@ std::vector<SidebarObjectGroup> GroupSessionObjects(const DbSession& session) {
     return groups;
   }
 
-  SidebarObjectGroup tables{.key = "tables", .label = "表", .items = {}};
-  SidebarObjectGroup views{.key = "views", .label = "视图", .items = {}};
-  SidebarObjectGroup mviews{.key = "mviews", .label = "物化视图", .items = {}};
-  SidebarObjectGroup foreign{.key = "foreign", .label = "外部表", .items = {}};
+  SidebarObjectGroup tables{
+      .key = "tables", .label = app::strings::sidebar_group_tables, .items = {}};
+  SidebarObjectGroup views{
+      .key = "views", .label = app::strings::sidebar_group_views, .items = {}};
+  SidebarObjectGroup mviews{
+      .key = "mviews", .label = app::strings::sidebar_group_mviews, .items = {}};
+  SidebarObjectGroup foreign{
+      .key = "foreign", .label = app::strings::sidebar_group_foreign, .items = {}};
 
-  for (const DbObject& object : session.objects) {
-    if (object.is_view) {
-      if (ContainsIgnoreCaseAscii(object.table_type, "materialized")) {
-        mviews.items.push_back(&object);
+  for (const DbObject* object : items) {
+    if (object->is_view) {
+      if (ContainsIgnoreCaseAscii(object->table_type, "materialized")) {
+        mviews.items.push_back(object);
       } else {
-        views.items.push_back(&object);
+        views.items.push_back(object);
       }
-    } else if (ContainsIgnoreCaseAscii(object.table_type, "foreign")) {
-      foreign.items.push_back(&object);
+    } else if (ContainsIgnoreCaseAscii(object->table_type, "foreign")) {
+      foreign.items.push_back(object);
     } else {
-      tables.items.push_back(&object);
+      tables.items.push_back(object);
     }
   }
 
@@ -601,29 +1042,197 @@ std::vector<SidebarObjectGroup> GroupSessionObjects(const DbSession& session) {
   return groups;
 }
 
-bool SessionHasMultipleSchemas(const DbSession& session) {
-  std::string first_schema;
+std::vector<SidebarObjectGroup> GroupSessionObjects(const DbSession& session) {
+  std::vector<const DbObject*> all_items;
+  all_items.reserve(session.objects.size());
   for (const DbObject& object : session.objects) {
-    if (object.db_schema.empty()) {
+    all_items.push_back(&object);
+  }
+  return GroupObjectItems(session.dialect, all_items);
+}
+
+std::string SessionObjectBucketName(const DbSession& session, const DbObject& object,
+                                    bool multi_catalog) {
+  if (session.dialect == Dialect::Redis) {
+    return {};
+  }
+  if (session.dialect == Dialect::Mysql) {
+    return ObjectDatabaseName(Dialect::Mysql, object);
+  }
+  if (multi_catalog && !object.catalog.empty() &&
+      !ContainsIgnoreCaseAscii(object.catalog, "def") &&
+      !ContainsIgnoreCaseAscii(object.catalog, "main")) {
+    if (!object.db_schema.empty() && object.db_schema != object.catalog) {
+      return object.catalog + "." + object.db_schema;
+    }
+    return object.catalog;
+  }
+  return ObjectDatabaseName(session.dialect, object);
+}
+
+bool SessionHasMultipleCatalogs(const DbSession& session) {
+  std::string first_catalog;
+  for (const DbObject& object : session.objects) {
+    if (object.catalog.empty()) {
       continue;
     }
-    if (first_schema.empty()) {
-      first_schema = object.db_schema;
-    } else if (object.db_schema != first_schema) {
+    std::string lower = object.catalog;
+    for (char& ch : lower) {
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    if (lower == "def" || lower == "main") {
+      continue;
+    }
+    if (first_catalog.empty()) {
+      first_catalog = lower;
+    } else if (lower != first_catalog) {
       return true;
     }
   }
   return false;
 }
 
-std::string ObjectKindLabel(const DbObject& object) {
+bool SessionUsesDatabaseHierarchy(const DbSession& session) {
+  if (session.dialect == Dialect::Redis || session.objects.empty()) {
+    return false;
+  }
+  const bool multi_catalog = SessionHasMultipleCatalogs(session);
+  std::vector<std::string> distinct_buckets;
+  for (const DbObject& object : session.objects) {
+    const std::string bucket = SessionObjectBucketName(session, object, multi_catalog);
+    if (bucket.empty()) {
+      continue;
+    }
+    if (std::ranges::find(distinct_buckets, bucket) == distinct_buckets.end()) {
+      distinct_buckets.push_back(bucket);
+      if (distinct_buckets.size() >= 2) {
+        return true;
+      }
+    }
+  }
+  if (distinct_buckets.size() == 1) {
+    return session.dialect == Dialect::Mysql || session.dialect == Dialect::Postgresql ||
+           ContainsIgnoreCaseAscii(session.driver_path, "mssql") ||
+           ContainsIgnoreCaseAscii(session.uri, "mssql://");
+  }
+  return false;
+}
+
+std::vector<SidebarDatabaseGroup> GroupSessionDatabases(const DbSession& session) {
+  const bool multi_catalog = SessionHasMultipleCatalogs(session);
+  const DatabasePreset& preset = ResolvePresetForProfile(session.driver_path, session.uri);
+  const std::string target_db = DecomposePresetUri(preset, session.uri).database;
+  std::string target_lower = target_db;
+  for (char& ch : target_lower) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+
+  struct RawBucket {
+    std::string name;
+    bool is_system = false;
+    bool is_target = false;
+    std::vector<const DbObject*> items;
+  };
+  std::vector<RawBucket> raw_buckets;
+  for (const DbObject& object : session.objects) {
+    std::string bucket = SessionObjectBucketName(session, object, multi_catalog);
+    if (bucket.empty()) {
+      bucket = !target_db.empty() ? target_db : std::string("default");
+    }
+    auto it = std::ranges::find_if(raw_buckets,
+                                   [&bucket](const RawBucket& b) { return b.name == bucket; });
+    if (it == raw_buckets.end()) {
+      std::string lower_name = bucket;
+      for (char& ch : lower_name) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      }
+      raw_buckets.push_back(RawBucket{
+          .name = bucket,
+          .is_system = IsSystemDatabaseOrSchema(bucket),
+          .is_target = !target_lower.empty() && lower_name == target_lower,
+          .items = {&object},
+      });
+    } else {
+      it->items.push_back(&object);
+    }
+  }
+
+  std::ranges::sort(raw_buckets, [](const RawBucket& a, const RawBucket& b) {
+    if (a.is_target != b.is_target) {
+      return a.is_target;
+    }
+    if (a.is_system != b.is_system) {
+      return !a.is_system;
+    }
+    return a.name < b.name;
+  });
+
+  std::size_t non_system_count = 0;
+  bool any_target = false;
+  for (const RawBucket& b : raw_buckets) {
+    if (!b.is_system) {
+      ++non_system_count;
+    }
+    if (b.is_target && !b.is_system) {
+      any_target = true;
+    }
+  }
+
+  std::vector<SidebarDatabaseGroup> result;
+  result.reserve(raw_buckets.size());
+  bool opened_first_non_system = false;
+  bool opened_first_fallback = false;
+  for (RawBucket& b : raw_buckets) {
+    bool open = false;
+    if (!b.is_system) {
+      if (non_system_count <= 4 || b.is_target || (!any_target && !opened_first_non_system)) {
+        open = true;
+        opened_first_non_system = true;
+      }
+    } else if (non_system_count == 0 && !opened_first_fallback) {
+      open = true;
+      opened_first_fallback = true;
+    }
+    result.push_back(SidebarDatabaseGroup{
+        .name = std::move(b.name),
+        .is_system = b.is_system,
+        .is_target = b.is_target,
+        .default_open = open,
+        .object_count = b.items.size(),
+        .groups = GroupObjectItems(session.dialect, b.items),
+    });
+  }
+  return result;
+}
+
+bool SessionHasMultipleSchemas(const DbSession& session) {
+  std::string first_schema;
+  for (const DbObject& object : session.objects) {
+    const std::string db_name = ObjectDatabaseName(session.dialect, object);
+    if (db_name.empty()) {
+      continue;
+    }
+    if (first_schema.empty()) {
+      first_schema = db_name;
+    } else if (db_name != first_schema) {
+      return true;
+    }
+  }
+  return false;
+}
+
+StringResource ObjectKindResource(const DbObject& object) {
   if (ContainsIgnoreCaseAscii(object.table_type, "redis")) {
-    return "Redis 数据库";
+    return app::strings::object_kind_redis;
   }
   if (object.is_view) {
-    return ContainsIgnoreCaseAscii(object.table_type, "materialized") ? "物化视图" : "视图";
+    return ContainsIgnoreCaseAscii(object.table_type, "materialized")
+               ? app::strings::object_kind_mview
+               : app::strings::object_kind_view;
   }
-  return ContainsIgnoreCaseAscii(object.table_type, "foreign") ? "外部表" : "表";
+  return ContainsIgnoreCaseAscii(object.table_type, "foreign")
+             ? app::strings::object_kind_foreign
+             : app::strings::object_kind_table;
 }
 
 [[huxerui::composable]] View ObjectSchemaDialog(DialogContext dialog,
@@ -632,17 +1241,18 @@ std::string ObjectKindLabel(const DbObject& object) {
                                                  std::string qualified_name, NotifyFn notify) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   auto loading = UseState(true);
   auto columns = UseState(std::vector<ColumnMeta>(object.columns));
   auto error = UseState(std::string{});
   auto dialog_tasks = UseTaskScope();
 
-  Lifecycle([dialog_tasks, adbc, object, loading, columns, error, notify] {
+  Lifecycle([dialog_tasks, adbc, object, loading, columns, error, notify, loc] {
     if (!adbc) {
       loading = false;
-      error = "连接已关闭";
+      error = loc.Get(app::strings::toast_connection_closed);
     } else {
-      dialog_tasks.Launch([adbc, object, loading, columns, error, notify]() -> Task<void> {
+      dialog_tasks.Launch([adbc, object, loading, columns, error, notify, loc]() -> Task<void> {
         DbObject object_copy = object;
         AdbcSchemaResult res = co_await adbc->sequence.Run(
             [adbc, object_copy = std::move(object_copy)](std::stop_token) {
@@ -652,7 +1262,7 @@ std::string ObjectKindLabel(const DbObject& object) {
         if (!res.error.empty()) {
           error = res.error;
           if (notify) {
-            notify("读取结构失败: " + res.error);
+            notify(loc.Fmt(app::strings::toast_load_schema_failed, res.error));
           }
           if (!res.columns.empty()) {
             columns = std::move(res.columns);
@@ -668,9 +1278,10 @@ std::string ObjectKindLabel(const DbObject& object) {
   const std::vector<ColumnMeta>& cols = columns.Get();
   View body_content;
   if (loading.Get()) {
-    body_content = MutedText("正在读取列结构…");
+    body_content = MutedText(UseString(app::strings::schema_dialog_loading));
   } else if (cols.empty()) {
-    body_content = MutedText(error.Get().empty() ? "未读取到列信息" : "读取列结构失败");
+    body_content = MutedText(UseString(error.Get().empty() ? app::strings::schema_dialog_empty
+                                                           : app::strings::schema_dialog_load_failed));
   } else {
     Views col_rows;
     col_rows.Reserve(cols.size());
@@ -699,12 +1310,13 @@ std::string ObjectKindLabel(const DbObject& object) {
 
   return DialogCard(Column{
       Row{
-          Text(display_label + " · 结构", TextRole::Title),
+          Text::Format(TextRole::Title, app::strings::schema_dialog_title, display_label),
           Spacer(),
-          ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button(app::strings::action_close).OnClick([dialog] { dialog.Dismiss(); })),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText(ObjectKindLabel(object) + " · " + qualified_name + " · 共 " +
-                std::to_string(cols.size()) + " 列"),
+      MutedText(UseString(app::strings::schema_dialog_summary,
+                          UseString(ObjectKindResource(object)), qualified_name,
+                          cols.size())),
       std::move(body_content),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
                     .With(Frame{.width = 560.0F}));
@@ -715,53 +1327,56 @@ std::string ObjectKindLabel(const DbObject& object) {
     DbObject object, std::string display_label, std::string drop_sql, State<AppModel> app,
     State<WorkspaceModel> workspace, TaskScope tasks, NotifyFn notify) {
   auto busy = UseState(false);
-  const std::string kind = ObjectKindLabel(object);
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
+  const StringResource kind_res = ObjectKindResource(object);
+  const std::string kind = UseString(kind_res);
 
-  const auto confirm = [dialog, adbc, session_id, display_label, kind, drop_sql, app, workspace,
-                        tasks, busy, notify] {
+  const auto confirm = [dialog, adbc, session_id, display_label, kind_res, drop_sql, app,
+                        workspace, tasks, busy, notify, loc] {
     if (busy.Get()) {
       return;
     }
     if (!adbc) {
       if (notify) {
-        notify("连接已关闭");
+        notify(loc.Get(app::strings::toast_connection_closed));
       }
       dialog.Dismiss();
       return;
     }
     busy = true;
-    tasks.Launch([dialog, adbc, session_id, display_label, kind, drop_sql, app, workspace, tasks,
-                  busy, notify]() -> Task<void> {
+    tasks.Launch([dialog, adbc, session_id, display_label, kind_res, drop_sql, app, workspace,
+                  tasks, busy, notify, loc]() -> Task<void> {
       AdbcQueryResult res = co_await ExecuteQueryAsync(adbc, drop_sql, false, 0);
       if (!res.error.empty()) {
         busy = false;
         if (notify) {
-          notify("删除失败: " + res.error);
+          notify(loc.Fmt(app::strings::toast_drop_failed, res.error));
         }
         co_return;
       }
       dialog.Dismiss();
       RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
       if (notify) {
-        notify("已删除" + kind + " " + display_label);
+        notify(loc.Fmt(app::strings::toast_drop_done, loc.Get(kind_res), display_label));
       }
     });
   };
 
   return DialogCard(Column{
       Row{
-          Text("删除" + kind, TextRole::Title),
+          Text::Format(TextRole::Title, app::strings::drop_dialog_title, kind),
           Spacer(),
-          ActionButton(Button("取消")
+          ActionButton(Button(app::strings::action_cancel)
                            .OnClick([dialog] { dialog.Dismiss(); })
                            .With(Enabled{!busy.Get()})),
-          ActionButton(Button(busy.Get() ? "删除中…" : "确认删除")
+          ActionButton(Button(busy.Get() ? app::strings::drop_dialog_confirming
+                                         : app::strings::drop_dialog_confirm)
                            .OnClick(confirm)
                            .With(Enabled{!busy.Get()}),
                        ButtonTone::DangerSolid),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText("确定删除「" + display_label + "」？此操作不可撤销。"),
-      MutedText("将执行：" + drop_sql),
+      MutedText(UseString(app::strings::drop_dialog_warning, display_label)),
+      MutedText(UseString(app::strings::drop_dialog_sql_preview, drop_sql)),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
                     .With(Frame{.width = 520.0F}));
 }
@@ -770,8 +1385,9 @@ std::string ObjectKindLabel(const DbObject& object) {
     DialogContext dialog, ConnectionProfile profile, std::string display_name,
     State<std::vector<ConnectionProfile>> profiles, std::string profiles_path, NotifyFn notify) {
   const auto config_db = UseService<ConfigDbService>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto confirm = [dialog, profile, display_name, profiles, profiles_path, config_db,
-                        notify] {
+                        notify, loc] {
     std::vector<ConnectionProfile> updated = profiles.Get();
     const auto it = std::ranges::find(updated, profile);
     if (it != updated.end()) {
@@ -779,26 +1395,26 @@ std::string ObjectKindLabel(const DbObject& object) {
     }
     if (!PersistConnectionProfileList(config_db, profiles_path, updated)) {
       if (notify) {
-        notify("保存连接配置失败");
+        notify(loc.Get(app::strings::toast_save_profiles_failed));
       }
       return;
     }
     profiles = std::move(updated);
     dialog.Dismiss();
     if (notify) {
-      notify("已删除连接配置 " + display_name);
+      notify(loc.Fmt(app::strings::toast_delete_profile_done, display_name));
     }
   };
 
   return DialogCard(Column{
       Row{
-          Text("删除已保存连接", TextRole::Title),
+          Text(app::strings::delete_profile_title, TextRole::Title),
           Spacer(),
-          ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button("删除").OnClick(confirm), ButtonTone::DangerSolid),
+          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button(app::strings::action_delete).OnClick(confirm),
+                       ButtonTone::DangerSolid),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText("将从已保存列表中移除「" + display_name + "」（" + profile.uri +
-                "），不会删除数据库文件本身。"),
+      MutedText(UseString(app::strings::delete_profile_body, display_name, profile.uri)),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
                     .With(Frame{.width = 480.0F}));
 }
@@ -809,20 +1425,43 @@ std::string ObjectKindLabel(const DbObject& object) {
                                                      std::size_t draft_count) {
   return DialogCard(Column{
       Row{
-          Text("放弃未保存的新增行？", TextRole::Title),
+          Text(app::strings::close_tabs_title, TextRole::Title),
           Spacer(),
-          ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
           ActionButton(
-              Button("放弃并关闭")
+              Button(app::strings::close_tabs_confirm)
                   .OnClick([app, workspace, tab_ids = std::move(tab_ids), dialog] {
                     CloseWorkspaceTabs(app, workspace, tab_ids);
                     dialog.Dismiss();
                   }),
               ButtonTone::DangerSolid),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MutedText("即将关闭的标签页中共有 " + std::to_string(draft_count) +
-                " 条未提交的新增行，关闭后这些空白编辑内容将会丢失。"),
+      MutedText(UseString(app::strings::close_tabs_message, draft_count)),
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
+                    .With(Frame{.width = 480.0F}));
+}
+
+[[huxerui::composable]] View CloseConfirmDialog(DialogContext dialog,
+                                                std::shared_ptr<TrayRuntime> tray_runtime,
+                                                State<bool> close_dialog_open) {
+  return DialogCard(Column{
+      Row{
+          Text(app::strings::close_app_title, TextRole::Title),
+          Spacer(),
+          ActionButton(Button(app::strings::action_cancel).OnClick([dialog, close_dialog_open] {
+            close_dialog_open = false;
+            dialog.Dismiss();
+          })),
+          ActionButton(Button(app::strings::action_quit)
+                           .OnClick([dialog, tray_runtime, close_dialog_open] {
+                             close_dialog_open = false;
+                             dialog.Dismiss();
+                             tray_runtime->RequestExit();
+                           }),
+                       ButtonTone::DangerSolid),
+      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
+      MutedText(UseString(app::strings::close_app_message)),
+  }.With(Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch})
                     .With(Frame{.width = 480.0F}));
 }
 
@@ -846,11 +1485,12 @@ struct SidebarConnectionEntry {
 [[huxerui::composable]] View Sidebar(
     State<AppModel> app, State<WorkspaceModel> workspace,
     State<std::vector<ConnectionProfile>> profiles, std::string profiles_path, TaskScope tasks,
-    NotifyFn notify, AppThemeConfig theme_config, bool system_dark,
+    NotifyFn notify, AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark,
     std::function<void(ConnectionProfile)> connect_profile) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   const auto config_db = UseService<ConfigDbService>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto menu = UseMenu();
   const auto dialogs = UseDialog();
   const auto clipboard = UseApplication().Clipboard();
@@ -858,21 +1498,23 @@ struct SidebarConnectionEntry {
   const WorkspaceTab* active_tab = workspace.Get().ActiveTab();
   auto collapsed_sessions = UseState(std::vector<std::uint64_t>{});
   auto collapsed_groups = UseState(std::vector<std::string>{});
+  auto db_open_overrides = UseState(std::unordered_map<std::string, bool>{});
   auto custom_order = UseState(std::vector<std::string>{});
   auto drop_hover_key = UseState(std::string{});
 
-  const auto copy_text = [clipboard, notify](std::string text, std::string label) {
+  const auto copy_text = [clipboard, notify, loc](std::string text, StringResource label_res) {
     if (clipboard && clipboard->SupportsSynchronousText() && clipboard->WriteText(text)) {
       if (notify) {
-        notify("已复制" + label);
+        notify(loc.Fmt(app::strings::toast_copied, loc.Get(label_res)));
       }
     } else if (notify) {
-      notify("当前环境不支持剪贴板");
+      notify(loc.Get(app::strings::toast_clipboard_unsupported));
     }
   };
 
   const auto& collapsed_session_ids = collapsed_sessions.Get();
   const auto& collapsed_group_keys = collapsed_groups.Get();
+  const auto& db_open_map = db_open_overrides.Get();
   const std::string& hovered_drop_key = drop_hover_key.Get();
 
   // Assemble saved profiles and live sessions in one unified order so
@@ -935,7 +1577,7 @@ struct SidebarConnectionEntry {
     }
   }
 
-  const auto reorder_connections = [profiles, profiles_path, config_db, custom_order, notify,
+  const auto reorder_connections = [profiles, profiles_path, config_db, custom_order, notify, loc,
                                     natural_keys, candidates](std::string from_key,
                                                               std::string to_key) {
     const std::vector<std::string> next_order =
@@ -955,7 +1597,7 @@ struct SidebarConnectionEntry {
     if (reordered_profiles != profiles.Get()) {
       profiles = reordered_profiles;
       if (!PersistConnectionProfileList(config_db, profiles_path, reordered_profiles) && notify) {
-        notify("保存连接顺序失败");
+        notify(loc.Get(app::strings::toast_save_order_failed));
       }
     }
   };
@@ -985,20 +1627,21 @@ struct SidebarConnectionEntry {
           profile.name.empty() ? UriDisplayName(profile.uri) : profile.name;
       const auto open_edit_profile_dialog = [dialogs, profile, app, workspace, profiles,
                                              profiles_path, tasks, notify, theme_config,
-                                             system_dark] {
+                                             language_mode, system_dark] {
         dialogs.Show([profile, app, workspace, profiles, profiles_path, tasks, notify,
-                      theme_config, system_dark](DialogContext dialog) {
+                      theme_config, language_mode, system_dark](DialogContext dialog) {
           return WithDialogTheme(
-              theme_config, system_dark,
+              theme_config, language_mode, system_dark,
               EditConnectionProfileDialog(dialog, profile, profile, std::nullopt, app, workspace,
                                           profiles, profiles_path, tasks, notify));
         });
       };
       const auto open_delete_profile_dialog = [dialogs, profile, display_name, profiles,
-                                               profiles_path, notify, theme_config, system_dark] {
+                                               profiles_path, notify, theme_config, language_mode,
+                                               system_dark] {
         dialogs.Show([profile, display_name, profiles, profiles_path, notify, theme_config,
-                      system_dark](DialogContext dialog) {
-          return WithDialogTheme(theme_config, system_dark,
+                      language_mode, system_dark](DialogContext dialog) {
+          return WithDialogTheme(theme_config, language_mode, system_dark,
                                  DeleteSavedProfileDialog(dialog, profile, display_name, profiles,
                                                           profiles_path, notify));
         });
@@ -1008,7 +1651,7 @@ struct SidebarConnectionEntry {
           TreeRow(TreeRowOptions{
                       .prefix = "▸",
                       .label = display_name,
-                      .trailing_text = "未连接",
+                      .trailing_text = UseString(app::strings::sidebar_status_disconnected),
                       .indent_level = 0,
                       .selected = false,
                       .emphasize = false,
@@ -1029,16 +1672,21 @@ struct SidebarConnectionEntry {
               .On<DragSourceEvents::Canceled>(
                   [drop_hover_key](const DragEvent&) { drop_hover_key = std::string{}; })
               .On<ViewEvents::ContextMenuRequested>(
-                  [menu, connect_profile, profile, copy_text, open_edit_profile_dialog,
+                  [menu, loc, connect_profile, profile, copy_text, open_edit_profile_dialog,
                    open_delete_profile_dialog](Point position) {
                     menu.ShowAt(position, {
-                        MenuItem("连接", [connect_profile, profile] { connect_profile(profile); }),
-                        MenuItem("编辑连接…", open_edit_profile_dialog),
+                        MenuItem(loc.Get(app::strings::sidebar_ctx_connect),
+                                 [connect_profile, profile] { connect_profile(profile); }),
+                        MenuItem(loc.Get(app::strings::sidebar_ctx_edit_conn),
+                                 open_edit_profile_dialog),
                         MenuSection{},
-                        MenuItem("复制连接 URI",
-                                 [copy_text, uri = profile.uri] { copy_text(uri, "连接 URI"); }),
+                        MenuItem(loc.Get(app::strings::sidebar_ctx_copy_uri),
+                                 [copy_text, uri = profile.uri] {
+                                   copy_text(uri, app::strings::sidebar_copy_uri_label);
+                                 }),
                         MenuSection{},
-                        MenuItem("删除已保存连接…", open_delete_profile_dialog),
+                        MenuItem(loc.Get(app::strings::sidebar_ctx_delete_profile),
+                                 open_delete_profile_dialog),
                     });
                   });
 
@@ -1102,7 +1750,7 @@ struct SidebarConnectionEntry {
     };
 
     const auto disconnect_session = [app, workspace, tasks, notify, session_id,
-                                     collapsed_sessions, collapsed_groups] {
+                                     collapsed_sessions, collapsed_groups, db_open_overrides] {
       collapsed_sessions.Update([session_id](std::vector<std::uint64_t>& ids) {
         std::erase(ids, session_id);
       });
@@ -1110,6 +1758,11 @@ struct SidebarConnectionEntry {
       collapsed_groups.Update([&group_prefix](std::vector<std::string>& keys) {
         std::erase_if(keys, [&group_prefix](const std::string& key) {
           return key.starts_with(group_prefix);
+        });
+      });
+      db_open_overrides.Update([&group_prefix](std::unordered_map<std::string, bool>& overrides) {
+        std::erase_if(overrides, [&group_prefix](const auto& kv) {
+          return kv.first.starts_with(group_prefix);
         });
       });
       CloseSession(app, workspace, tasks, session_id, notify);
@@ -1156,12 +1809,12 @@ struct SidebarConnectionEntry {
     const std::optional<ConnectionProfile> edit_original = entry.profile;
     const auto open_edit_session_dialog = [dialogs, edit_original, edit_initial, session_id, app,
                                            workspace, profiles, profiles_path, tasks, notify,
-                                           theme_config, system_dark] {
+                                           theme_config, language_mode, system_dark] {
       dialogs.Show([edit_original, edit_initial, session_id, app, workspace, profiles,
-                    profiles_path, tasks, notify, theme_config,
+                    profiles_path, tasks, notify, theme_config, language_mode,
                     system_dark](DialogContext dialog) {
         return WithDialogTheme(
-            theme_config, system_dark,
+            theme_config, language_mode, system_dark,
             EditConnectionProfileDialog(dialog, edit_original, edit_initial, session_id, app,
                                         workspace, profiles, profiles_path, tasks, notify));
       });
@@ -1192,29 +1845,38 @@ struct SidebarConnectionEntry {
                   reorder_connections(payload.key, entry_key);
                 })
             .On<ViewEvents::ContextMenuRequested>(
-                [menu, is_expanded, toggle_session, refresh_session, app, workspace, copy_text,
-                 open_edit_session_dialog, disconnect_session, session_id, uri = session.uri,
-                 session_name = session.name, is_redis = (session.dialect == Dialect::Redis),
-                 notify](Point position) {
+                [menu, loc, is_expanded, toggle_session, refresh_session, app, workspace,
+                 copy_text, open_edit_session_dialog, disconnect_session, session_id,
+                 uri = session.uri, session_name = session.name,
+                 is_redis = (session.dialect == Dialect::Redis), notify](Point position) {
                   menu.ShowAt(position, {
-                      MenuItem(is_expanded ? (is_redis ? "收起数据库" : "收起对象")
-                                           : (is_redis ? "展开数据库" : "展开对象"),
+                      MenuItem(loc.Get(is_expanded
+                                           ? (is_redis ? app::strings::sidebar_ctx_collapse_dbs
+                                                       : app::strings::sidebar_ctx_collapse_objects)
+                                           : (is_redis ? app::strings::sidebar_ctx_expand_dbs
+                                                       : app::strings::sidebar_ctx_expand_objects)),
                                toggle_session),
-                      MenuItem(is_redis ? "刷新数据库列表" : "刷新对象列表", refresh_session),
-                      MenuItem(is_redis ? "新建命令台" : "新建查询",
+                      MenuItem(loc.Get(is_redis ? app::strings::sidebar_ctx_refresh_dbs
+                                                : app::strings::sidebar_ctx_refresh_objects),
+                               refresh_session),
+                      MenuItem(loc.Get(is_redis ? app::strings::sidebar_ctx_new_console
+                                                : app::strings::nav_new_query),
                                [app, workspace, session_id] {
                                  (void)OpenSqlTab(app, workspace, session_id);
                                }),
                       MenuSection{},
-                      MenuItem("编辑连接…", open_edit_session_dialog),
-                      MenuItem("复制连接 URI",
-                               [copy_text, uri] { copy_text(uri, "连接 URI"); }),
+                      MenuItem(loc.Get(app::strings::sidebar_ctx_edit_conn),
+                               open_edit_session_dialog),
+                      MenuItem(loc.Get(app::strings::sidebar_ctx_copy_uri),
+                               [copy_text, uri] {
+                                 copy_text(uri, app::strings::sidebar_copy_uri_label);
+                               }),
                       MenuSection{},
-                      MenuItem("断开连接",
-                               [disconnect_session, session_name, notify] {
+                      MenuItem(loc.Get(app::strings::sidebar_ctx_disconnect),
+                               [disconnect_session, session_name, notify, loc] {
                                  disconnect_session();
                                  if (notify) {
-                                   notify("已断开 " + session_name);
+                                   notify(loc.Fmt(app::strings::toast_disconnected, session_name));
                                  }
                                }),
                   });
@@ -1228,8 +1890,9 @@ struct SidebarConnectionEntry {
     if (session.objects.empty()) {
       tree_rows.Add(TreeRow(TreeRowOptions{
                                 .prefix = {},
-                                .label = session.dialect == Dialect::Redis ? "暂无可用数据库"
-                                                                           : "暂无表或视图",
+                                .label = UseString(session.dialect == Dialect::Redis
+                                                       ? app::strings::sidebar_empty_redis
+                                                       : app::strings::sidebar_empty_tables),
                                 .trailing_text = {},
                                 .indent_level = 1,
                                 .selected = false,
@@ -1242,192 +1905,276 @@ struct SidebarConnectionEntry {
     }
 
     const bool multi_schema = SessionHasMultipleSchemas(session);
-    const std::vector<SidebarObjectGroup> groups = GroupSessionObjects(session);
-    for (const SidebarObjectGroup& group : groups) {
-      const std::string group_id = std::to_string(session_id) + ":" + group.key;
-      const bool group_open =
-          std::ranges::find(collapsed_group_keys, group_id) == collapsed_group_keys.end();
+    const bool use_db_hierarchy = SessionUsesDatabaseHierarchy(session);
 
-      const auto toggle_group = [collapsed_groups, group_id] {
-        collapsed_groups.Update([&group_id](std::vector<std::string>& keys) {
-          const auto it = std::ranges::find(keys, group_id);
-          if (it == keys.end()) {
-            keys.push_back(group_id);
-          } else {
-            keys.erase(it);
-          }
-        });
-      };
+    const auto render_object_group =
+        [&](const SidebarObjectGroup& group, const std::string& group_id, int group_indent,
+            bool hide_schema_prefix) {
+          const bool group_open =
+              std::ranges::find(collapsed_group_keys, group_id) == collapsed_group_keys.end();
 
-      const bool is_view_group = group.key == "views" || group.key == "mviews";
-      const bool is_foreign_group = group.key == "foreign";
-      const std::string item_icon = is_view_group ? "◈" : (is_foreign_group ? "◇" : "⊞");
-      const Color group_accent =
-          is_view_group ? semantic.accent_view
-                        : (is_foreign_group ? semantic.accent_external : semantic.accent_table);
+          const auto toggle_group = [collapsed_groups, group_id] {
+            collapsed_groups.Update([&group_id](std::vector<std::string>& keys) {
+              const auto it = std::ranges::find(keys, group_id);
+              if (it == keys.end()) {
+                keys.push_back(group_id);
+              } else {
+                keys.erase(it);
+              }
+            });
+          };
 
-      tree_rows.Add(
-          TreeRow(TreeRowOptions{
-                      .prefix = group_open ? "▾" : "▸",
-                      .label = group.label,
-                      .trailing_text = std::to_string(group.items.size()),
-                      .indent_level = 1,
-                      .selected = false,
-                      .emphasize = true,
-                      .active_hint = false,
-                      .muted = false,
-                      .prefix_color = group_accent,
-                      .status_dot = std::nullopt,
-                  },
-                  toggle_group)
-              .On<ViewEvents::ContextMenuRequested>(
-                  [menu, group_open, toggle_group, refresh_session, app, workspace,
-                   session_id](Point position) {
-                    menu.ShowAt(position, {
-                        MenuItem(group_open ? "收起分组" : "展开分组", toggle_group),
-                        MenuItem("刷新对象列表", refresh_session),
-                        MenuItem("新建查询",
-                                 [app, workspace, session_id] {
-                                   (void)OpenSqlTab(app, workspace, session_id);
-                                 }),
-                    });
-                  })
-              .Key("group-" + group_id));
+          const bool is_view_group = group.key == "views" || group.key == "mviews";
+          const bool is_foreign_group = group.key == "foreign";
+          const std::string item_icon =
+              is_view_group ? "◈" : (is_foreign_group ? "◇" : "⊞");
+          const Color group_accent =
+              is_view_group ? semantic.accent_view
+                            : (is_foreign_group ? semantic.accent_external : semantic.accent_table);
 
-      if (!group_open) {
-        continue;
-      }
+          tree_rows.Add(
+              TreeRow(TreeRowOptions{
+                          .prefix = group_open ? "▾" : "▸",
+                          .label = UseString(group.label),
+                          .trailing_text = std::to_string(group.items.size()),
+                          .indent_level = group_indent,
+                          .selected = false,
+                          .emphasize = true,
+                          .active_hint = false,
+                          .muted = false,
+                          .prefix_color = group_accent,
+                          .status_dot = std::nullopt,
+                      },
+                      toggle_group)
+                  .On<ViewEvents::ContextMenuRequested>(
+                      [menu, loc, group_open, toggle_group, refresh_session, app, workspace,
+                       session_id](Point position) {
+                        menu.ShowAt(position, {
+                            MenuItem(loc.Get(group_open ? app::strings::sidebar_ctx_collapse_group
+                                                        : app::strings::sidebar_ctx_expand_group),
+                                     toggle_group),
+                            MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_objects),
+                                     refresh_session),
+                            MenuItem(loc.Get(app::strings::nav_new_query),
+                                     [app, workspace, session_id] {
+                                       (void)OpenSqlTab(app, workspace, session_id);
+                                     }),
+                        });
+                      })
+                  .Key("group-" + group_id));
 
-      for (std::size_t idx = 0; idx < group.items.size(); ++idx) {
-        const DbObject& object = *group.items[idx];
-        const bool is_redis = session.dialect == Dialect::Redis;
-        const bool is_selected =
-            active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Table &&
-            active_tab->session_id == session_id && active_tab->object_name == object.name &&
-            active_tab->object_schema == object.db_schema &&
-            active_tab->is_view == object.is_view;
-        const std::string display_label =
-            (multi_schema && !object.db_schema.empty())
-                ? (object.db_schema + "." + object.name)
-                : object.name;
-        const std::string name = object.name;
-        const std::string db_schema = object.db_schema;
-        const bool is_view = object.is_view;
-        const std::string qualified =
-            is_redis ? object.name : QualifiedName(session.dialect, object);
-        const std::string select_sql = "SELECT * FROM " + qualified + " LIMIT 100;";
-        const std::string drop_sql = BuildDropObjectSql(session.dialect, object);
-        const std::string kind_label = ObjectKindLabel(object);
-        const std::string row_trailing =
-            (is_redis && object.item_count.has_value())
-                ? std::to_string(*object.item_count)
-                : std::string{};
-        std::string redis_db_index = "0";
-        if (is_redis && object.name.size() > 2 &&
-            (object.name.starts_with("db") || object.name.starts_with("DB"))) {
-          redis_db_index = object.name.substr(2);
-        }
-
-        const auto open_object = [app, workspace, tasks, notify, session_id, name, db_schema,
-                                  is_view] {
-          SelectObject(app, workspace, tasks, session_id, name, db_schema, is_view, notify);
-        };
-
-        const auto open_schema_dialog = [dialogs, adbc = session.session, object, display_label,
-                                         qualified, notify, theme_config, system_dark] {
-          if (!adbc) {
-            if (notify) {
-              notify("连接已关闭");
-            }
+          if (!group_open) {
             return;
           }
-          dialogs.Show([adbc, object, display_label, qualified, notify, theme_config,
-                        system_dark](DialogContext dialog) {
-            return WithDialogTheme(
-                theme_config, system_dark,
-                ObjectSchemaDialog(dialog, adbc, object, display_label, qualified, notify));
-          });
+
+          for (std::size_t idx = 0; idx < group.items.size(); ++idx) {
+            const DbObject& object = *group.items[idx];
+            const bool is_redis = session.dialect == Dialect::Redis;
+            const std::string object_schema =
+                object.db_schema.empty() ? ObjectDatabaseName(session.dialect, object)
+                                         : object.db_schema;
+            const bool is_selected =
+                active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Table &&
+                active_tab->session_id == session_id && active_tab->object_name == object.name &&
+                active_tab->object_schema == object_schema &&
+                active_tab->is_view == object.is_view;
+            const std::string display_label =
+                (!hide_schema_prefix && multi_schema && !object_schema.empty())
+                    ? (object_schema + "." + object.name)
+                    : object.name;
+            const std::string name = object.name;
+            const bool is_view = object.is_view;
+            const std::string qualified =
+                is_redis ? object.name : QualifiedName(session.dialect, object);
+            const std::string select_sql = "SELECT * FROM " + qualified + " LIMIT 100;";
+            const std::string drop_sql = BuildDropObjectSql(session.dialect, object);
+            const StringResource kind_res = ObjectKindResource(object);
+            const std::string row_trailing =
+                (is_redis && object.item_count.has_value())
+                    ? std::to_string(*object.item_count)
+                    : std::string{};
+            std::string redis_db_index = "0";
+            if (is_redis && object.name.size() > 2 &&
+                (object.name.starts_with("db") || object.name.starts_with("DB"))) {
+              redis_db_index = object.name.substr(2);
+            }
+
+            const auto open_object = [app, workspace, tasks, notify, session_id, name,
+                                      object_schema, is_view] {
+              SelectObject(app, workspace, tasks, session_id, name, object_schema, is_view,
+                           notify);
+            };
+
+            const auto open_schema_dialog = [dialogs, adbc = session.session, object,
+                                             display_label, qualified, notify, theme_config,
+                                             language_mode, system_dark, loc] {
+              if (!adbc) {
+                if (notify) {
+                  notify(loc.Get(app::strings::toast_connection_closed));
+                }
+                return;
+              }
+              dialogs.Show([adbc, object, display_label, qualified, notify, theme_config,
+                            language_mode, system_dark](DialogContext dialog) {
+                return WithDialogTheme(
+                    theme_config, language_mode, system_dark,
+                    ObjectSchemaDialog(dialog, adbc, object, display_label, qualified, notify));
+              });
+            };
+
+            const auto open_drop_dialog = [dialogs, adbc = session.session, session_id, object,
+                                           display_label, drop_sql, app, workspace, tasks, notify,
+                                           theme_config, language_mode, system_dark, loc] {
+              if (!adbc) {
+                if (notify) {
+                  notify(loc.Get(app::strings::toast_connection_closed));
+                }
+                return;
+              }
+              dialogs.Show([adbc, session_id, object, display_label, drop_sql, app, workspace,
+                            tasks, notify, theme_config, language_mode,
+                            system_dark](DialogContext dialog) {
+                return WithDialogTheme(theme_config, language_mode, system_dark,
+                                       DropObjectDialog(dialog, adbc, session_id, object,
+                                                        display_label, drop_sql, app, workspace,
+                                                        tasks, notify));
+              });
+            };
+
+            tree_rows.Add(
+                TreeRow(TreeRowOptions{
+                            .prefix = item_icon,
+                            .label = display_label,
+                            .trailing_text = row_trailing,
+                            .indent_level = group_indent + 1,
+                            .selected = is_selected,
+                            .emphasize = false,
+                            .active_hint = false,
+                            .muted = false,
+                            .prefix_color = group_accent,
+                            .status_dot = std::nullopt,
+                        },
+                        open_object)
+                    .On<ViewEvents::ContextMenuRequested>(
+                        [menu, loc, open_object, app, workspace, open_schema_dialog, copy_text,
+                         refresh_session, open_drop_dialog, session_id, select_sql, display_label,
+                         kind_res, is_redis, redis_db_index](Point position) {
+                          if (is_redis) {
+                            menu.ShowAt(position, {
+                                MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse),
+                                         open_object),
+                                MenuItem(loc.Get(app::strings::sidebar_ctx_open_in_console),
+                                         [app, workspace, session_id, redis_db_index,
+                                          display_label] {
+                                           (void)OpenSqlTab(app, workspace, session_id,
+                                                            "SELECT " + redis_db_index,
+                                                            "Redis · " + display_label);
+                                         }),
+                                MenuItem(loc.Get(app::strings::sidebar_ctx_view_fields),
+                                         open_schema_dialog),
+                                MenuSection{},
+                                MenuItem(loc.Get(app::strings::sidebar_ctx_copy_name),
+                                         [copy_text, display_label] {
+                                           copy_text(display_label,
+                                                     app::strings::sidebar_copy_name_label);
+                                         }),
+                                MenuSection{},
+                                MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_dbs),
+                                         refresh_session),
+                            });
+                            return;
+                          }
+                          menu.ShowAt(position, {
+                              MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse), open_object),
+                              MenuItem(loc.Get(app::strings::sidebar_ctx_open_in_sql),
+                                       [app, workspace, session_id, select_sql, display_label] {
+                                         (void)OpenSqlTab(app, workspace, session_id, select_sql,
+                                                          "SQL · " + display_label);
+                                       }),
+                              MenuItem(loc.Get(app::strings::sidebar_ctx_view_schema),
+                                       open_schema_dialog),
+                              MenuSection{},
+                              MenuItem(loc.Get(app::strings::sidebar_ctx_copy_name),
+                                       [copy_text, display_label] {
+                                         copy_text(display_label,
+                                                   app::strings::sidebar_copy_name_label);
+                                       }),
+                              MenuItem(loc.Get(app::strings::sidebar_ctx_copy_select),
+                                       [copy_text, select_sql] {
+                                         copy_text(select_sql,
+                                                   app::strings::sidebar_copy_select_label);
+                                       }),
+                              MenuSection{},
+                              MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_objects),
+                                       refresh_session),
+                              MenuItem(loc.Fmt(app::strings::sidebar_ctx_drop_object,
+                                               loc.Get(kind_res)),
+                                       open_drop_dialog),
+                          });
+                        })
+                    .Key("obj-" + group_id + "-" + object_schema + "-" + name + "-" +
+                         std::to_string(idx)));
+          }
         };
 
-        const auto open_drop_dialog = [dialogs, adbc = session.session, session_id, object,
-                                       display_label, drop_sql, app, workspace, tasks, notify,
-                                       theme_config, system_dark] {
-          if (!adbc) {
-            if (notify) {
-              notify("连接已关闭");
-            }
-            return;
-          }
-          dialogs.Show([adbc, session_id, object, display_label, drop_sql, app, workspace, tasks,
-                        notify, theme_config, system_dark](DialogContext dialog) {
-            return WithDialogTheme(theme_config, system_dark,
-                                   DropObjectDialog(dialog, adbc, session_id, object, display_label,
-                                                    drop_sql, app, workspace, tasks, notify));
+    if (use_db_hierarchy) {
+      const std::vector<SidebarDatabaseGroup> db_buckets = GroupSessionDatabases(session);
+      for (const SidebarDatabaseGroup& db_bucket : db_buckets) {
+        const std::string db_key = std::to_string(session_id) + ":db:" + db_bucket.name;
+        const auto override_it = db_open_map.find(db_key);
+        const bool db_open =
+            override_it != db_open_map.end() ? override_it->second : db_bucket.default_open;
+        const auto toggle_db = [db_open_overrides, db_key, db_open] {
+          db_open_overrides.Update([&db_key, db_open](std::unordered_map<std::string, bool>& map) {
+            map[db_key] = !db_open;
           });
         };
 
         tree_rows.Add(
             TreeRow(TreeRowOptions{
-                        .prefix = item_icon,
-                        .label = display_label,
-                        .trailing_text = row_trailing,
-                        .indent_level = 2,
-                        .selected = is_selected,
-                        .emphasize = false,
+                        .prefix = db_open ? "▾" : "▸",
+                        .label = db_bucket.name,
+                        .trailing_text = std::to_string(db_bucket.object_count),
+                        .indent_level = 1,
+                        .selected = false,
+                        .emphasize = !db_bucket.is_system,
                         .active_hint = false,
-                        .muted = false,
-                        .prefix_color = group_accent,
+                        .muted = db_bucket.is_system,
+                        .prefix_color =
+                            db_bucket.is_target
+                                ? std::optional<Color>(spec.colors.primary)
+                                : std::optional<Color>(spec.colors.on_surface_variant),
                         .status_dot = std::nullopt,
                     },
-                    open_object)
+                    toggle_db)
                 .On<ViewEvents::ContextMenuRequested>(
-                    [menu, open_object, app, workspace, open_schema_dialog, copy_text,
-                     refresh_session, open_drop_dialog, session_id, select_sql, display_label,
-                     kind_label, is_redis, redis_db_index](Point position) {
-                      if (is_redis) {
-                        menu.ShowAt(position, {
-                            MenuItem("打开浏览", open_object),
-                            MenuItem("在命令台中操作",
-                                     [app, workspace, session_id, redis_db_index, display_label] {
-                                       (void)OpenSqlTab(app, workspace, session_id,
-                                                        "SELECT " + redis_db_index,
-                                                        "Redis · " + display_label);
-                                     }),
-                            MenuItem("查看字段结构", open_schema_dialog),
-                            MenuSection{},
-                            MenuItem("复制名称",
-                                     [copy_text, display_label] {
-                                       copy_text(display_label, "对象名称");
-                                     }),
-                            MenuSection{},
-                            MenuItem("刷新数据库列表", refresh_session),
-                        });
-                        return;
-                      }
+                    [menu, loc, db_open, toggle_db, refresh_session, app, workspace,
+                     session_id](Point position) {
                       menu.ShowAt(position, {
-                          MenuItem("打开浏览", open_object),
-                          MenuItem("在 SQL 编辑器中查询",
-                                   [app, workspace, session_id, select_sql, display_label] {
-                                     (void)OpenSqlTab(app, workspace, session_id, select_sql,
-                                                      "SQL · " + display_label);
+                          MenuItem(loc.Get(db_open ? app::strings::sidebar_ctx_collapse_db
+                                                   : app::strings::sidebar_ctx_expand_db),
+                                   toggle_db),
+                          MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_objects),
+                                   refresh_session),
+                          MenuItem(loc.Get(app::strings::nav_new_query),
+                                   [app, workspace, session_id] {
+                                     (void)OpenSqlTab(app, workspace, session_id);
                                    }),
-                          MenuItem("查看结构", open_schema_dialog),
-                          MenuSection{},
-                          MenuItem("复制名称",
-                                   [copy_text, display_label] {
-                                     copy_text(display_label, "对象名称");
-                                   }),
-                          MenuItem("复制 SELECT 语句",
-                                   [copy_text, select_sql] {
-                                     copy_text(select_sql, "SELECT 语句");
-                                   }),
-                          MenuSection{},
-                          MenuItem("刷新对象列表", refresh_session),
-                          MenuItem("删除" + kind_label + "…", open_drop_dialog),
                       });
                     })
-                .Key("obj-" + std::to_string(session_id) + "-" + group.key + "-" +
-                     object.db_schema + "-" + name + "-" + std::to_string(idx)));
+                .Key("db-" + db_key));
+
+        if (!db_open) {
+          continue;
+        }
+        for (const SidebarObjectGroup& group : db_bucket.groups) {
+          render_object_group(group, db_key + ":" + group.key, 2, true);
+        }
+      }
+    } else {
+      const std::vector<SidebarObjectGroup> groups = GroupSessionObjects(session);
+      for (const SidebarObjectGroup& group : groups) {
+        render_object_group(group, std::to_string(session_id) + ":" + group.key, 1, false);
       }
     }
   }
@@ -1435,7 +2182,7 @@ struct SidebarConnectionEntry {
   const std::size_t total_connections = ordered_entries.size();
   View tree_view;
   if (tree_rows.Size() == 0) {
-    tree_view = MutedText("暂无数据库连接，点击左上角「新建连接」").With(Grow(1.0F));
+    tree_view = MutedText(UseString(app::strings::sidebar_empty)).With(Grow(1.0F));
   } else {
     tree_view = ScrollView(Column{std::move(tree_rows)}
                                .With(Spacing{1.0F}, CrossAlign{CrossAxisAlignment::Stretch}))
@@ -1444,7 +2191,7 @@ struct SidebarConnectionEntry {
 
   return Column{
       Row{
-          Caption("数据库连接"),
+          Caption(UseString(app::strings::sidebar_title)),
           Spacer(),
           MutedText(std::to_string(total_connections)),
       }.With(CrossAlign{CrossAxisAlignment::Center}),
@@ -1465,18 +2212,20 @@ struct SidebarConnectionEntry {
                                              NotifyFn notify, bool is_redis) {
   return DialogCard(Column{
       Row{
-          Text(is_redis ? "删除键" : "删除行", TextRole::Title),
+          Text(is_redis ? app::strings::delete_row_title_redis
+                        : app::strings::delete_row_title_sql,
+               TextRole::Title),
           Spacer(),
-          ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
           ActionButton(
-              Button("删除").OnClick([app, workspace, tab_id, tasks, notify, dialog] {
+              Button(app::strings::action_delete).OnClick([app, workspace, tab_id, tasks, notify,
+                                                          dialog] {
                 RequestDeleteSelected(app, workspace, tasks, tab_id, notify);
                 dialog.Dismiss();
               }),
               ButtonTone::DangerSolid),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      Text(is_redis ? "选中的键会立即从 Redis 中删除，此操作不可撤销。"
-                    : "选中的行会立即从数据库中删除，此操作不可撤销。"),
+      Text(is_redis ? app::strings::delete_row_body_redis : app::strings::delete_row_body_sql),
   }.With(Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch})
                     .With(Frame{.width = 520.0F}));
 }
@@ -1484,6 +2233,7 @@ struct SidebarConnectionEntry {
 [[huxerui::composable]] View AdbcManagerDialog(DialogContext dialog,
                                                    AdbcManagerContext context) {
   const auto config_db = UseService<ConfigDbService>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   auto profiles = context.profiles;
   auto dialog_tasks = UseTaskScope();
   auto tab = UseState(context.initial_tab);
@@ -1518,14 +2268,14 @@ struct SidebarConnectionEntry {
   };
 
   const auto load_catalog = [context, dialog_tasks, catalog, catalog_loaded, catalog_loading,
-                             catalog_failed]() {
+                             catalog_failed, loc]() {
     if (catalog_loading.Get()) {
       return;
     }
     if (!context.http) {
       catalog_failed = true;
       if (context.notify) {
-        context.notify("HTTP 客户端不可用");
+        context.notify(loc.Get(app::strings::toast_http_unavailable));
       }
       return;
     }
@@ -1565,18 +2315,18 @@ struct SidebarConnectionEntry {
   };
 
   const auto start_install = [context, dialog_tasks, driver, installing_slug,
-                              install_status, refresh_drivers](RegistryDriverInfo item) {
+                              install_status, refresh_drivers, loc](RegistryDriverInfo item) {
     if (!installing_slug.Get().empty()) {
       return;
     }
     if (!context.http) {
       if (context.notify) {
-        context.notify("HTTP 客户端不可用");
+        context.notify(loc.Get(app::strings::toast_http_unavailable));
       }
       return;
     }
     installing_slug = item.slug;
-    install_status = "正在准备下载 " + item.slug + " …";
+    install_status = loc.Fmt(app::strings::adbc_preparing_download, item.slug);
     dialog_tasks.Launch([context, item = std::move(item), driver, installing_slug,
                          install_status, refresh_drivers]() -> Task<void> {
       auto on_progress = [install_status](std::string msg) { install_status = std::move(msg); };
@@ -1599,12 +2349,12 @@ struct SidebarConnectionEntry {
   };
 
   const auto start_uninstall = [context, dialog_tasks, installing_slug,
-                                install_status, refresh_drivers](std::string slug) {
+                                install_status, refresh_drivers, loc](std::string slug) {
     if (!installing_slug.Get().empty()) {
       return;
     }
     installing_slug = slug;
-    install_status = "正在卸载 " + slug + " …";
+    install_status = loc.Fmt(app::strings::adbc_uninstalling, slug);
     dialog_tasks.Launch([context, slug = std::move(slug), installing_slug,
                          install_status, refresh_drivers]() -> Task<void> {
       auto uninstall_job = [slug]() { return UninstallUserAdbcDriverBlocking(slug); };
@@ -1625,12 +2375,12 @@ struct SidebarConnectionEntry {
   };
 
   const auto save_profile = [context, config_db, profiles, selected, driver, uri, username,
-                             password, name]() -> bool {
+                             password, name, loc]() -> bool {
     const std::string driver_path = driver.Get().text;
     const std::string uri_text = uri.Get().text;
     if (driver_path.empty() || uri_text.empty()) {
       if (context.notify) {
-        context.notify("ADBC driver 名称/路径和 URI 都不能为空");
+        context.notify(loc.Get(app::strings::toast_driver_uri_empty));
       }
       return false;
     }
@@ -1656,7 +2406,7 @@ struct SidebarConnectionEntry {
     }
     if (!PersistConnectionProfileList(config_db, context.profiles_path, list)) {
       if (context.notify) {
-        context.notify("保存连接配置失败: " + context.profiles_path);
+        context.notify(loc.Fmt(app::strings::toast_save_profiles_path_failed, context.profiles_path));
       }
       return false;
     }
@@ -1664,12 +2414,12 @@ struct SidebarConnectionEntry {
     selected = index;
     name = TextEditingValue::FromText(profile.name);
     if (context.notify) {
-      context.notify("已保存 " + profile.name);
+      context.notify(loc.Fmt(app::strings::toast_profile_saved, profile.name));
     }
     return true;
   };
 
-  const auto delete_profile = [context, config_db, profiles, selected, name] {
+  const auto delete_profile = [context, config_db, profiles, selected, name, loc] {
     const int index = selected.Get();
     std::vector<ConnectionProfile> list = profiles.Get();
     if (index < 0 || static_cast<std::size_t>(index) >= list.size()) {
@@ -1680,7 +2430,7 @@ struct SidebarConnectionEntry {
     list.erase(position);
     if (!PersistConnectionProfileList(config_db, context.profiles_path, list)) {
       if (context.notify) {
-        context.notify("删除后保存失败: " + context.profiles_path);
+        context.notify(loc.Fmt(app::strings::toast_delete_save_failed, context.profiles_path));
       }
       return;
     }
@@ -1688,7 +2438,7 @@ struct SidebarConnectionEntry {
     selected = -1;
     name = TextEditingValue::FromText({});
     if (context.notify) {
-      context.notify("已删除 " + removed);
+      context.notify(loc.Fmt(app::strings::toast_profile_removed, removed));
     }
   };
 
@@ -1749,65 +2499,60 @@ struct SidebarConnectionEntry {
   }
 
   View saved_panel = Column{
-      Caption("已保存的连接"),
+      Caption(UseString(app::strings::adbc_saved_profiles)),
       profile_rows.Size() == 0
-          ? View(MutedText("暂无保存的连接"))
+          ? View(MutedText(UseString(app::strings::adbc_no_saved_profiles)))
           : View(ScrollView(Column{std::move(profile_rows)}.With(Spacing{2.0F}))
                      .With(Grow(1.0F))),
   }.With(Frame{.width = 220.0F}, Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 
   View form_panel = Column{
       Row{
-          Caption("ADBC 驱动"),
+          Caption(UseString(app::strings::adbc_drivers_heading)),
           Spacer(),
-          ActionButton(Button("安装驱动…").OnClick([switch_tab]() mutable {
+          ActionButton(Button(app::strings::adbc_install_drivers_btn).OnClick([switch_tab]() mutable {
             switch_tab(1);
           })),
-          ActionButton(Button("刷新").OnClick([refresh_drivers, notify = context.notify] {
+          ActionButton(Button(app::strings::action_refresh).OnClick([refresh_drivers,
+                                                                     notify = context.notify, loc] {
             const std::size_t count = refresh_drivers();
             if (notify) {
-              notify("发现 " + std::to_string(count) + " 个驱动");
+              notify(loc.Fmt(app::strings::toast_drivers_found, count));
             }
           })),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{6.0F}),
       driver_rows.Size() == 0
-          ? View(MutedText("未发现 ADBC 驱动"))
+          ? View(MutedText(UseString(app::strings::adbc_no_drivers_found)))
           : View(ScrollView(Column{std::move(driver_rows)}.With(Spacing{2.0F}))
                      .With(Frame{.height = 140.0F})),
       TextField(driver)
-          .Label("ADBC Driver（名称或路径）")
-          .Placeholder("postgresql  ·  /path/to/libadbc_driver_postgresql.so")
+          .Label(app::strings::adbc_driver_field_label)
+          .Placeholder(app::strings::adbc_driver_field_placeholder)
           .Variant(TextFieldVariant::Outlined)
           .OnChanged([driver](const TextEditingValue& value) { driver = value; }),
       TextField(uri)
-          .Label("URI")
-          .Placeholder("/path/to/app.sqlite  ·  postgresql://host/db")
+          .Label(app::strings::adbc_uri_field_label)
+          .Placeholder(app::strings::adbc_uri_field_placeholder)
           .Variant(TextFieldVariant::Outlined)
           .OnChanged([uri](const TextEditingValue& value) { uri = value; }),
       Row{
           TextField(username)
-              .Label("用户名（可选）")
+              .Label(app::strings::adbc_user_field_label)
               .Variant(TextFieldVariant::Outlined)
               .OnChanged([username](const TextEditingValue& value) { username = value; })
               .With(Grow(1.0F)),
-          TextField(password)
-              .Label("密码（可选）")
-              .Variant(TextFieldVariant::Outlined)
-              .Secure(true)
-              .OnChanged([password](const TextEditingValue& value) { password = value; })
+          PasswordField(password, app::strings::adbc_password_field_label)
               .With(Grow(1.0F)),
       }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
       TextField(name)
-          .Label("显示名称（可选）")
-          .Placeholder("留空则使用 URI 文件名")
+          .Label(app::strings::adbc_name_field_label)
+          .Placeholder(app::strings::adbc_name_placeholder)
           .Variant(TextFieldVariant::Outlined)
           .OnChanged([name](const TextEditingValue& value) { name = value; }),
   }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}, Grow(1.0F));
 
   View manage_tab = Column{
-      MutedText("连接配置（默认保留可选密码）保存在 dbpp.sqlite3；自动发现标准 ADBC manifest "
-                "目录、ADBC_DRIVER_PATH、DBPP_ADBC_DRIVERS 与系统库目录，支持短名、.toml "
-                "与动态库路径。"),
+      MutedText(UseString(app::strings::adbc_manage_hint)),
       Row{
           std::move(saved_panel),
           Divider(Axis::Vertical),
@@ -1847,16 +2592,14 @@ struct SidebarConnectionEntry {
         StripLeadingV(installed_version) == StripLeadingV(item.version);
 
     std::string detail;
+    const std::string ver_suffix =
+        installed_version.empty() ? std::string{} : " " + installed_version;
     if (user_is_installed) {
-      detail = "已安装" +
-               (installed_version.empty() ? std::string{} : " " + installed_version) +
-               " · ";
+      detail = UseString(app::strings::adbc_installed_prefix, ver_suffix) + " · ";
     } else if (has_manifest) {
-      detail = "已有外部配置" +
-               (installed_version.empty() ? std::string{} : " " + installed_version) +
-               " · ";
+      detail = UseString(app::strings::adbc_external_prefix, ver_suffix) + " · ";
     }
-    detail += "可用 " + item.version;
+    detail += UseString(app::strings::adbc_available_version, item.version);
     if (!item.license.empty()) {
       detail += " · " + item.license;
     }
@@ -1866,22 +2609,25 @@ struct SidebarConnectionEntry {
 
     View trailing;
     if (active_install == item.slug) {
-      trailing = MutedText("处理中…");
+      trailing = MutedText(UseString(app::strings::adbc_status_busy));
     } else if (user_is_installed) {
       trailing = Row{
-          ActionButton(Button("卸载").OnClick([start_uninstall, slug = item.slug]() mutable {
+          ActionButton(Button(app::strings::action_uninstall).OnClick([start_uninstall,
+                                                                       slug = item.slug]() mutable {
                          start_uninstall(slug);
                        }),
                        ButtonTone::Danger)
               .With(Enabled{!busy}),
-          ActionButton(Button(same_version ? "重装" : "更新")
+          ActionButton(Button(same_version ? app::strings::action_reinstall
+                                           : app::strings::action_update)
                            .OnClick([start_install, item]() mutable {
                              start_install(item);
                            }))
               .With(Enabled{!busy}),
       }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center});
     } else {
-      trailing = ActionButton(Button("安装").OnClick([start_install, item]() mutable {
+      trailing = ActionButton(Button(app::strings::action_install).OnClick([start_install,
+                                                                            item]() mutable {
                                 start_install(item);
                               }),
                               ButtonTone::Primary)
@@ -1896,14 +2642,15 @@ struct SidebarConnectionEntry {
 
   View install_list_content;
   if (catalog_loading.Get() && catalog_list.empty()) {
-    install_list_content = Column{MutedText("正在获取在线驱动目录…")}.With(Grow(1.0F));
+    install_list_content =
+        Column{MutedText(UseString(app::strings::adbc_catalog_loading))}.With(Grow(1.0F));
   } else if (catalog_failed.Get() && catalog_list.empty()) {
     install_list_content =
-        Column{MutedText("目录加载失败，请点击右上角「刷新目录」重试")}.With(Grow(1.0F));
+        Column{MutedText(UseString(app::strings::adbc_catalog_failed))}.With(Grow(1.0F));
   } else if (registry_rows.Size() == 0) {
     install_list_content = Column{
-        MutedText(catalog_list.empty() ? "点击「刷新目录」加载可安装驱动"
-                                       : "没有匹配的驱动"),
+        MutedText(UseString(catalog_list.empty() ? app::strings::adbc_catalog_prompt
+                                                 : app::strings::adbc_catalog_no_match)),
     }.With(Grow(1.0F));
   } else {
     install_list_content =
@@ -1911,13 +2658,17 @@ struct SidebarConnectionEntry {
   }
 
   const std::string user_dir = UserAdbcDriversDir();
+  const std::string catalog_meta_text =
+      user_dir.empty()
+          ? UseString(app::strings::adbc_catalog_meta, AdbcRegistryBaseUrl(),
+                      CurrentPlatformTuple())
+          : UseString(app::strings::adbc_catalog_meta_with_dir, AdbcRegistryBaseUrl(),
+                      CurrentPlatformTuple(), user_dir);
   View install_tab = Column{
-      MutedText("目录源: " + AdbcRegistryBaseUrl() + " · 平台: " +
-                CurrentPlatformTuple() +
-                (user_dir.empty() ? std::string{} : " · 安装到: " + user_dir)),
+      MutedText(catalog_meta_text),
       TextField(registry_filter)
-          .Label("筛选驱动")
-          .Placeholder("postgresql / mysql / duckdb / clickhouse …")
+          .Label(app::strings::adbc_filter_label)
+          .Placeholder(app::strings::adbc_filter_placeholder)
           .Variant(TextFieldVariant::Outlined)
           .OnChanged([registry_filter](const TextEditingValue& value) {
             registry_filter = value;
@@ -1929,16 +2680,19 @@ struct SidebarConnectionEntry {
   View header_actions;
   if (tab.Get() == 0) {
     header_actions = Row{
-        ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
-        ActionButton(Button("删除").OnClick(delete_profile), ButtonTone::Danger)
+        ActionButton(Button(app::strings::action_close).OnClick([dialog] { dialog.Dismiss(); })),
+        ActionButton(Button(app::strings::action_delete).OnClick(delete_profile),
+                     ButtonTone::Danger)
             .With(Enabled{selected.Get() >= 0}),
-        ActionButton(Button("保存").OnClick([save_profile] { (void)save_profile(); })),
-        ActionButton(Button("连接").OnClick(connect), ButtonTone::Primary),
+        ActionButton(Button(app::strings::action_save).OnClick([save_profile] {
+          (void)save_profile();
+        })),
+        ActionButton(Button(app::strings::action_connect).OnClick(connect), ButtonTone::Primary),
     }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
   } else {
     header_actions = Row{
-        ActionButton(Button("关闭").OnClick([dialog] { dialog.Dismiss(); })),
-        ActionButton(Button("刷新目录").OnClick([load_catalog]() mutable {
+        ActionButton(Button(app::strings::action_close).OnClick([dialog] { dialog.Dismiss(); })),
+        ActionButton(Button(app::strings::adbc_refresh_catalog).OnClick([load_catalog]() mutable {
           load_catalog();
         })).With(Enabled{!catalog_loading.Get()}),
     }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F});
@@ -1946,8 +2700,9 @@ struct SidebarConnectionEntry {
 
   View body = Column{
       Row{
-          Text("ADBC 管理器", TextRole::Title),
-          SegmentedButton({"连接与驱动", "安装驱动"}, tab.Get())
+          Text(app::strings::adbc_title, TextRole::Title),
+          SegmentedButton({app::strings::adbc_tab_connections, app::strings::adbc_tab_install},
+                          tab.Get())
               .OnChanged([switch_tab](std::size_t index) mutable {
                 switch_tab(index);
               }),
@@ -1964,11 +2719,13 @@ struct SidebarConnectionEntry {
 
 [[huxerui::composable]] View ConnectDialog(DialogContext dialog, ConnectContext context) {
   const auto config_db = UseService<ConfigDbService>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   auto dialog_tasks = UseTaskScope();
   auto step = UseState<int>(0);
   auto type_filter = UseState(TextEditingValue::FromText({}));
+  auto extra_query = UseState(std::string{});
   auto category_tab = UseState<std::size_t>(0);
   auto selected_preset_id = UseState<std::string>("sqlite");
   auto drivers = UseState(std::vector<AdbcDriverInfo>{});
@@ -1983,6 +2740,20 @@ struct SidebarConnectionEntry {
   auto password = UseState(TextEditingValue::FromText({}));
   auto title = UseState(TextEditingValue::FromText({}));
   auto save_profile_flag = UseState(true);
+
+  const ConnectionFormStates form{
+      .driver_slug = selected_preset_id,
+      .driver = driver,
+      .uri = uri,
+      .host = host,
+      .port = port,
+      .database = database,
+      .username = username,
+      .password = password,
+      .title = title,
+      .extra_query = extra_query,
+      .input_mode = input_mode,
+  };
 
   auto installing = UseState(false);
   auto install_status = UseState(std::string{});
@@ -2005,12 +2776,17 @@ struct SidebarConnectionEntry {
     }
   }
   const DatabasePreset active_preset = *active_ptr;
+  const LocalizedPresetStrings active_preset_strings = DatabasePresetStrings(active_preset);
+  const std::string active_preset_name = UseString(active_preset_strings.name);
+  const std::string active_preset_placeholder = active_preset_strings.uri_placeholder
+                                                    ? UseString(*active_preset_strings.uri_placeholder)
+                                                    : active_preset.uri_placeholder;
   const std::vector<AdbcDriverInfo>& driver_list = drivers.Get();
   const std::optional<AdbcDriverInfo> matched_driver =
       FindInstalledDriverForPreset(active_preset, driver_list);
 
   const auto select_preset = [context, step, selected_preset_id, input_mode, driver, uri,
-                              host, port, database, username, password, title,
+                              host, port, database, username, password, title, extra_query,
                               install_status, drivers](const DatabasePreset& preset) {
     selected_preset_id = preset.id;
     step = 1;
@@ -2018,6 +2794,7 @@ struct SidebarConnectionEntry {
     install_status = {};
     title = TextEditingValue::FromText({});
     password = TextEditingValue::FromText({});
+    extra_query = {};
 
     const std::optional<AdbcDriverInfo> installed =
         FindInstalledDriverForPreset(preset, drivers.Get());
@@ -2058,7 +2835,12 @@ struct SidebarConnectionEntry {
   if (step.Get() == 0) {
     const std::string filter_text = type_filter.Get().text;
     const std::size_t cat_idx = category_tab.Get();
-    std::vector<const DatabasePreset*> visible;
+    struct VisiblePreset {
+      const DatabasePreset* preset = nullptr;
+      std::string name;
+      std::string subtitle;
+    };
+    std::vector<VisiblePreset> visible;
     visible.reserve(presets.size());
     for (const DatabasePreset& preset : presets) {
       bool cat_ok = true;
@@ -2073,36 +2855,51 @@ struct SidebarConnectionEntry {
       if (!cat_ok) {
         continue;
       }
+      const LocalizedPresetStrings p_strs = DatabasePresetStrings(preset);
+      std::string p_name = UseString(p_strs.name);
+      std::string p_sub = UseString(p_strs.subtitle);
       if (!filter_text.empty() &&
+          !ContainsIgnoreCaseAscii(p_name, filter_text) &&
+          !ContainsIgnoreCaseAscii(p_sub, filter_text) &&
           !ContainsIgnoreCaseAscii(preset.name, filter_text) &&
           !ContainsIgnoreCaseAscii(preset.id, filter_text) &&
           !ContainsIgnoreCaseAscii(preset.driver_slug, filter_text) &&
           !ContainsIgnoreCaseAscii(preset.subtitle, filter_text)) {
         continue;
       }
-      visible.push_back(&preset);
+      visible.push_back(VisiblePreset{
+          .preset = &preset,
+          .name = std::move(p_name),
+          .subtitle = std::move(p_sub),
+      });
     }
 
     Views grid_rows;
     grid_rows.Reserve((visible.size() + 1) / 2);
-    const auto make_card = [spec, semantic, &driver_list,
-                            select_preset](const DatabasePreset& preset) {
+    const std::string badge_builtin = UseString(app::strings::connect_badge_builtin);
+    const std::string badge_manual = UseString(app::strings::connect_badge_manual);
+    const std::string badge_ready = UseString(app::strings::connect_badge_ready);
+    const std::string badge_install = UseString(app::strings::connect_badge_install);
+    const auto make_card = [spec, semantic, &driver_list, select_preset, &badge_builtin,
+                            &badge_manual, &badge_ready,
+                            &badge_install](const VisiblePreset& entry) {
+      const DatabasePreset& preset = *entry.preset;
       View badge;
       if (preset.builtin) {
-        badge = StatusBadge("内置", semantic.success, semantic.success_container,
+        badge = StatusBadge(badge_builtin, semantic.success, semantic.success_container,
                             WithAlpha(semantic.success, 0.35F));
       } else if (preset.form_kind == ConnectionFormKind::Custom) {
-        badge = StatusBadge("手动", spec.colors.on_surface_variant, spec.colors.surface_container,
-                            semantic.border_subtle);
+        badge = StatusBadge(badge_manual, spec.colors.on_surface_variant,
+                            spec.colors.surface_container, semantic.border_subtle);
       } else if (FindInstalledDriverForPreset(preset, driver_list).has_value()) {
-        badge = StatusBadge("已就绪", semantic.success, semantic.success_container,
+        badge = StatusBadge(badge_ready, semantic.success, semantic.success_container,
                             WithAlpha(semantic.success, 0.35F));
       } else {
-        badge = StatusBadge("需安装", semantic.warning, semantic.warning_container,
+        badge = StatusBadge(badge_install, semantic.warning, semantic.warning_container,
                             WithAlpha(semantic.warning, 0.35F));
       }
       View nav = NavItem(
-          preset.name, preset.subtitle, false,
+          entry.name, entry.subtitle, false,
           [select_preset, preset]() mutable { select_preset(preset); }, std::move(badge),
           std::nullopt, DatabaseBadgeIcon(DetectDatabaseBrand(preset.id), 20.0F, 34.0F));
       return Column{std::move(nav)}
@@ -2113,20 +2910,20 @@ struct SidebarConnectionEntry {
     };
 
     for (std::size_t i = 0; i < visible.size(); i += 2) {
-      const DatabasePreset* left = visible[i];
-      const DatabasePreset* right = (i + 1 < visible.size()) ? visible[i + 1] : nullptr;
+      const VisiblePreset* left = &visible[i];
+      const VisiblePreset* right = (i + 1 < visible.size()) ? &visible[i + 1] : nullptr;
       View left_card = make_card(*left);
       View right_slot = right != nullptr ? make_card(*right) : View(Spacer().With(Grow(1.0F)));
       grid_rows.Add(
           Row{std::move(left_card), std::move(right_slot)}
               .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-              .Key("db-type-row-" + left->id));
+              .Key("db-type-row-" + left->preset->id));
     }
 
     View grid_content;
     if (grid_rows.Size() == 0) {
       grid_content = Column{
-          MutedText("没有匹配的数据库类型"),
+          MutedText(UseString(app::strings::connect_no_match)),
       }.With(Grow(1.0F), MainAlign{MainAxisAlignment::Center},
              CrossAlign{CrossAxisAlignment::Center});
     } else {
@@ -2137,27 +2934,31 @@ struct SidebarConnectionEntry {
 
     View body = Column{
         Row{
-            Text("新建连接", TextRole::Title),
-            MutedText("选择数据库类型"),
+            Text(app::strings::connect_title, TextRole::Title),
+            MutedText(UseString(app::strings::connect_step0_subtitle)),
             Spacer(),
-            ActionButton(Button("已保存连接…").OnClick([dialog, open_manager = context.open_manager] {
-              dialog.Dismiss();
-              if (open_manager) {
-                open_manager(0, {});
-              }
-            })),
-            ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
+            ActionButton(Button(app::strings::connect_saved_profiles_btn)
+                             .OnClick([dialog, open_manager = context.open_manager] {
+                               dialog.Dismiss();
+                               if (open_manager) {
+                                 open_manager(0, {});
+                               }
+                             })),
+            ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
         }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
         TextField(type_filter)
-            .Label("搜索数据库")
-            .Placeholder("SQLite / PostgreSQL / MySQL / Redis / DuckDB / ClickHouse …")
+            .Label(app::strings::connect_search_label)
+            .Placeholder(app::strings::connect_search_placeholder)
             .Variant(TextFieldVariant::Outlined)
             .LineLimits(TextFieldLineLimits::SingleLine())
             .OnChanged([type_filter](const TextEditingValue& value) { type_filter = value; }),
-        SegmentedButton({"全部", "本地文件", "关系型", "键值 / 缓存", "分析 / 云端", "自定义"}, cat_idx)
+        SegmentedButton({app::strings::connect_cat_all, app::strings::connect_cat_file,
+                         app::strings::connect_cat_relational, app::strings::connect_cat_kv,
+                         app::strings::connect_cat_analytics, app::strings::connect_cat_custom},
+                        cat_idx)
             .OnChanged([category_tab](std::size_t index) { category_tab = index; }),
         std::move(grid_content),
-        MutedText("选择数据库类型后进入连接配置；未安装的 ADBC 驱动可在下一步一键安装。"),
+        MutedText(UseString(app::strings::connect_step0_hint)),
     }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch},
            Frame{.width = 740.0F, .height = 560.0F});
 
@@ -2166,24 +2967,24 @@ struct SidebarConnectionEntry {
 
   const auto install_active_driver = [context, dialog_tasks, active_preset, installing,
                                       install_status, driver,
-                                      refresh_drivers]() {
+                                      refresh_drivers, loc]() {
     if (installing.Get() || active_preset.driver_slug.empty()) {
       return;
     }
     if (!context.http) {
       if (context.notify) {
-        context.notify("HTTP 客户端不可用");
+        context.notify(loc.Get(app::strings::toast_http_unavailable));
       }
       return;
     }
     installing = true;
-    install_status = "正在查询 ADBC Driver Registry …";
+    install_status = loc.Get(app::strings::connect_query_registry);
     const std::string target_slug = active_preset.driver_slug;
     const auto http = context.http;
     const NotifyFn notify = context.notify;
 
     dialog_tasks.Launch([http, target_slug, installing, install_status,
-                         driver, refresh_drivers, notify]() -> Task<void> {
+                         driver, refresh_drivers, notify, loc]() -> Task<void> {
       RegistryCatalogResult cat = co_await FetchRegistryCatalogAsync(http);
       if (!cat.error.empty()) {
         installing = false;
@@ -2205,7 +3006,8 @@ struct SidebarConnectionEntry {
         installing = false;
         install_status = {};
         if (notify) {
-          notify("当前平台 (" + CurrentPlatformTuple() + ") 未提供在线驱动: " + target_slug);
+          notify(loc.Fmt(app::strings::connect_platform_no_driver, CurrentPlatformTuple(),
+                         target_slug));
         }
         co_return;
       }
@@ -2230,18 +3032,21 @@ struct SidebarConnectionEntry {
     });
   };
 
-  const auto pick_local_file = [context, dialog_tasks, active_preset, uri, title]() {
+  const auto pick_local_file = [context, dialog_tasks, active_preset, active_preset_strings, uri,
+                                title, loc]() {
     if (!context.picker || !context.picker->CanOpenFiles()) {
       if (context.notify) {
-        context.notify("当前平台不支持系统文件选择器");
+        context.notify(loc.Get(app::strings::connect_picker_unsupported));
       }
       return;
     }
-    dialog_tasks.Launch([picker = context.picker, preset_name = active_preset.name,
+    const std::string filter_label =
+        loc.Fmt(app::strings::connect_picker_filter, loc.Get(active_preset_strings.name));
+    dialog_tasks.Launch([picker = context.picker, filter_label,
                          extensions = active_preset.file_extensions, uri, title,
-                         notify = context.notify]() -> Task<void> {
+                         notify = context.notify, loc]() -> Task<void> {
       FilePickerFilter filter;
-      filter.name = preset_name + " 数据库";
+      filter.name = filter_label;
       filter.extensions = extensions;
       auto file_reference = co_await picker->OpenFileAsync(std::move(filter));
       if (!file_reference) {
@@ -2250,7 +3055,7 @@ struct SidebarConnectionEntry {
       auto file = file_reference->AsFile();
       if (!file) {
         if (notify) {
-          notify("所选文件没有本地路径");
+          notify(loc.Get(app::strings::connect_picker_no_local_path));
         }
         co_return;
       }
@@ -2262,10 +3067,12 @@ struct SidebarConnectionEntry {
   };
 
   const auto connect = [context, config_db, active_preset, input_mode, driver, uri, host, port,
-                        database, username, password, title, save_profile_flag, dialog] {
+                        database, extra_query, username, password, title, save_profile_flag, dialog,
+                        loc] {
     const std::string effective_uri =
         (active_preset.form_kind == ConnectionFormKind::HostPort && input_mode.Get() == 0)
-            ? ComposePresetUri(active_preset, host.Get().text, port.Get().text, database.Get().text)
+            ? ComposePresetUri(active_preset, host.Get().text, port.Get().text,
+                               database.Get().text, extra_query.Get())
             : uri.Get().text;
     const SanitizedUriResult sanitized = SanitizeUriCredentials(effective_uri);
 
@@ -2278,7 +3085,7 @@ struct SidebarConnectionEntry {
 
     if (request.driver_path.empty() || request.uri.empty()) {
       if (context.notify) {
-        context.notify("ADBC 驱动与连接地址不能为空");
+        context.notify(loc.Get(app::strings::toast_driver_addr_required));
       }
       return;
     }
@@ -2315,7 +3122,8 @@ struct SidebarConnectionEntry {
       }
       if (!PersistConnectionProfileList(config_db, context.profiles_path, list)) {
         if (context.notify) {
-          context.notify("保存连接配置失败: " + context.profiles_path);
+          context.notify(
+              loc.Fmt(app::strings::toast_save_profiles_path_failed, context.profiles_path));
         }
         return;
       }
@@ -2330,35 +3138,41 @@ struct SidebarConnectionEntry {
   View readiness_strip;
   if (active_preset.form_kind != ConnectionFormKind::Custom) {
     if (matched_driver.has_value()) {
-      const std::string ready_detail =
-          active_preset.id == "redis"
-              ? std::string("内置 Redis 客户端（RESP2/RESP3，无需安装驱动）")
-              : (active_preset.builtin
-                     ? ("内置 SQLite 驱动 · " + matched_driver->path)
-                     : (matched_driver->detail.empty() ? matched_driver->path
-                                                       : matched_driver->detail));
+      std::string ready_text;
+      if (active_preset.id == "redis") {
+        ready_text = UseString(app::strings::connect_ready_redis);
+      } else if (active_preset.builtin) {
+        ready_text = UseString(app::strings::connect_ready_sqlite, matched_driver->path);
+      } else {
+        const std::string& driver_detail =
+            matched_driver->detail.empty() ? matched_driver->path : matched_driver->detail;
+        ready_text = UseString(app::strings::connect_ready_driver, driver_detail);
+      }
       readiness_strip = Row{
           AccentDot(semantic.success, 7.0F),
-          MutedText(active_preset.id == "redis" ? ready_detail : ("驱动已就绪 · " + ready_detail)),
+          MutedText(ready_text),
       }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center});
     } else {
       readiness_strip =
           Row{
               Column{
-                  Text("尚未安装 " + active_preset.name + " 驱动（" + active_preset.driver_slug + "）"),
-                  MutedText("可点击右侧一键从官方 ADBC Registry 下载安装，或手动指定驱动路径。"),
+                  Text::Format(app::strings::connect_missing_driver_title, active_preset_name,
+                               active_preset.driver_slug),
+                  MutedText(UseString(app::strings::connect_missing_driver_hint)),
               }.With(Grow(1.0F), Spacing{2.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
-              ActionButton(Button(installing.Get() ? "安装中…" : "一键安装驱动")
+              ActionButton(Button(installing.Get() ? app::strings::connect_installing_btn
+                                                   : app::strings::connect_one_click_install)
                                .OnClick(install_active_driver)
                                .With(Enabled{!installing.Get()}),
                            ButtonTone::Primary),
-              ActionButton(Button("ADBC 管理器…").OnClick([dialog, open_manager = context.open_manager,
-                                                         slug = active_preset.driver_slug] {
-                dialog.Dismiss();
-                if (open_manager) {
-                  open_manager(1, slug);
-                }
-              })),
+              ActionButton(Button(app::strings::connect_open_manager_btn)
+                               .OnClick([dialog, open_manager = context.open_manager,
+                                         slug = active_preset.driver_slug] {
+                                 dialog.Dismiss();
+                                 if (open_manager) {
+                                   open_manager(1, slug);
+                                 }
+                               })),
           }.With(Padding{EdgeInsets::Symmetric(10.0F, 8.0F)}, Spacing{8.0F},
                  CrossAlign{CrossAxisAlignment::Center},
                  Background{VisualFill{semantic.warning_container}},
@@ -2366,247 +3180,32 @@ struct SidebarConnectionEntry {
     }
   }
 
-  Views form_fields;
-  if (active_preset.form_kind == ConnectionFormKind::File) {
-    form_fields.Add(
-        Row{
-            TextField(uri)
-                .Label("数据库文件路径")
-                .Placeholder(active_preset.uri_placeholder)
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([uri](const TextEditingValue& value) { uri = value; })
-                .With(Grow(1.0F)),
-            ActionButton(Button("浏览文件…").OnClick(pick_local_file))
-                .With(Enabled{context.picker && context.picker->CanOpenFiles()}),
-        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}));
-    form_fields.Add(
-        TextField(title)
-            .Label("显示名称（可选）")
-            .Placeholder("留空则使用文件名")
-            .Variant(TextFieldVariant::Outlined)
-            .LineLimits(TextFieldLineLimits::SingleLine())
-            .OnChanged([title](const TextEditingValue& value) { title = value; }));
-    form_fields.Add(
-        MonospaceField(
-            TextField(driver)
-                .Label("ADBC 驱动")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([driver](const TextEditingValue& value) { driver = value; })));
-  } else if (active_preset.form_kind == ConnectionFormKind::HostPort) {
-    form_fields.Add(
-        SegmentedButton({"表单填写", "URI 字符串"}, input_mode.Get())
-            .OnChanged([input_mode, active_preset, host, port, database, uri](std::size_t idx) {
-              if (idx == 1 && input_mode.Get() == 0) {
-                uri = TextEditingValue::FromText(
-                    ComposePresetUri(active_preset, host.Get().text, port.Get().text,
-                                     database.Get().text));
-              }
-              input_mode = idx;
-            }));
-    if (input_mode.Get() == 0) {
-      form_fields.Add(
-          Row{
-              TextField(host)
-                  .Label("主机")
-                  .Placeholder(active_preset.default_host)
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .OnChanged([host](const TextEditingValue& value) { host = value; })
-                  .With(Grow(2.0F)),
-              TextField(port)
-                  .Label("端口")
-                  .Placeholder(active_preset.default_port)
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .OnChanged([port](const TextEditingValue& value) { port = value; })
-                  .With(Grow(1.0F)),
-          }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-      form_fields.Add(
-          TextField(database)
-              .Label(active_preset.id == "redis" ? "数据库编号（0-15）" : "数据库名")
-              .Placeholder(active_preset.default_database)
-              .Variant(TextFieldVariant::Outlined)
-              .LineLimits(TextFieldLineLimits::SingleLine())
-              .OnChanged([database](const TextEditingValue& value) { database = value; }));
-      form_fields.Add(
-          Row{
-              TextField(username)
-                  .Label(active_preset.id == "redis" ? "用户名（ACL 可选）" : "用户名")
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .OnChanged([username](const TextEditingValue& value) { username = value; })
-                  .With(Grow(1.0F)),
-              TextField(password)
-                  .Label("密码（可选）")
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .Secure(true)
-                  .OnChanged([password](const TextEditingValue& value) { password = value; })
-                  .With(Grow(1.0F)),
-          }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-      const std::string preview = ComposePresetUri(
-          active_preset, host.Get().text, port.Get().text, database.Get().text);
-      form_fields.Add(MutedText("连接 URI: " + preview));
-    } else {
-      form_fields.Add(
-          MonospaceField(
-              TextField(uri)
-                  .Label("连接 URI")
-                  .Placeholder(active_preset.uri_placeholder)
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .OnChanged([uri](const TextEditingValue& value) { uri = value; })));
-      form_fields.Add(
-          Row{
-              TextField(username)
-                  .Label("用户名（可选）")
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .OnChanged([username](const TextEditingValue& value) { username = value; })
-                  .With(Grow(1.0F)),
-              TextField(password)
-                  .Label("密码（可选）")
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .Secure(true)
-                  .OnChanged([password](const TextEditingValue& value) { password = value; })
-                  .With(Grow(1.0F)),
-          }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-      form_fields.Add(
-          MonospaceField(
-              TextField(driver)
-                  .Label("ADBC 驱动（短名或路径）")
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::SingleLine())
-                  .OnChanged([driver](const TextEditingValue& value) { driver = value; })));
-    }
-    form_fields.Add(
-        TextField(title)
-            .Label("显示名称（可选）")
-            .Placeholder("留空则自动命名")
-            .Variant(TextFieldVariant::Outlined)
-            .LineLimits(TextFieldLineLimits::SingleLine())
-            .OnChanged([title](const TextEditingValue& value) { title = value; }));
-  } else if (active_preset.form_kind == ConnectionFormKind::Uri) {
-    form_fields.Add(
-        MonospaceField(
-            TextField(uri)
-                .Label("连接 URI")
-                .Placeholder(active_preset.uri_placeholder)
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([uri](const TextEditingValue& value) { uri = value; })));
-    form_fields.Add(
-        Row{
-            TextField(username)
-                .Label("用户名（可选）")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([username](const TextEditingValue& value) { username = value; })
-                .With(Grow(1.0F)),
-            TextField(password)
-                .Label("密码（可选）")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .Secure(true)
-                .OnChanged([password](const TextEditingValue& value) { password = value; })
-                .With(Grow(1.0F)),
-        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-    form_fields.Add(
-        MonospaceField(
-            TextField(driver)
-                .Label("ADBC 驱动（短名或路径）")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([driver](const TextEditingValue& value) { driver = value; })));
-    form_fields.Add(
-        TextField(title)
-            .Label("显示名称（可选）")
-            .Placeholder("留空则自动命名")
-            .Variant(TextFieldVariant::Outlined)
-            .LineLimits(TextFieldLineLimits::SingleLine())
-            .OnChanged([title](const TextEditingValue& value) { title = value; }));
-  } else {
-    Views discovered_rows;
-    discovered_rows.Reserve(driver_list.size());
-    for (const AdbcDriverInfo& info : driver_list) {
-      const std::string& detail = info.detail.empty() ? info.path : info.detail;
-      discovered_rows.Add(
-          NavItem(info.name, detail, driver.Get().text == info.path,
-                  [driver, info] { driver = TextEditingValue::FromText(info.path); }, {},
-                  std::nullopt,
-                  DatabaseIcon(DetectDatabaseBrand(info.path + " " + info.name), 18.0F))
-              .Key("custom-driver-" + info.path + "-" + detail));
-    }
-    if (discovered_rows.Size() > 0) {
-      form_fields.Add(Caption("已发现的 ADBC 驱动（点击填入）"));
-      form_fields.Add(
-          ScrollView(Column{std::move(discovered_rows)}.With(Spacing{2.0F}))
-              .With(Frame{.height = 110.0F}));
-    }
-    form_fields.Add(
-        MonospaceField(
-            TextField(driver)
-                .Label("ADBC 驱动（短名 / .toml / 共享库路径）")
-                .Placeholder("postgresql · /path/to/libadbc_driver_*.so")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([driver](const TextEditingValue& value) { driver = value; })));
-    form_fields.Add(
-        MonospaceField(
-            TextField(uri)
-                .Label("URI")
-                .Placeholder(active_preset.uri_placeholder)
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([uri](const TextEditingValue& value) { uri = value; })));
-    form_fields.Add(
-        Row{
-            TextField(username)
-                .Label("用户名（可选）")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .OnChanged([username](const TextEditingValue& value) { username = value; })
-                .With(Grow(1.0F)),
-            TextField(password)
-                .Label("密码（可选）")
-                .Variant(TextFieldVariant::Outlined)
-                .LineLimits(TextFieldLineLimits::SingleLine())
-                .Secure(true)
-                .OnChanged([password](const TextEditingValue& value) { password = value; })
-                .With(Grow(1.0F)),
-        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-    form_fields.Add(
-        TextField(title)
-            .Label("显示名称（可选）")
-            .Placeholder("留空则使用 URI 文件名")
-            .Variant(TextFieldVariant::Outlined)
-            .LineLimits(TextFieldLineLimits::SingleLine())
-            .OnChanged([title](const TextEditingValue& value) { title = value; }));
-  }
-
-  form_fields.Add(
-      Switch("保存到已保存连接（默认保留密码）", save_profile_flag)
-          .OnChanged([save_profile_flag](bool value) { save_profile_flag = value; }));
+  View form_fields = Column{
+      ConnectionFormFields(
+          active_preset, active_preset_placeholder, form, driver_list,
+          context.picker && context.picker->CanOpenFiles(), pick_local_file, connect,
+          (active_preset.form_kind == ConnectionFormKind::File ||
+           active_preset.form_kind == ConnectionFormKind::Custom)
+              ? app::strings::connect_name_filename_hint
+              : app::strings::connect_name_auto_hint),
+      Switch(app::strings::connect_save_profile_switch, save_profile_flag)
+          .OnChanged([save_profile_flag](bool value) { save_profile_flag = value; }),
+  }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 
   View step1_body = Column{
       Row{
-          ActionButton(Button("← 选择类型").OnClick([step] {
+          ActionButton(Button(app::strings::connect_back_step0).OnClick([step] {
             step = 0;
           })),
           DatabaseIcon(DetectDatabaseBrand(active_preset.id), 22.0F),
-          Text("连接 " + active_preset.name, TextRole::Title),
+          Text::Format(TextRole::Title, app::strings::connect_step1_title, active_preset_name),
           Spacer(),
-          ActionButton(Button("取消").OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button("连接").OnClick(connect), ButtonTone::Primary)
+          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+          ActionButton(Button(app::strings::action_connect).OnClick(connect), ButtonTone::Primary)
               .With(Enabled{!installing.Get()}),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
       std::move(readiness_strip),
-      ScrollView(Column{std::move(form_fields)}
-                     .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}))
-          .With(Grow(1.0F)),
+      ScrollView(std::move(form_fields)).With(Grow(1.0F)),
       installing.Get() && !install_status.Get().empty() ? MutedText(install_status.Get())
                                                         : View{},
   }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch},
@@ -2617,15 +3216,17 @@ struct SidebarConnectionEntry {
 
 [[huxerui::composable]] View TableBrowserPage(
     State<AppModel> app, State<WorkspaceModel> workspace, std::uint64_t tab_id,
-    TaskScope tasks, NotifyFn notify, AppThemeConfig theme_config, bool system_dark) {
+    TaskScope tasks, NotifyFn notify, AppThemeConfig theme_config, LanguageMode language_mode,
+    bool system_dark) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto dialogs = UseDialog();
   auto live_drafts = UseState(std::make_shared<std::unordered_map<std::string, std::string>>());
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
-    return TableEmptyState("标签页已关闭");
+    return TableEmptyState(app::strings::table_tab_closed);
   }
   const TableModel& model = tab->table;
   const DbSession* session = nullptr;
@@ -2636,7 +3237,7 @@ struct SidebarConnectionEntry {
     }
   }
   if (session == nullptr) {
-    return TableEmptyState("数据库连接已断开");
+    return TableEmptyState(app::strings::table_conn_disconnected);
   }
   const bool is_redis = session->dialect == Dialect::Redis;
 
@@ -2742,11 +3343,11 @@ struct SidebarConnectionEntry {
     });
   };
 
-  const auto block_if_dirty = [workspace, tab_id, notify]() -> bool {
+  const auto block_if_dirty = [workspace, tab_id, notify, loc]() -> bool {
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
     if (cur != nullptr && !cur->table.pending_inserts.empty()) {
       if (notify) {
-        notify("当前有未提交的新增行，请先点击「提交」或「回滚」");
+        notify(loc.Get(app::strings::table_dirty_block));
       }
       return true;
     }
@@ -2782,7 +3383,7 @@ struct SidebarConnectionEntry {
     reload(cur->table.page, cur->table.filter);
   };
 
-  const auto add_draft_row = [workspace, tab_id, flush_live_drafts, notify] {
+  const auto add_draft_row = [workspace, tab_id, flush_live_drafts, notify, loc] {
     flush_live_drafts();
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
     if (cur == nullptr || !cur->table.editable || cur->table.read_only || cur->table.committing ||
@@ -2813,7 +3414,7 @@ struct SidebarConnectionEntry {
       target->selected_cell = DataTableCellId{.row_id = row_id, .column_id = focus_col};
     });
     if (committed_rows > 12 && notify) {
-      notify("已在表格最底部添加空白行，滚动到底部编辑后点击「提交」或「回滚」");
+      notify(loc.Get(app::strings::table_draft_added_hint));
     }
   };
 
@@ -2822,7 +3423,7 @@ struct SidebarConnectionEntry {
     RequestCommitPendingInserts(app, workspace, tasks, tab_id, notify);
   };
 
-  const auto rollback_inserts = [workspace, tab_id, live_drafts, notify] {
+  const auto rollback_inserts = [workspace, tab_id, live_drafts, notify, loc] {
     live_drafts.Get()->clear();
     bool cleared = false;
     workspace.Update([&](WorkspaceModel& ws) {
@@ -2838,13 +3439,13 @@ struct SidebarConnectionEntry {
       cleared = true;
     });
     if (cleared && notify) {
-      notify("已回滚未保存的新增行");
+      notify(loc.Get(app::strings::table_draft_rolled_back));
     }
   };
 
   const auto delete_selected_action = [dialogs, app, workspace, tab_id, live_drafts,
                                        flush_live_drafts, tasks, notify, theme_config,
-                                       system_dark, is_redis] {
+                                       language_mode, system_dark, is_redis, loc] {
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
     if (cur == nullptr || !cur->selected_cell.has_value()) {
       return;
@@ -2871,13 +3472,13 @@ struct SidebarConnectionEntry {
         target->selected_cell = std::nullopt;
       });
       if (notify) {
-        notify("已移除 1 条未保存行");
+        notify(loc.Get(app::strings::table_draft_removed_one));
       }
       return;
     }
-    dialogs.Show([app, workspace, tab_id, tasks, notify, theme_config, system_dark,
+    dialogs.Show([app, workspace, tab_id, tasks, notify, theme_config, language_mode, system_dark,
                   is_redis](DialogContext dialog) {
-      return WithDialogTheme(theme_config, system_dark,
+      return WithDialogTheme(theme_config, language_mode, system_dark,
                              DeleteRowDialog(dialog, app, workspace, tab_id, tasks, notify, is_redis));
     });
   };
@@ -2885,8 +3486,9 @@ struct SidebarConnectionEntry {
   Views toolbar_items;
   toolbar_items.Add(
       TextField(tab->filter_input)
-          .Label(is_redis ? "筛选  MATCH" : "筛选  WHERE")
-          .Placeholder(is_redis ? "例如 user:* 或 session:*" : "例如 price > 10 AND name LIKE 'A%'")
+          .Label(is_redis ? app::strings::table_filter_redis : app::strings::table_filter_sql)
+          .Placeholder(is_redis ? app::strings::table_filter_redis_ph
+                                : app::strings::table_filter_sql_ph)
           .Variant(TextFieldVariant::Outlined)
           .LineLimits(TextFieldLineLimits::SingleLine())
           .OnChanged([workspace, tab_id](const TextEditingValue& value) {
@@ -2898,24 +3500,27 @@ struct SidebarConnectionEntry {
           })
           .OnSubmitted([apply_filter] { apply_filter(); })
           .With(Frame{.width = 240.0F}));
-  toolbar_items.Add(ActionButton(Button("应用筛选").OnClick(apply_filter)));
+  toolbar_items.Add(ActionButton(Button(app::strings::table_apply_filter).OnClick(apply_filter)));
   toolbar_items.Add(Spacer());
-  toolbar_items.Add(ActionButton(Button("刷新").OnClick(refresh)));
+  toolbar_items.Add(ActionButton(Button(app::strings::action_refresh).OnClick(refresh)));
   toolbar_items.Add(
-      ActionButton(Button(is_redis ? "＋ 添加键" : "＋ 添加行").OnClick(add_draft_row))
+      ActionButton(Button(is_redis ? app::strings::table_add_key : app::strings::table_add_row)
+                       .OnClick(add_draft_row))
           .With(Enabled{model.editable && !model.read_only && !model.committing}));
   if (!model.pending_inserts.empty()) {
     const std::string commit_label =
-        model.committing ? "提交中…"
-                         : "提交 (" + std::to_string(model.pending_inserts.size()) + ")";
+        model.committing ? UseString(app::strings::table_committing)
+                         : UseString(app::strings::table_commit_n, model.pending_inserts.size());
     toolbar_items.Add(
         ActionButton(Button(commit_label).OnClick(commit_inserts), ButtonTone::Primary)
             .With(Enabled{!model.committing}));
     toolbar_items.Add(
-        ActionButton(Button("回滚").OnClick(rollback_inserts)).With(Enabled{!model.committing}));
+        ActionButton(Button(app::strings::table_rollback).OnClick(rollback_inserts))
+            .With(Enabled{!model.committing}));
   }
   toolbar_items.Add(
-      ActionButton(Button(is_redis ? "删除键" : "删除行").OnClick(delete_selected_action),
+      ActionButton(Button(is_redis ? app::strings::table_delete_key : app::strings::table_delete_row)
+                       .OnClick(delete_selected_action),
                    ButtonTone::Danger)
           .With(Enabled{model.editable && !model.read_only && !model.committing &&
                         tab->selected_cell.has_value()}));
@@ -2927,21 +3532,20 @@ struct SidebarConnectionEntry {
       std::max<std::int64_t>(1, (model.total + model.page_size - 1) / model.page_size);
   const std::string status_text =
       !model.pending_inserts.empty()
-          ? ("待提交 " + std::to_string(model.pending_inserts.size()) +
-             " 行 · 双击或按 Enter 填写表格底部空白行，点击「提交」保存或「回滚」放弃")
-          : (model.message.empty() ? "没有数据" : model.message);
+          ? UseString(app::strings::table_pending_hint, model.pending_inserts.size())
+          : (model.message.empty() ? UseString(app::strings::table_no_data) : model.message);
   View pager = Row{
       MutedText(status_text),
-      model.read_only ? Chip("只读") : View{},
+      model.read_only ? Chip(app::strings::table_read_only) : View{},
       Spacer(),
-      ActionButton(Button("上一页")
+      ActionButton(Button(app::strings::table_prev_page)
                        .OnClick([reload, model] {
                          if (model.page > 0) {
                            reload(model.page - 1, model.filter);
                          }
                        }))
           .With(Enabled{model.page > 0 && model.pending_inserts.empty()}),
-      ActionButton(Button("下一页")
+      ActionButton(Button(app::strings::table_next_page)
                        .OnClick([reload, model, page_count] {
                          if (model.page + 1 < page_count) {
                            reload(model.page + 1, model.filter);
@@ -2952,14 +3556,18 @@ struct SidebarConnectionEntry {
 
   View table_view;
   if ((model.snapshot == nullptr && model.pending_inserts.empty()) || model.columns.empty()) {
-    const std::string empty_text =
+    const StringResource empty_res =
         model.loading
-            ? "正在加载…"
-            : (!model.error.empty() ? "加载失败，点击「刷新」重试" : "表中没有可显示的列");
-    table_view = TableEmptyState(empty_text);
+            ? app::strings::table_loading
+            : (!model.error.empty() ? app::strings::table_load_failed_retry
+                                    : app::strings::table_no_columns);
+    table_view = TableEmptyState(empty_res);
   } else {
     const std::shared_ptr<const GridSnapshot> snapshot = model.snapshot;
     const std::vector<PendingInsertRow> drafts = model.pending_inserts;
+    const std::string draft_first_empty = UseString(app::strings::table_draft_first_col_empty);
+    const std::string draft_other_empty = UseString(app::strings::table_draft_other_col_empty);
+    const std::string draft_acc_empty = UseString(app::strings::table_draft_accessibility_empty);
     std::vector<DataTableColumn> columns;
     columns.reserve(model.columns.size());
     for (std::size_t index = 0; index < model.columns.size(); ++index) {
@@ -2978,7 +3586,8 @@ struct SidebarConnectionEntry {
           .max = kMaxColumnWidth,
       };
       column.sortable = true;
-      column.render_cell = [snapshot, drafts, index, spec, semantic](
+      column.render_cell = [snapshot, drafts, index, spec, semantic, draft_first_empty,
+                            draft_other_empty, draft_acc_empty](
                                const DataTableCellContext& cell) -> DataTableCellContent {
         if (const auto draft_id = ParseDraftRowId(cell.id.row_id)) {
           const PendingInsertRow* draft = FindDraftRow(drafts, *draft_id);
@@ -2987,7 +3596,8 @@ struct SidebarConnectionEntry {
                                       : std::string{};
           const bool is_blank = raw.empty();
           const std::string display =
-              index == 0 ? (is_blank ? "＋ (空白)" : "＋ " + raw) : (is_blank ? "(空白)" : raw);
+              index == 0 ? (is_blank ? draft_first_empty : "＋ " + raw)
+                         : (is_blank ? draft_other_empty : raw);
           const Color draft_color =
               is_blank ? WithAlpha(semantic.draft_accent, 0.72F) : semantic.draft_accent;
           TextStyle style{is_blank ? Font::Monospace(13.0F).WithSlant(FontSlant::Italic)
@@ -2998,7 +3608,7 @@ struct SidebarConnectionEntry {
                           .Style(style)
                           .LineLimit(1)
                           .Overflow(TextOverflow::Ellipsis),
-              .label = is_blank ? std::string{"空白"} : raw,
+              .label = is_blank ? draft_acc_empty : raw,
           };
         }
 
@@ -3156,9 +3766,10 @@ struct SidebarConnectionEntry {
                                      std::uint64_t tab_id, TaskScope tasks, NotifyFn notify) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Sql) {
-    return TableEmptyState("查询标签页已关闭");
+    return TableEmptyState(app::strings::sql_tab_closed);
   }
   const SqlModel& sql_model = tab->sql;
   const DbSession* session = nullptr;
@@ -3170,11 +3781,11 @@ struct SidebarConnectionEntry {
   }
 
   if (session == nullptr || !session->session) {
-    return TableEmptyState("数据库连接已断开，请重新连接后执行");
+    return TableEmptyState(app::strings::sql_conn_disconnected);
   }
   const bool is_redis = session->dialect == Dialect::Redis;
 
-  const auto run = [app, workspace, tab_id, tasks, notify] {
+  const auto run = [app, workspace, tab_id, tasks, notify, loc] {
     const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
     if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
       return;
@@ -3195,21 +3806,22 @@ struct SidebarConnectionEntry {
     }
     if (!adbc) {
       if (notify) {
-        notify("连接已关闭");
+        notify(loc.Get(app::strings::toast_connection_closed));
       }
       return;
     }
 
-    workspace.Update([tab_id](WorkspaceModel& ws) {
+    const std::string running_status = loc.Get(app::strings::sql_running);
+    workspace.Update([tab_id, running_status](WorkspaceModel& ws) {
       if (WorkspaceTab* target = ws.FindTab(tab_id)) {
         target->sql.running = true;
         target->sql.error.clear();
-        target->sql.status = "执行中…";
+        target->sql.status = running_status;
       }
     });
 
     tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_is_redis,
-                  text]() -> Task<void> {
+                  text, loc]() -> Task<void> {
       if (session_is_redis || IsSqlReadStatement(text)) {
         AdbcQueryResult result =
             co_await ExecuteQueryAsync(adbc, text, true, kMaxQueryRows);
@@ -3223,7 +3835,9 @@ struct SidebarConnectionEntry {
             }
           });
           if (notify) {
-            notify((session_is_redis ? "命令失败: " : "SQL 失败: ") + message);
+            notify(loc.Fmt(session_is_redis ? app::strings::sql_cmd_failed
+                                            : app::strings::sql_query_failed,
+                           message));
           }
           co_return;
         }
@@ -3239,18 +3853,19 @@ struct SidebarConnectionEntry {
                               ComputeAutoColumnWidth(query->columns[i], i, query->snapshot.get()));
         }
         const std::size_t rows = query->snapshot->rows.size();
-        workspace.Update([tab_id, query, rows, auto_widths = std::move(auto_widths)](
-                             WorkspaceModel& ws) mutable {
+        const std::string returned_status = loc.Fmt(
+            query->truncated ? app::strings::sql_returned_rows_truncated
+                             : app::strings::sql_returned_rows,
+            rows);
+        workspace.Update([tab_id, query, returned_status,
+                          auto_widths = std::move(auto_widths)](WorkspaceModel& ws) mutable {
           if (WorkspaceTab* target = ws.FindTab(tab_id)) {
             query->id = target->sql.next_result_id++;
             target->sql.result = query;
             target->sql.column_widths = std::move(auto_widths);
             target->sql.running = false;
             target->sql.error.clear();
-            target->sql.status = "返回 " + std::to_string(rows) + " 行";
-            if (query->truncated) {
-              target->sql.status += "（已截断）";
-            }
+            target->sql.status = returned_status;
           }
         });
         if (session_is_redis && !IsReadStatement(Dialect::Redis, text)) {
@@ -3271,24 +3886,27 @@ struct SidebarConnectionEntry {
           }
         });
         if (notify) {
-          notify("SQL 失败: " + message);
+          notify(loc.Fmt(app::strings::sql_query_failed, message));
         }
         co_return;
       }
 
-      workspace.Update([tab_id, affected = executed.affected](WorkspaceModel& ws) {
+      const std::string done_status =
+          executed.affected >= 0
+              ? loc.Fmt(app::strings::sql_affected_rows, executed.affected)
+              : loc.Get(app::strings::sql_exec_done);
+      workspace.Update([tab_id, done_status](WorkspaceModel& ws) {
         if (WorkspaceTab* target = ws.FindTab(tab_id)) {
           target->sql.result.reset();
           target->sql.column_widths.clear();
           target->sql.running = false;
           target->sql.error.clear();
-          target->sql.status =
-              affected >= 0 ? "影响 " + std::to_string(affected) + " 行" : "执行完成";
+          target->sql.status = done_status;
         }
       });
       RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
       if (notify) {
-        notify("SQL 已执行，影响 " + std::to_string(executed.affected) + " 行");
+        notify(loc.Fmt(app::strings::sql_toast_affected, executed.affected));
       }
     });
   };
@@ -3326,26 +3944,27 @@ struct SidebarConnectionEntry {
       result_view = TableEmptyState(sql_model.status);
     }
   } else {
-    result_view = TableEmptyState("执行一条语句以查看结果");
+    result_view = TableEmptyState(app::strings::sql_empty_prompt);
   }
 
   return Column{
       Row{
           DatabaseIcon(DetectDatabaseBrand(session->driver_path, session->uri, session->dialect),
                        20.0F),
-          Text(is_redis ? "Redis 控制台" : "SQL", TextRole::Title),
+          Text(is_redis ? app::strings::sql_title_redis : app::strings::sql_title_sql,
+               TextRole::Title),
           MutedText(session->name),
           Spacer(),
-          ActionButton(Button(sql_model.running ? "执行中…" : "执行")
+          ActionButton(Button(sql_model.running ? app::strings::sql_running : app::strings::sql_run)
                            .OnClick(run)
                            .With(Enabled{!sql_model.running}),
                        ButtonTone::Primary),
       }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
       MonospaceField(
           TextField(sql_model.editor)
-              .Label(is_redis ? "Redis 命令" : "SQL 语句")
-              .Placeholder(is_redis ? "PING  ·  GET key  ·  HGETALL user:1  ·  INFO server"
-                                    : "SELECT * FROM table LIMIT 100;")
+              .Label(is_redis ? app::strings::sql_label_redis : app::strings::sql_label_sql)
+              .Placeholder(is_redis ? StringVariant(app::strings::sql_ph_redis)
+                                    : StringVariant("SELECT * FROM table LIMIT 100;"))
               .Variant(TextFieldVariant::Outlined)
               .LineLimits(TextFieldLineLimits::MultiLine(6, 12))
               .OnChanged([workspace, tab_id](const TextEditingValue& value) {
@@ -3359,8 +3978,8 @@ struct SidebarConnectionEntry {
       Row{
           MutedText(sql_model.status),
           Spacer(),
-          MutedText(is_redis ? "支持 Redis 命令（自动识别读写，写操作后刷新数据库计数）"
-                             : "支持 SELECT / PRAGMA / 写语句 / RETURNING"),
+          MutedText(UseString(is_redis ? app::strings::sql_hint_redis
+                                       : app::strings::sql_hint_sql)),
       }.With(CrossAlign{CrossAxisAlignment::Center}),
       std::move(result_view),
   }.With(Grow(1.0F), Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
@@ -3372,6 +3991,7 @@ struct SidebarConnectionEntry {
 
 [[huxerui::composable]] View SettingsPage(NotifyFn notify) {
   const auto settings = UseService<SettingsModel>();
+  const LocalizedCatalog loc{UseService<Resources>(), settings};
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   auto tasks = UseTaskScope();
@@ -3383,9 +4003,10 @@ struct SidebarConnectionEntry {
   auto animating = UseState(std::make_shared<ThemeAnimationFlag>());
   const bool system_dark = UseSystemThemeBrightness() == ThemeBrightness::Dark;
   const AppThemeConfig theme_config = settings->ThemeConfig();
+  const LanguageMode language_mode = settings->language.Get();
 
   // 明暗真正变化时使用圆形扩散过渡（参考 Clash-Flux），并将偏好持久化到 dbpp.sqlite3。
-  const auto apply_mode = [settings, notify, transition, tasks, animating, system_dark,
+  const auto apply_mode = [settings, notify, transition, tasks, animating, system_dark, loc,
                            current_mode = theme_config.mode,
                            motion = spec.motion](ThemeMode next_mode) {
     if (animating.Get()->animating) {
@@ -3393,9 +4014,9 @@ struct SidebarConnectionEntry {
     }
     const bool current_dark = ResolveIsDark(current_mode, system_dark);
     const bool target_dark = ResolveIsDark(next_mode, system_dark);
-    const auto mutation = [settings, notify, next_mode] {
+    const auto mutation = [settings, notify, next_mode, loc] {
       if (!settings->SetThemeMode(next_mode) && notify) {
-        notify("主题设置保存失败");
+        notify(loc.Get(app::strings::toast_theme_save_failed));
       }
     };
     if (current_dark == target_dark || motion.reduced_motion) {
@@ -3413,17 +4034,18 @@ struct SidebarConnectionEntry {
   };
 
   const auto& presets = AvailableThemePresets();
-  const auto make_preset_card = [settings, notify, &spec, &semantic,
+  const auto make_preset_card = [settings, notify, &spec, &semantic, loc,
                                  active_preset = theme_config.preset](const ThemePresetMeta& meta) {
     const bool selected = meta.preset == active_preset;
     const Color title_color = selected ? spec.colors.on_primary_container : spec.colors.on_surface;
     const Color sub_color = selected ? WithAlpha(spec.colors.on_primary_container, 0.80F)
                                      : spec.colors.on_surface_variant;
+    const auto [name_res, sub_res] = ThemePresetStrings(meta.preset);
     return Column{
         Spacer().With(Grow(0.0F), Frame{.height = 4.0F, .min_height = 4.0F, .max_height = 4.0F},
                       CornerRadius{2.0F}, Background{meta.swatch_bar}),
         Row{
-            Text(meta.name).Style(
+            Text(name_res).Style(
                 TextStyle{Font::System(font_size::kBody).WithWeight(FontWeight::SemiBold),
                           title_color}),
             Spacer(),
@@ -3431,7 +4053,7 @@ struct SidebarConnectionEntry {
             AccentDot(meta.swatch_b, 8.0F),
             AccentDot(meta.swatch_c, 8.0F),
         }.With(Spacing{4.0F}, CrossAlign{CrossAxisAlignment::Center}),
-        Text(meta.subtitle)
+        Text(sub_res)
             .Style(TextStyle{Font::System(font_size::kCaption), sub_color})
             .LineLimit(1)
             .Overflow(TextOverflow::Ellipsis),
@@ -3441,9 +4063,9 @@ struct SidebarConnectionEntry {
               Background{VisualFill{selected ? spec.colors.primary_container : spec.colors.surface}},
               Border{selected ? spec.colors.primary : semantic.border_subtle,
                      selected ? 2.0F : 1.0F})
-        .OnClick([settings, notify, preset = meta.preset] {
+        .OnClick([settings, notify, preset = meta.preset, loc] {
           if (!settings->SetThemePreset(preset) && notify) {
-            notify("主题设置保存失败");
+            notify(loc.Get(app::strings::toast_theme_save_failed));
           }
         })
         .Key("theme-preset-" + std::string(ThemePresetKey(meta.preset)));
@@ -3461,32 +4083,46 @@ struct SidebarConnectionEntry {
   }
 
   View body = Column{
-      Text("设置", TextRole::Title),
-      Caption("明暗模式"),
-      SegmentedButton({"跟随系统", "深色", "浅色"},
+      Text(app::strings::settings_title, TextRole::Title),
+      Caption(UseString(app::strings::settings_section_language)),
+      SegmentedButton({app::strings::settings_lang_system, app::strings::settings_lang_zh,
+                       app::strings::settings_lang_en},
+                      static_cast<std::size_t>(language_mode))
+          .OnChanged([settings, notify, loc](std::size_t index) {
+            const auto next = static_cast<LanguageMode>(index);
+            const Locale platform =
+                loc.resources ? loc.resources->Configuration().locale : Locale::Default();
+            SetActiveUiLanguage(ResolveUiLanguage(next, platform.LanguageTag()));
+            if (!settings->SetLanguage(next) && notify) {
+              notify(loc.Get(app::strings::toast_language_save_failed));
+            }
+          }),
+      Caption(UseString(app::strings::settings_section_appearance)),
+      SegmentedButton({app::strings::settings_theme_system, app::strings::settings_theme_dark,
+                       app::strings::settings_theme_light},
                       static_cast<std::size_t>(theme_config.mode))
           .OnChanged([apply_mode](std::size_t index) {
             apply_mode(static_cast<ThemeMode>(index));
           }),
-      Caption("配色主题"),
+      Caption(UseString(app::strings::settings_section_palette)),
       Column{std::move(preset_rows)}.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
       Divider(),
-      Caption("托盘"),
-      Switch("启用托盘图标", settings->tray_enabled)
-          .OnChanged([settings, notify](bool value) {
-            if (!settings->SetTrayEnabled(value)) {
-              notify("托盘设置保存失败");
+      Caption(UseString(app::strings::settings_section_tray)),
+      Switch(app::strings::settings_tray_enable, settings->tray_enabled)
+          .OnChanged([settings, notify, loc](bool value) {
+            if (!settings->SetTrayEnabled(value) && notify) {
+              notify(loc.Get(app::strings::toast_tray_save_failed));
             }
           }),
-      Switch("轻量级模式", settings->lightweight)
-          .OnChanged([settings, notify](bool value) {
-            if (!settings->SetLightweight(value)) {
-              notify("托盘设置保存失败");
+      Switch(app::strings::settings_tray_lightweight, settings->lightweight)
+          .OnChanged([settings, notify, loc](bool value) {
+            if (!settings->SetLightweight(value) && notify) {
+              notify(loc.Get(app::strings::toast_tray_save_failed));
             }
           })
           .With(Enabled{settings->tray_enabled.Get()}),
-      MutedText("轻量级模式在关闭窗口时销毁界面（会断开数据库连接），从托盘唤出时重建。"),
-      MutedText("db++ · ADBC 数据管理器"),
+      MutedText(UseString(app::strings::settings_tray_lightweight_hint)),
+      MutedText(UseString(app::strings::settings_footer)),
   }.With(Frame{.width = 620.0F}, Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 
   return ScrollView(Row{
@@ -3531,8 +4167,18 @@ struct SidebarConnectionEntry {
   const WindowHandle window = UseWindow();
   const auto tray_runtime = UseService<TrayRuntime>();
   const auto settings_model = UseService<SettingsModel>();
+  const LocalizedCatalog loc{UseService<Resources>(), settings_model};
   const bool system_dark = UseSystemThemeBrightness() == ThemeBrightness::Dark;
+  Lifecycle(
+      [tray_runtime, system_dark] {
+        if (tray_runtime) {
+          tray_runtime->UpdateSystemDark(system_dark);
+        }
+        return [] {};
+      },
+      system_dark);
   const AppThemeConfig theme_config = settings_model->ThemeConfig();
+  const LanguageMode language_mode = settings_model->language.Get();
   const ResolvedTheme resolved = ResolveTheme(theme_config, system_dark);
   const ThemeSpec& spec = resolved.spec;
   const SemanticColors& semantic = resolved.semantic;
@@ -3564,29 +4210,12 @@ struct SidebarConnectionEntry {
         }
         close_dialog_open = true;
         const AppThemeConfig current_theme = settings_model->ThemeConfig();
-        dialogs.Show([tray_runtime, close_dialog_open, current_theme,
+        const LanguageMode current_language = settings_model->language.Get();
+        dialogs.Show([tray_runtime, close_dialog_open, current_theme, current_language,
                       system_dark](DialogContext dialog) {
           return WithDialogTheme(
-              current_theme, system_dark,
-              DialogCard(Column{
-                  Row{
-                      Text("关闭 db++？", TextRole::Title),
-                      Spacer(),
-                      ActionButton(Button("取消").OnClick([dialog, close_dialog_open] {
-                        close_dialog_open = false;
-                        dialog.Dismiss();
-                      })),
-                      ActionButton(Button("退出").OnClick(
-                                       [dialog, tray_runtime, close_dialog_open] {
-                                         close_dialog_open = false;
-                                         dialog.Dismiss();
-                                         tray_runtime->RequestExit();
-                                       }),
-                                   ButtonTone::DangerSolid),
-                  }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-                  MutedText("托盘不可用；退出会关闭全部数据库连接。"),
-              }.With(Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-                             .With(Frame{.width = 480.0F})));
+              current_theme, current_language, system_dark,
+              CloseConfirmDialog(dialog, tray_runtime, close_dialog_open));
         });
         return true;
       });
@@ -3619,7 +4248,7 @@ struct SidebarConnectionEntry {
   });
 
   const auto open_manager = [dialogs, app, workspace, profiles, tasks, http, profiles_path,
-                             default_file, notify, theme_config,
+                             default_file, notify, theme_config, language_mode,
                              system_dark](std::size_t initial_tab, std::string initial_filter) {
     AdbcManagerContext context{
         .app = app,
@@ -3633,17 +4262,19 @@ struct SidebarConnectionEntry {
         .initial_tab = initial_tab,
         .initial_filter = std::move(initial_filter),
         .theme_config = theme_config,
+        .language_mode = language_mode,
         .system_dark = system_dark,
         .notify = notify,
     };
     dialogs.Show([context](DialogContext dialog) {
-      return WithDialogTheme(context.theme_config, context.system_dark,
+      return WithDialogTheme(context.theme_config, context.language_mode, context.system_dark,
                              AdbcManagerDialog(dialog, context));
     });
   };
 
   const auto open_new = [dialogs, app, workspace, profiles, tasks, picker, http, profiles_path,
-                         notify, default_file, theme_config, system_dark, open_manager] {
+                         notify, default_file, theme_config, language_mode, system_dark,
+                         open_manager] {
     ConnectContext context{
         .app = app,
         .workspace = workspace,
@@ -3655,21 +4286,22 @@ struct SidebarConnectionEntry {
         .default_driver = DefaultSqliteDriverPath(),
         .default_uri = default_file.Path(),
         .theme_config = theme_config,
+        .language_mode = language_mode,
         .system_dark = system_dark,
         .notify = notify,
         .open_manager = open_manager,
     };
     dialogs.Show([context](DialogContext dialog) {
-      return WithDialogTheme(context.theme_config, context.system_dark,
+      return WithDialogTheme(context.theme_config, context.language_mode, context.system_dark,
                              ConnectDialog(dialog, context));
     });
   };
 
-  const auto open_new_query = [app, workspace, show_settings, notify] {
+  const auto open_new_query = [app, workspace, show_settings, notify, loc] {
     show_settings = false;
     const DbSession* active_session = app.Get().ActiveSession();
     if (active_session == nullptr) {
-      notify("请先连接或选择左侧数据库连接，再新建查询");
+      notify(loc.Get(app::strings::toast_select_connection_first));
       return;
     }
     (void)OpenSqlTab(app, workspace, active_session->id);
@@ -3689,7 +4321,7 @@ struct SidebarConnectionEntry {
     OpenConnection(app, workspace, tasks, std::move(request), notify);
   };
 
-  const auto request_close_tabs = [dialogs, app, workspace, theme_config,
+  const auto request_close_tabs = [dialogs, app, workspace, theme_config, language_mode,
                                    system_dark](std::vector<std::uint64_t> ids) {
     if (ids.empty()) {
       return;
@@ -3706,9 +4338,9 @@ struct SidebarConnectionEntry {
       CloseWorkspaceTabs(app, workspace, ids);
       return;
     }
-    dialogs.Show([app, workspace, ids = std::move(ids), draft_count, theme_config,
+    dialogs.Show([app, workspace, ids = std::move(ids), draft_count, theme_config, language_mode,
                   system_dark](DialogContext dialog) {
-      return WithDialogTheme(theme_config, system_dark,
+      return WithDialogTheme(theme_config, language_mode, system_dark,
                              ConfirmCloseTabsDialog(dialog, app, workspace, ids, draft_count));
     });
   };
@@ -3734,15 +4366,15 @@ struct SidebarConnectionEntry {
   }
 
   View title_bar = WindowTitleBar{
-      TitleBarButton("新建连接",
+      TitleBarButton(UseString(app::strings::nav_new_connection),
                      [show_settings, open_new] {
                        show_settings = false;
                        open_new();
                      }),
-      TitleBarButton("新建查询", open_new_query,
+      TitleBarButton(UseString(app::strings::nav_new_query), open_new_query,
                      !show_settings.Get() && active_tab != nullptr &&
                          active_tab->kind == WorkspaceTabKind::Sql),
-      TitleBarButton("驱动管理",
+      TitleBarButton(UseString(app::strings::nav_driver_manager),
                      [show_settings, open_manager] {
                        show_settings = false;
                        open_manager(1, {});
@@ -3798,23 +4430,24 @@ struct SidebarConnectionEntry {
               [app, workspace, tid] { ActivateWorkspaceTab(app, workspace, tid); },
               [request_close_tabs, tid] { request_close_tabs({tid}); })
               .On<ViewEvents::ContextMenuRequested>(
-                  [menu, request_close_tabs, tid, other_ids, all_ids](Point position) {
+                  [menu, loc, request_close_tabs, tid, other_ids, all_ids](Point position) {
                     std::vector<MenuEntry> entries;
                     entries.emplace_back(
-                        MenuItem("关闭标签页", [request_close_tabs, tid] {
-                          request_close_tabs({tid});
-                        }));
+                        MenuItem(loc.Get(app::strings::tab_ctx_close),
+                                 [request_close_tabs, tid] { request_close_tabs({tid}); }));
                     if (!other_ids.empty()) {
                       entries.emplace_back(
-                          MenuItem("关闭其它标签页", [request_close_tabs, other_ids] {
-                            request_close_tabs(other_ids);
-                          }));
+                          MenuItem(loc.Get(app::strings::tab_ctx_close_others),
+                                   [request_close_tabs, other_ids] {
+                                     request_close_tabs(other_ids);
+                                   }));
                     }
                     entries.emplace_back(MenuSection{});
                     entries.emplace_back(
-                        MenuItem("关闭全部标签页", [request_close_tabs, all_ids] {
-                          request_close_tabs(all_ids);
-                        }));
+                        MenuItem(loc.Get(app::strings::tab_ctx_close_all),
+                                 [request_close_tabs, all_ids] {
+                                   request_close_tabs(all_ids);
+                                 }));
                     menu.ShowAt(position, std::move(entries));
                   })
               .Key("ws-tab-" + std::to_string(tid)));
@@ -3832,11 +4465,10 @@ struct SidebarConnectionEntry {
 
     View active_body;
     if (active_tab == nullptr) {
-      active_body =
-          TableEmptyState("从左侧选择一个表或视图，或点击「新建查询」打开新标签页");
+      active_body = TableEmptyState(app::strings::empty_select_object);
     } else if (active_tab->kind == WorkspaceTabKind::Table) {
       active_body = TableBrowserPage(app, workspace, active_tab->id, tasks, notify,
-                                     theme_config, system_dark)
+                                     theme_config, language_mode, system_dark)
                         .Key("tab-body-" + std::to_string(active_tab->id));
     } else {
       active_body = SqlPage(app, workspace, active_tab->id, tasks, notify)
@@ -3858,7 +4490,7 @@ struct SidebarConnectionEntry {
   } else {
     page_content = Row{
         Sidebar(app, workspace, profiles, profiles_path, tasks, notify, theme_config,
-                system_dark, connect_profile),
+                language_mode, system_dark, connect_profile),
         std::move(main_content).With(Grow(1.0F)),
     }.With(Grow(1.0F), CrossAlign{CrossAxisAlignment::Stretch});
   }
@@ -3878,10 +4510,24 @@ struct SidebarConnectionEntry {
   return Theme(AppThemeDefinition(resolved), std::move(shell));
 }
 
+[[huxerui::composable]] View AppShell() {
+  const auto settings = UseService<SettingsModel>();
+  const auto resources = UseService<Resources>();
+  const LanguageMode mode = settings ? settings->language.Get() : LanguageMode::System;
+  const Locale platform_locale =
+      resources ? resources->Configuration().locale : Locale::Default();
+  const Locale effective = EffectiveLocale(mode, platform_locale);
+  SetActiveUiLanguage(ResolveUiLanguage(mode, effective.LanguageTag()));
+  if (auto override_locale = EffectiveLocaleOverride(mode)) {
+    return ProvideEnvironment(*override_locale, AppContent());
+  }
+  return AppContent();
+}
+
 } // namespace dbpp
 
 huxerui::View AppRoot() {
-  return dbpp::AppContent();
+  return dbpp::AppShell();
 }
 
 const huxerui::Application application{

@@ -1,7 +1,10 @@
 # build.yml — db++ 多平台桌面 CI 与发版流水线（Linux / Windows / macOS）。
 #
-# 参考 Clash-Flux/.github/workflows/build.yml 适配，按桌面项目裁剪：
-#   * 使用标准 C++20（无 C++23 modules / import std），无需额外 LLVM 工具链；
+# 参考 Clash-Flux/.github/workflows/build.yml 适配，按 CMake >= 4.4 + C++23 模块
+# （dbpp_core + import std）构建：
+#   * Linux：ubuntu:24.04 容器 + clang-21 / libc++-21-dev（含重写 libc++.modules.json 路径）；
+#   * Windows：MSVC + CMake 4.4.2 + Ninja；
+#   * macOS：Homebrew llvm clang++ / libc++ + 生成 libc++.modules.json；
 #   * 通过 cmake/FindSQLite3.cmake（DBPP_USE_VENDORED_SQLITE3=ON）直接编译 Lib-SQLite
 #     内置 SQLite3，与 HuxerUI::SQLite 共用同一份 SQLite 源码，避免各平台依赖外部 sqlite3；
 #   * HuxerUI 与 Lib-SQLite 源码钉在 COMMIT，分别 clone 到 third_party/{huxerui,Lib-SQLite}/（已 gitignore）。
@@ -37,13 +40,13 @@ env:
 
 jobs:
   # ------------------------------------------------------------------ Linux
-  # ubuntu-24.04 原生 runner（GLIBC <= 2.39 基线），构建 x86_64 与 arm64 免安装目录 + DEB + RPM。
+  # ubuntu:24.04 容器（GLIBC <= 2.39 基线）+ apt.llvm.org clang-21/libc++-21（C++23 modules + import std），
+  # 构建 x86_64 与 arm64 免安装目录 + DEB + RPM。
   build-linux:
     name: build-linux-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    env:
-      CC: gcc-14
-      CXX: g++-14
+    container:
+      image: ubuntu:24.04
     strategy:
       fail-fast: false
       matrix:
@@ -53,16 +56,36 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
+      - name: Install container baseline
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl gnupg
+          install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | gpg --dearmor --yes -o /etc/apt/keyrings/llvm.gpg
+          echo 'deb [signed-by=/etc/apt/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update
+
+      - name: Check out source
+        uses: actions/checkout@v7
+
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            gcc-14 g++-14 ninja-build pkg-config file binutils gzip \
+          apt-get install -y --no-install-recommends \
+            clang-21 libc++-21-dev g++ ninja-build pkg-config file binutils gzip \
             python3 python3-pip libgtk-4-dev libepoxy-dev libsoup-3.0-dev dpkg-dev rpm
-          python3 -m pip install --user --break-system-packages -q cmake==4.4.2
-          printf '%s\n' "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/cmake" --version | head -1
-          g++-14 --version | head -1
+          python3 -m pip install --break-system-packages -q cmake==4.4.2
+          cmake --version | head -1
+          clang++-21 --version | head -1
+          python3 -c "
+          import glob, json
+          p = glob.glob('/usr/lib/*-linux-gnu/libc++.modules.json')[0]
+          d = json.load(open(p))
+          for m in d['modules']:
+              m['source-path'] = '/usr/lib/llvm-21/share/libc++/v1/' + m['source-path'].split('/')[-1]
+              m['local-arguments']['system-include-directories'] = ['/usr/lib/llvm-21/share/libc++/v1']
+          json.dump(d, open(p, 'w'), indent=1)"
 
       - name: Install safe patchelf for runtime deployment
         shell: bash
@@ -90,9 +113,6 @@ jobs:
           printf '%s\n' "${patchelf_root}/bin" >> "${GITHUB_PATH}"
           "${patchelf_root}/bin/patchelf" --version
 
-      - name: Check out source
-        uses: actions/checkout@v7
-
       - name: Fetch HuxerUI & Lib-SQLite sources (pinned)
         shell: bash
         run: |
@@ -105,7 +125,11 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DDBPP_BUILD_TESTS=ON -DDBPP_USE_VENDORED_SQLITE3=ON
+            -DDBPP_BUILD_TESTS=ON -DDBPP_USE_VENDORED_SQLITE3=ON \
+            -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 \
+            -DCMAKE_CXX_FLAGS='-stdlib=libc++' \
+            -DCMAKE_EXE_LINKER_FLAGS='-stdlib=libc++' \
+            -DCMAKE_SHARED_LINKER_FLAGS='-stdlib=libc++'
 
       - name: Build release
         run: cmake --build build --config Release --parallel
@@ -119,8 +143,13 @@ jobs:
           set -euo pipefail
           rm -rf dist-root dist-src
           DESTDIR="$PWD/dist-root" cmake --install build --component HuxerUIApplication --prefix /opt/dbpp
-          mkdir -p dist-src
+          mkdir -p dist-src/lib
           cp -a dist-root/opt/dbpp/. dist-src/
+          for lib in libc++.so.1 libc++abi.so.1 libunwind.so.1; do
+            p="$(find /usr/lib -name "$lib" -print -quit 2>/dev/null || true)"
+            if [ -n "$p" ]; then cp -L "$p" "dist-src/lib/$lib"; fi
+          done
+          patchelf --set-rpath '$ORIGIN/lib' dist-src/dbpp
           test -x dist-src/dbpp
           test -f dist-src/dbpp.resources/huxerui/resources.bin
           test -f dist-src/lib/libhuxerui.so
@@ -398,18 +427,40 @@ jobs:
           git clone --filter=blob:none "$LIB_SQLITE_REPO" third_party/Lib-SQLite
           git -C third_party/Lib-SQLite checkout "$LIB_SQLITE_COMMIT"
 
-      - name: Ensure CMake >= 4.4 and Ninja
+      - name: Install dependencies (brew llvm + cmake + ninja)
         run: |
           set -euo pipefail
+          brew install llvm
           python3 -m venv "$RUNNER_TEMP/dbpp-tools"
           "$RUNNER_TEMP/dbpp-tools/bin/python" -m pip install -q cmake==4.4.2 ninja
           echo "$RUNNER_TEMP/dbpp-tools/bin" >> "$GITHUB_PATH"
+          llvm_prefix="$(brew --prefix llvm)"
+          mod_dir="$llvm_prefix/share/libc++/v1"
+          for f in std.cppm std.compat.cppm; do
+            test -f "$mod_dir/$f" || { echo "missing $mod_dir/$f (brew llvm layout changed?)" >&2; exit 1; }
+          done
+          python3 - "$mod_dir" "$llvm_prefix/lib/libc++.modules.json" <<'PY'
+          import json, sys
+          mod_dir, out = sys.argv[1], sys.argv[2]
+          mod = lambda name: {"logical-name": name, "source-path": mod_dir + "/" + name + ".cppm", "is-std-library": True, "local-arguments": {"system-include-directories": [mod_dir]}}
+          json.dump({"version": 1, "revision": 1, "modules": [mod("std"), mod("std.compat")]}, open(out, "w"), indent=1)
+          PY
+          echo "LLVM_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/dbpp-tools/bin/cmake" --version | head -1
           "$RUNNER_TEMP/dbpp-tools/bin/ninja" --version
 
       - name: Configure
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_OBJCXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_CXX_FLAGS='-stdlib=libc++ -D_LIBCPP_DISABLE_AVAILABILITY' \
+            -DCMAKE_OBJCXX_FLAGS='-stdlib=libc++ -D_LIBCPP_DISABLE_AVAILABILITY' \
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_CXX_STDLIB_MODULES_JSON="$LLVM_PREFIX/lib/libc++.modules.json" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DDBPP_BUILD_TESTS=ON -DDBPP_USE_VENDORED_SQLITE3=ON
 

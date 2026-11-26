@@ -1,28 +1,18 @@
-#include "adbc_session.h"
-#include "cli.h"
-#include "config_db.h"
-#include "driver_installer.h"
-#include "model.h"
-#include "settings.h"
-#include "theme.h"
-
+#include <huxerui/huxerui.h>
 #include <huxerui/sqlite.h>
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+
+import std;
+import dbpp.settings;
+import dbpp.types;
+import dbpp.adbc;
+import dbpp.driver_installer;
+import dbpp.db;
+import dbpp.config_db;
+import dbpp.cli;
+
+#include "theme_palette.h"
 
 namespace fs = std::filesystem;
 
@@ -920,17 +910,58 @@ void TestTableCellPreviewAndAutoWidth() {
 }
 
 void TestSettingsAndThemePalettes(const fs::path& dir) {
+  Expect(dbpp::LanguageModeKey(dbpp::LanguageMode::System) == "system",
+         "LanguageModeKey system mismatch");
+  Expect(dbpp::LanguageModeKey(dbpp::LanguageMode::Zh) == "zh",
+         "LanguageModeKey zh mismatch");
+  Expect(dbpp::LanguageModeKey(dbpp::LanguageMode::En) == "en",
+         "LanguageModeKey en mismatch");
+  Expect(dbpp::LanguageModeFromKey("zh") == dbpp::LanguageMode::Zh, "LanguageModeFromKey zh");
+  Expect(dbpp::LanguageModeFromKey("en") == dbpp::LanguageMode::En, "LanguageModeFromKey en");
+  Expect(dbpp::LanguageModeFromKey("system") == dbpp::LanguageMode::System,
+         "LanguageModeFromKey system");
+  Expect(dbpp::LanguageModeFromKey("unknown") == dbpp::LanguageMode::System,
+         "LanguageModeFromKey unknown fallback");
+
   const fs::path settings_path = dir / "sub" / "settings.tsv";
   dbpp::TraySettings saved;
   saved.tray_enabled = false;
   saved.lightweight = true;
   saved.theme_mode = dbpp::ThemeMode::Dark;
   saved.theme_preset = dbpp::ThemePreset::VioletDusk;
+  saved.language = dbpp::LanguageMode::En;
   Expect(dbpp::SaveTraySettings(settings_path.string(), saved),
          "SaveTraySettings should create parent directory and succeed");
 
   const dbpp::TraySettings loaded = dbpp::LoadTraySettings(settings_path.string());
-  Expect(loaded == saved, "LoadTraySettings round-trip with theme config mismatch");
+  Expect(loaded == saved, "LoadTraySettings round-trip with theme and language config mismatch");
+
+  const fs::path sqlite_settings_dir = dir / "sqlite_settings";
+  fs::create_directories(sqlite_settings_dir);
+  const fs::path sqlite_db_path = sqlite_settings_dir / "dbpp.sqlite3";
+  {
+    dbpp::TraySettings sqlite_saved = saved;
+    sqlite_saved.language = dbpp::LanguageMode::Zh;
+    Expect(dbpp::SaveTraySettings(sqlite_db_path.string(), sqlite_saved),
+           "SaveTraySettings to dbpp.sqlite3 should succeed");
+    const dbpp::TraySettings sqlite_loaded = dbpp::LoadTraySettings(sqlite_db_path.string());
+    Expect(sqlite_loaded == sqlite_saved,
+           "LoadTraySettings round-trip from dbpp.sqlite3 mismatch");
+
+    const dbpp::TraySettings startup_loaded =
+        dbpp::ConfigDbService::ReadStartupSettingsSync(sqlite_db_path.string());
+    Expect(startup_loaded == sqlite_saved,
+           "ReadStartupSettingsSync ui.language round-trip mismatch");
+
+    sqlite_saved.language = dbpp::LanguageMode::En;
+    Expect(dbpp::SaveTraySettings(sqlite_db_path.string(), sqlite_saved),
+           "SaveTraySettings updating ui.language=en in dbpp.sqlite3 should succeed");
+    Expect(dbpp::LoadTraySettings(sqlite_db_path.string()).language == dbpp::LanguageMode::En,
+           "LoadTraySettings should reflect updated ui.language=en in dbpp.sqlite3");
+    Expect(dbpp::ConfigDbService::ReadStartupSettingsSync(sqlite_db_path.string()).language ==
+               dbpp::LanguageMode::En,
+           "ReadStartupSettingsSync update to ui.language=en mismatch");
+  }
 
   const fs::path legacy_path = dir / "legacy_settings.tsv";
   WriteTextFile(legacy_path, "tray.enabled\tfalse\ntray.lightweight\ttrue\n");

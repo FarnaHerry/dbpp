@@ -1,8 +1,15 @@
-#include "config_db.h"
+module;
 
+#include <huxerui/sqlite.h>
+#include <huxerui/task.h>
 #include <cstdio>
-#include <filesystem>
-#include <utility>
+
+module dbpp.config_db;
+
+import std;
+import dbpp.settings;
+import dbpp.types;
+import dbpp.db;
 
 namespace dbpp {
 
@@ -48,6 +55,8 @@ void ApplySettingPair(std::string_view key, std::string_view value, TraySettings
     out.theme_mode = ThemeModeFromKey(value);
   } else if (key == kSettingThemePreset) {
     out.theme_preset = ThemePresetFromKey(value);
+  } else if (key == kSettingUiLanguage) {
+    out.language = LanguageModeFromKey(value);
   }
 }
 
@@ -109,7 +118,7 @@ TraySettings ConfigDbService::ReadStartupSettingsSync(const std::string& db_path
   auto read = sqlite::Database::QueryReadOnlySync(
       huxerui::File{db_path},
       "SELECT key, value FROM settings WHERE key IN "
-      "('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset')",
+      "('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', 'ui.language')",
       [&result](const sqlite::RowView& row) -> sqlite::Result<void> {
         auto key = row.Get<std::string>("key");
         if (!key) {

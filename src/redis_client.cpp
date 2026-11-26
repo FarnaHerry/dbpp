@@ -1,23 +1,6 @@
-#include "redis_client.h"
+module;
 
-#include <algorithm>
-#include <cctype>
-#include <cerrno>
-#include <charconv>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <iomanip>
-#include <iterator>
-#include <map>
-#include <set>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <unordered_set>
-#include <utility>
-#include <vector>
+#include <huxerui/datatable.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -38,6 +21,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
+module dbpp.redis;
+
+import std;
+import dbpp.types;
+import dbpp.i18n;
 
 namespace dbpp {
 
@@ -212,7 +205,7 @@ bool WaitConnectReady(SocketHandle s, int timeout_ms, std::string& error_out) {
   pfd.events = POLLWRNORM;
   const int rc = WSAPoll(&pfd, 1, timeout_ms);
   if (rc == 0) {
-    error_out = "连接超时";
+    error_out = Tr("Connection timed out", "连接超时");
     return false;
   }
   if (rc < 0) {
@@ -297,7 +290,7 @@ bool WaitConnectReady(SocketHandle s, int timeout_ms, std::string& error_out) {
     rc = poll(&pfd, 1, timeout_ms);
   } while (rc < 0 && errno == EINTR);
   if (rc == 0) {
-    error_out = "连接超时";
+    error_out = Tr("Connection timed out", "连接超时");
     return false;
   }
   if (rc < 0) {
@@ -344,7 +337,7 @@ bool FindCrLf(std::string_view buffer, std::size_t pos, std::size_t& line_end) {
 bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
                         RedisValue& out, std::string& error) {
   if (depth > kMaxRespDepth) {
-    error = "RESP 嵌套层级过深";
+    error = Tr("RESP nesting too deep", "RESP 嵌套层级过深");
     return false;
   }
   if (cursor >= buffer.size()) {
@@ -376,7 +369,7 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
     case ':': {
       const auto parsed = ParseStrictInt64(line);
       if (!parsed.has_value()) {
-        error = "无效的 RESP 整数: " + std::string(line);
+        error = TrFmt("Invalid RESP integer: {0}", "无效的 RESP 整数: {0}", {line});
         return false;
       }
       out = RedisValue{};
@@ -413,7 +406,7 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
         cursor = line_end + 2;
         return true;
       }
-      error = "无效的 RESP3 布尔值: " + std::string(line);
+      error = TrFmt("Invalid RESP3 boolean: {0}", "无效的 RESP3 布尔值: {0}", {line});
       return false;
     }
     case ',': {
@@ -433,7 +426,7 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
         char* end = nullptr;
         const double val = std::strtod(copy.c_str(), &end);
         if (errno == ERANGE || end != copy.c_str() + copy.size()) {
-          error = "无效的 RESP3 浮点数: " + std::string(line);
+          error = TrFmt("Invalid RESP3 double: {0}", "无效的 RESP3 浮点数: {0}", {line});
           return false;
         }
         out.number = val;
@@ -446,12 +439,12 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
     case '=': {
       const auto parsed_len = ParseStrictInt64(line);
       if (!parsed_len.has_value()) {
-        error = "无效的 RESP 字符串长度: " + std::string(line);
+        error = TrFmt("Invalid RESP string length: {0}", "无效的 RESP 字符串长度: {0}", {line});
         return false;
       }
       if (*parsed_len < 0) {
         if (*parsed_len != -1) {
-          error = "非法的 RESP 字符串长度: " + std::string(line);
+          error = TrFmt("Negative RESP string length: {0}", "非法的 RESP 字符串长度: {0}", {line});
           return false;
         }
         out = RedisValue{};
@@ -460,7 +453,7 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
         return true;
       }
       if (*parsed_len > kMaxRespBulkBytes) {
-        error = "RESP Bulk 数据超过 64MB 限制";
+        error = Tr("RESP bulk payload exceeds 64MB limit", "RESP Bulk 数据超过 64MB 限制");
         return false;
       }
       const std::size_t payload_len = static_cast<std::size_t>(*parsed_len);
@@ -470,7 +463,7 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
       }
       if (buffer[payload_start + payload_len] != '\r' ||
           buffer[payload_start + payload_len + 1] != '\n') {
-        error = "RESP Bulk 缺少 CRLF 结束符";
+        error = Tr("RESP bulk payload missing CRLF terminator", "RESP Bulk 缺少 CRLF 结束符");
         return false;
       }
       std::string_view payload = buffer.substr(payload_start, payload_len);
@@ -489,12 +482,12 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
     case '%': {
       const auto parsed_count = ParseStrictInt64(line);
       if (!parsed_count.has_value()) {
-        error = "无效的 RESP 数组长度: " + std::string(line);
+        error = TrFmt("Invalid RESP array length: {0}", "无效的 RESP 数组长度: {0}", {line});
         return false;
       }
       if (*parsed_count < 0) {
         if (*parsed_count != -1) {
-          error = "非法的 RESP 数组长度: " + std::string(line);
+          error = TrFmt("Negative RESP array length: {0}", "非法的 RESP 数组长度: {0}", {line});
           return false;
         }
         out = RedisValue{};
@@ -503,7 +496,7 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
         return true;
       }
       if (*parsed_count > kMaxRespArrayElements) {
-        error = "RESP 数组元素数量过多";
+        error = Tr("Too many elements in RESP array", "RESP 数组元素数量过多");
         return false;
       }
       std::size_t next = line_end + 2;
@@ -525,7 +518,8 @@ bool ParseRespValueImpl(std::string_view buffer, std::size_t& cursor, int depth,
     }
     default: {
       // Handle inline reply fallback if a server/proxy sends unexpected text.
-      error = std::string("不支持的 RESP 响应前缀 '") + prefix + "'";
+      error = TrFmt("Unsupported RESP reply prefix '{0}'", "不支持的 RESP 响应前缀 '{0}'",
+                    {std::string{prefix}});
       return false;
     }
   }
@@ -592,7 +586,7 @@ public:
     }
     SkipWs();
     if (pos_ != text_.size()) {
-      error_out = "JSON 尾部存在多余字符";
+      error_out = Tr("Trailing characters after JSON", "JSON 尾部存在多余字符");
       return false;
     }
     return true;
@@ -630,7 +624,7 @@ private:
 
   bool ParseString(std::string& out, std::string& error_out) {
     if (pos_ >= text_.size() || text_[pos_] != '"') {
-      error_out = "期望 JSON 字符串";
+      error_out = Tr("Expected JSON string", "期望 JSON 字符串");
       return false;
     }
     ++pos_;
@@ -641,7 +635,8 @@ private:
         return true;
       }
       if (static_cast<unsigned char>(c) < 0x20U) {
-        error_out = "JSON 字符串包含未转义控制字符";
+        error_out = Tr("Unescaped control character in JSON string",
+                       "JSON 字符串包含未转义控制字符");
         return false;
       }
       if (c != '\\') {
@@ -649,7 +644,7 @@ private:
         continue;
       }
       if (pos_ >= text_.size()) {
-        error_out = "JSON 转义序列未结束";
+        error_out = Tr("Unterminated JSON escape sequence", "JSON 转义序列未结束");
         return false;
       }
       const char esc = text_[pos_++];
@@ -664,14 +659,15 @@ private:
         case 't': out.push_back('\t'); break;
         case 'u': {
           if (pos_ + 4 > text_.size()) {
-            error_out = "JSON \\u 转义长度不足";
+            error_out = Tr("Truncated JSON \\u escape", "JSON \\u 转义长度不足");
             return false;
           }
           std::uint32_t cp = 0;
           for (int k = 0; k < 4; ++k) {
             const int d = HexDigit(text_[pos_++]);
             if (d < 0) {
-              error_out = "无效的 JSON \\u 十六进制字符";
+              error_out = Tr("Invalid hex digit in JSON \\u escape",
+                             "无效的 JSON \\u 十六进制字符");
               return false;
             }
             cp = (cp << 4) | static_cast<std::uint32_t>(d);
@@ -697,22 +693,23 @@ private:
           break;
         }
         default:
-          error_out = std::string("不支持的 JSON 转义 \\") + esc;
+          error_out = TrFmt("Unsupported JSON escape \\{0}", "不支持的 JSON 转义 \\{0}",
+                            {std::string{esc}});
           return false;
       }
     }
-    error_out = "JSON 字符串缺少结束引号";
+    error_out = Tr("Unterminated JSON string", "JSON 字符串缺少结束引号");
     return false;
   }
 
   bool ParseValue(JsonValue& out, std::string& error_out, int depth) {
     if (depth > 32) {
-      error_out = "JSON 嵌套层级过深";
+      error_out = Tr("JSON nesting too deep", "JSON 嵌套层级过深");
       return false;
     }
     SkipWs();
     if (pos_ >= text_.size()) {
-      error_out = "JSON 内容意外结束";
+      error_out = Tr("Unexpected end of JSON input", "JSON 内容意外结束");
       return false;
     }
     const char c = text_[pos_];
@@ -740,7 +737,7 @@ private:
         }
         SkipWs();
         if (pos_ >= text_.size() || text_[pos_] != ':') {
-          error_out = "JSON 对象缺少 ':'";
+          error_out = Tr("Expected ':' in JSON object", "JSON 对象缺少 ':'");
           return false;
         }
         ++pos_;
@@ -751,7 +748,7 @@ private:
         out.object_val.emplace_back(std::move(key), std::move(val));
         SkipWs();
         if (pos_ >= text_.size()) {
-          error_out = "JSON 对象缺少 '}'";
+          error_out = Tr("Expected '}' in JSON object", "JSON 对象缺少 '}'");
           return false;
         }
         if (text_[pos_] == '}') {
@@ -760,7 +757,7 @@ private:
           return true;
         }
         if (text_[pos_] != ',') {
-          error_out = "JSON 对象成员间缺少 ','";
+          error_out = Tr("Expected ',' between JSON object members", "JSON 对象成员间缺少 ','");
           return false;
         }
         ++pos_;
@@ -785,7 +782,7 @@ private:
         out.array_val.push_back(std::move(elem));
         SkipWs();
         if (pos_ >= text_.size()) {
-          error_out = "JSON 数组缺少 ']'";
+          error_out = Tr("Expected ']' in JSON array", "JSON 数组缺少 ']'");
           return false;
         }
         if (text_[pos_] == ']') {
@@ -794,7 +791,7 @@ private:
           return true;
         }
         if (text_[pos_] != ',') {
-          error_out = "JSON 数组元素间缺少 ','";
+          error_out = Tr("Expected ',' between JSON array elements", "JSON 数组元素间缺少 ','");
           return false;
         }
         ++pos_;
@@ -829,7 +826,7 @@ private:
         ++pos_;
       }
       if (pos_ >= text_.size() || !std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
-        error_out = "无效的 JSON 数字";
+        error_out = Tr("Invalid JSON number", "无效的 JSON 数字");
         return false;
       }
       while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
@@ -838,7 +835,7 @@ private:
       if (pos_ < text_.size() && text_[pos_] == '.') {
         ++pos_;
         if (pos_ >= text_.size() || !std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
-          error_out = "无效的 JSON 小数";
+          error_out = Tr("Invalid JSON fraction", "无效的 JSON 小数");
           return false;
         }
         while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
@@ -851,7 +848,7 @@ private:
           ++pos_;
         }
         if (pos_ >= text_.size() || !std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
-          error_out = "无效的 JSON 指数";
+          error_out = Tr("Invalid JSON exponent", "无效的 JSON 指数");
           return false;
         }
         while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) {
@@ -863,7 +860,7 @@ private:
       char* end = nullptr;
       const double d = std::strtod(raw.c_str(), &end);
       if (errno == ERANGE || end != raw.c_str() + raw.size() || !std::isfinite(d)) {
-        error_out = "JSON 数字超出范围: " + raw;
+        error_out = TrFmt("JSON number out of range: {0}", "JSON 数字超出范围: {0}", {raw});
         return false;
       }
       out = JsonValue{};
@@ -873,7 +870,7 @@ private:
       return true;
     }
 
-    error_out = std::string("无效的 JSON token '") + c + "'";
+    error_out = TrFmt("Invalid JSON token '{0}'", "无效的 JSON token '{0}'", {std::string{c}});
     return false;
   }
 
@@ -1043,8 +1040,9 @@ bool ValidateWritableKeyType(std::string_view type_text, std::string& normalized
     normalized_out = lower;
     return true;
   }
-  error_out = "不支持的 Redis 类型 '" + std::string(type_text) +
-              "'（可选: string, hash, list, set, zset）";
+  error_out = TrFmt("Unsupported Redis type '{0}' (valid: string, hash, list, set, zset)",
+                    "不支持的 Redis 类型 '{0}'（可选: string, hash, list, set, zset）",
+                    {type_text});
   return false;
 }
 
@@ -1064,12 +1062,14 @@ bool BuildWriteCommandArgs(std::string_view type, std::string_view value_text,
   }
   JsonValue parsed;
   if (!JsonParser(value_text).Parse(parsed, error_out)) {
-    error_out = std::string(type) + " 类型的值必须为合法 JSON（" + error_out + "）";
+    error_out = TrFmt("{0} value must be valid JSON ({1})",
+                      "{0} 类型的值必须为合法 JSON（{1}）", {type, error_out});
     return false;
   }
   if (type == "hash") {
     if (parsed.kind != JsonValue::Kind::Object || parsed.object_val.empty()) {
-      error_out = "hash 值必须为非空 JSON 对象，例如 {\"field\":\"value\"}";
+      error_out = Tr("hash value must be a non-empty JSON object, e.g. {\"field\":\"value\"}",
+                     "hash 值必须为非空 JSON 对象，例如 {\"field\":\"value\"}");
       return false;
     }
     for (const auto& [field, val] : parsed.object_val) {
@@ -1080,7 +1080,8 @@ bool BuildWriteCommandArgs(std::string_view type, std::string_view value_text,
   }
   if (type == "list" || type == "set") {
     if (parsed.kind != JsonValue::Kind::Array || parsed.array_val.empty()) {
-      error_out = std::string(type) + " 值必须为非空 JSON 数组，例如 [\"a\",\"b\"]";
+      error_out = TrFmt("{0} value must be a non-empty JSON array, e.g. [\"a\",\"b\"]",
+                        "{0} 值必须为非空 JSON 数组，例如 [\"a\",\"b\"]", {type});
       return false;
     }
     for (const JsonValue& elem : parsed.array_val) {
@@ -1090,12 +1091,14 @@ bool BuildWriteCommandArgs(std::string_view type, std::string_view value_text,
   }
   if (type == "zset") {
     if (parsed.kind != JsonValue::Kind::Array || parsed.array_val.empty()) {
-      error_out = "zset 值必须为非空 JSON 数组，例如 [{\"member\":\"a\",\"score\":1}]";
+      error_out = Tr("zset value must be a non-empty JSON array, e.g. [{\"member\":\"a\",\"score\":1}]",
+                     "zset 值必须为非空 JSON 数组，例如 [{\"member\":\"a\",\"score\":1}]");
       return false;
     }
     for (const JsonValue& elem : parsed.array_val) {
       if (elem.kind != JsonValue::Kind::Object) {
-        error_out = "zset 数组元素必须为包含 member 与 score 的对象";
+        error_out = Tr("zset array elements must be objects with member and score",
+                       "zset 数组元素必须为包含 member 与 score 的对象");
         return false;
       }
       const JsonValue* member = nullptr;
@@ -1105,11 +1108,12 @@ bool BuildWriteCommandArgs(std::string_view type, std::string_view value_text,
         if (k == "score") score = &v;
       }
       if (member == nullptr || score == nullptr) {
-        error_out = "zset 每个元素都需要 member 和 score 字段";
+        error_out = Tr("Every zset element requires member and score fields",
+                       "zset 每个元素都需要 member 和 score 字段");
         return false;
       }
       if (score->kind != JsonValue::Kind::Number && score->kind != JsonValue::Kind::String) {
-        error_out = "zset 的 score 必须为数字";
+        error_out = Tr("zset score must be a number", "zset 的 score 必须为数字");
         return false;
       }
       std::string score_str = score->AsScalarString();
@@ -1118,7 +1122,8 @@ bool BuildWriteCommandArgs(std::string_view type, std::string_view value_text,
       const double d = std::strtod(score_str.c_str(), &end);
       if (score_str.empty() || errno == ERANGE || end != score_str.c_str() + score_str.size() ||
           !std::isfinite(d)) {
-        error_out = "zset 的 score 不是有效数字: " + score_str;
+        error_out = TrFmt("zset score is not a valid number: {0}",
+                          "zset 的 score 不是有效数字: {0}", {score_str});
         return false;
       }
       args_out.push_back(std::move(score_str));
@@ -1126,7 +1131,7 @@ bool BuildWriteCommandArgs(std::string_view type, std::string_view value_text,
     }
     return true;
   }
-  error_out = "暂不支持写入类型: " + std::string(type);
+  error_out = TrFmt("Writing type {0} is not supported yet", "暂不支持写入类型: {0}", {type});
   return false;
 }
 
@@ -1191,7 +1196,7 @@ bool WriteTypedRedisKey(RedisClient& client, std::string_view key, std::string_v
   } else if (type == "zset") {
     write_cmd.emplace_back("ZADD");
   } else {
-    error_out = "不支持的类型: " + std::string(type);
+    error_out = TrFmt("Unsupported type: {0}", "不支持的类型: {0}", {type});
     return false;
   }
   write_cmd.emplace_back(key);
@@ -1292,7 +1297,7 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
   RedisParseUriResult res;
   std::string_view work = TrimAscii(uri);
   if (work.empty()) {
-    res.error = "Redis 连接地址不能为空";
+    res.error = Tr("Redis connection URI cannot be empty", "Redis 连接地址不能为空");
     return res;
   }
 
@@ -1301,12 +1306,14 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
     const std::string scheme = LowerAscii(work.substr(0, scheme_pos));
     if (scheme == "rediss") {
       res.endpoint.tls = true;
-      res.error =
-          "暂不支持 TLS 加密的 rediss:// 连接；请使用 redis:// 或通过 SSH 隧道映射到本地端口";
+      res.error = Tr(
+          "TLS rediss:// connections are not supported yet; use redis:// or tunnel to a local port via SSH",
+          "暂不支持 TLS 加密的 rediss:// 连接；请使用 redis:// 或通过 SSH 隧道映射到本地端口");
       return res;
     }
     if (scheme != "redis") {
-      res.error = "无效的 Redis URI 协议 '" + scheme + "://'（仅支持 redis://）";
+      res.error = TrFmt("Invalid Redis URI scheme '{0}://' (only redis:// is supported)",
+                        "无效的 Redis URI 协议 '{0}://'（仅支持 redis://）", {scheme});
       return res;
     }
     work.remove_prefix(scheme_pos + 3);
@@ -1341,7 +1348,7 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
 
   authority = TrimAscii(authority);
   if (authority.empty()) {
-    res.error = "Redis URI 缺少主机名";
+    res.error = Tr("Redis URI missing host", "Redis URI 缺少主机名");
     return res;
   }
 
@@ -1350,14 +1357,14 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
   if (authority.front() == '[') {
     const std::size_t close = authority.find(']');
     if (close == std::string_view::npos) {
-      res.error = "无效的 IPv6 地址";
+      res.error = Tr("Invalid IPv6 address", "无效的 IPv6 地址");
       return res;
     }
     host_part = authority.substr(1, close - 1);
     const std::string_view rest = authority.substr(close + 1);
     if (!rest.empty()) {
       if (rest.front() != ':') {
-        res.error = "无效的 Redis 主机端口格式";
+        res.error = Tr("Invalid Redis host:port format", "无效的 Redis 主机端口格式");
         return res;
       }
       port_part = rest.substr(1);
@@ -1371,7 +1378,7 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
   }
 
   if (host_part.empty()) {
-    res.error = "Redis URI 缺少主机名";
+    res.error = Tr("Redis URI missing host", "Redis URI 缺少主机名");
     return res;
   }
   res.endpoint.host = std::string(host_part);
@@ -1379,7 +1386,7 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
   if (!port_part.empty()) {
     const auto port_num = ParseStrictInt64(port_part);
     if (!port_num.has_value() || *port_num < 1 || *port_num > 65535) {
-      res.error = "无效的 Redis 端口: " + std::string(port_part);
+      res.error = TrFmt("Invalid Redis port: {0}", "无效的 Redis 端口: {0}", {port_part});
       return res;
     }
     res.endpoint.port = static_cast<std::uint16_t>(*port_num);
@@ -1402,7 +1409,8 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
     }
     const auto db_num = ParseRedisDbName(path);
     if (!db_num.has_value()) {
-      res.error = "无效的 Redis 数据库编号: " + std::string(path);
+      res.error = TrFmt("Invalid Redis database index: {0}", "无效的 Redis 数据库编号: {0}",
+                        {path});
       return res;
     }
     res.endpoint.db = *db_num;
@@ -1423,7 +1431,7 @@ RedisParseUriResult ParseRedisUri(std::string_view uri, std::string_view usernam
     if (k == "db" && !v.empty()) {
       const auto db_num = ParseRedisDbName(v);
       if (!db_num.has_value()) {
-        res.error = "无效的 Redis db 参数: " + v;
+        res.error = TrFmt("Invalid Redis db parameter: {0}", "无效的 Redis db 参数: {0}", {v});
         return res;
       }
       res.endpoint.db = *db_num;
@@ -1539,7 +1547,7 @@ RedisCommandParseResult ParseRedisCommandLine(std::string_view line) {
         token.push_back(c);
       }
       if (!closed) {
-        res.error = "命令字符串缺少结束引号";
+        res.error = Tr("Command string missing closing quote", "命令字符串缺少结束引号");
         res.args.clear();
         return res;
       }
@@ -1572,7 +1580,7 @@ RedisCommandParseResult ParseRedisCommandLine(std::string_view line) {
           token.push_back(c);
         }
         if (!closed) {
-          res.error = "命令字符串缺少结束引号";
+          res.error = Tr("Command string missing closing quote", "命令字符串缺少结束引号");
           res.args.clear();
           return res;
         }
@@ -1718,12 +1726,13 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
   struct addrinfo* res = nullptr;
   const int gai = getaddrinfo(endpoint_.host.c_str(), port_str.c_str(), &hints, &res);
   if (gai != 0 || res == nullptr) {
-    error_out = "解析主机失败 (" + endpoint_.host + "): " + GaiErrorText(gai);
+    error_out = TrFmt("Failed to resolve host ({0}): {1}", "解析主机失败 ({0}): {1}",
+                      {endpoint_.host, GaiErrorText(gai)});
     return false;
   }
 
   SocketHandle connected = kInvalidSocket;
-  std::string last_err = "无法连接到 Redis 服务器";
+  std::string last_err(Tr("Unable to connect to Redis server", "无法连接到 Redis 服务器"));
   for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
     const SocketHandle fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
     if (fd == kInvalidSocket) {
@@ -1760,7 +1769,9 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
   freeaddrinfo(res);
 
   if (connected == kInvalidSocket) {
-    error_out = "连接 Redis 失败 (" + endpoint_.host + ":" + port_str + "): " + last_err;
+    error_out = TrFmt("Failed to connect to Redis ({0}:{1}): {2}",
+                      "连接 Redis 失败 ({0}:{1}): {2}",
+                      {endpoint_.host, port_str, last_err});
     return false;
   }
 
@@ -1803,7 +1814,8 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
       }
     }
     if (auth_reply.IsError()) {
-      error_out = "Redis 认证失败: " + auth_reply.str;
+      error_out = TrFmt("Redis authentication failed: {0}", "Redis 认证失败: {0}",
+                        {auth_reply.str});
       Disconnect();
       return false;
     }
@@ -1816,7 +1828,8 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
       return false;
     }
     if (sel_reply.IsError()) {
-      error_out = "切换数据库 db" + std::to_string(current_db_) + " 失败: " + sel_reply.str;
+      error_out = TrFmt("Failed to switch database db{0}: {1}", "切换数据库 db{0} 失败: {1}",
+                        {std::to_string(current_db_), sel_reply.str});
       Disconnect();
       return false;
     }
@@ -1828,7 +1841,7 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
     return false;
   }
   if (ping_reply.IsError()) {
-    error_out = "Redis PING 失败: " + ping_reply.str;
+    error_out = TrFmt("Redis PING failed: {0}", "Redis PING 失败: {0}", {ping_reply.str});
     Disconnect();
     return false;
   }
@@ -1839,7 +1852,7 @@ bool RedisClient::OpenSocketAndHandshake(std::string& error_out) {
 bool RedisClient::SendAll(std::string_view payload, std::string& error_out) {
   const SocketHandle fd = static_cast<SocketHandle>(sock_);
   if (fd == kInvalidSocket) {
-    error_out = "Redis 连接未建立";
+    error_out = Tr("Redis connection not established", "Redis 连接未建立");
     return false;
   }
   std::size_t sent_total = 0;
@@ -1863,8 +1876,10 @@ bool RedisClient::SendAll(std::string_view payload, std::string& error_out) {
       continue;
     }
 #endif
-    error_out = IsTimedOutError(code) ? "发送 Redis 请求超时"
-                                      : ("发送 Redis 请求失败: " + LastSocketErrorText(code));
+    error_out = IsTimedOutError(code)
+                    ? std::string(Tr("Timed out sending Redis request", "发送 Redis 请求超时"))
+                    : TrFmt("Failed to send Redis request: {0}", "发送 Redis 请求失败: {0}",
+                            {LastSocketErrorText(code)});
     return false;
   }
   return true;
@@ -1873,7 +1888,7 @@ bool RedisClient::SendAll(std::string_view payload, std::string& error_out) {
 bool RedisClient::RecvSome(std::string& error_out) {
   const SocketHandle fd = static_cast<SocketHandle>(sock_);
   if (fd == kInvalidSocket) {
-    error_out = "Redis 连接未建立";
+    error_out = Tr("Redis connection not established", "Redis 连接未建立");
     return false;
   }
   char buf[16384];
@@ -1888,7 +1903,7 @@ bool RedisClient::RecvSome(std::string& error_out) {
       return true;
     }
     if (n == 0) {
-      error_out = "Redis 服务器已关闭连接";
+      error_out = Tr("Redis server closed connection", "Redis 服务器已关闭连接");
       return false;
     }
     const int code = CurrentSocketError();
@@ -1897,8 +1912,10 @@ bool RedisClient::RecvSome(std::string& error_out) {
       continue;
     }
 #endif
-    error_out = IsTimedOutError(code) ? "读取 Redis 响应超时"
-                                      : ("读取 Redis 响应失败: " + LastSocketErrorText(code));
+    error_out = IsTimedOutError(code)
+                    ? std::string(Tr("Timed out reading Redis reply", "读取 Redis 响应超时"))
+                    : TrFmt("Failed to read Redis reply: {0}", "读取 Redis 响应失败: {0}",
+                            {LastSocketErrorText(code)});
     return false;
   }
 }
@@ -1983,7 +2000,7 @@ bool RedisClient::Command(const std::vector<std::string>& args, RedisValue& out,
 
 bool RedisClient::EnsureDb(int db, std::string& error_out) {
   if (db < 0) {
-    error_out = "无效的 Redis 数据库编号";
+    error_out = Tr("Invalid Redis database index", "无效的 Redis 数据库编号");
     return false;
   }
   if (IsConnected() && current_db_ == db) {
@@ -2005,7 +2022,8 @@ bool RedisClient::EnsureDb(int db, std::string& error_out) {
   }
   if (reply.IsError()) {
     current_db_ = prev_db;
-    error_out = "切换数据库 db" + std::to_string(db) + " 失败: " + reply.str;
+    error_out = TrFmt("Failed to switch database db{0}: {1}", "切换数据库 db{0} 失败: {1}",
+                      {std::to_string(db), reply.str});
     return false;
   }
   return true;
@@ -2066,9 +2084,13 @@ AdbcObjectsResult LoadRedisObjectsBlocking(RedisClient& client) {
     RedisValue ping_reply;
     std::string ping_err;
     if (!client.Command({"PING"}, ping_reply, ping_err) || ping_reply.IsError()) {
-      result.error = !ping_err.empty()
-                         ? ping_err
-                         : (!ping_reply.str.empty() ? ping_reply.str : "无法连接 Redis 服务器");
+      result.error =
+          !ping_err.empty()
+              ? ping_err
+              : (!ping_reply.str.empty()
+                     ? ping_reply.str
+                     : std::string(Tr("Unable to connect to Redis server",
+                                      "无法连接到 Redis 服务器")));
       return result;
     }
   }
@@ -2110,7 +2132,8 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
 
   const std::optional<int> target_db = ParseRedisDbName(object.name);
   if (!target_db.has_value()) {
-    result.error = "无效的 Redis 数据库对象名: " + object.name;
+    result.error = TrFmt("Invalid Redis database object name: {0}",
+                         "无效的 Redis 数据库对象名: {0}", {object.name});
     return result;
   }
   if (!client.EnsureDb(*target_db, result.error)) {
@@ -2134,7 +2157,7 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
       return result;
     }
     if (scan_reply.kind != RedisValueKind::Array || scan_reply.elements.size() < 2) {
-      result.error = "SCAN 返回格式无效";
+      result.error = Tr("Invalid SCAN response format", "SCAN 返回格式无效");
       return result;
     }
     cursor = scan_reply.elements[0].ToDisplayString();
@@ -2394,10 +2417,12 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
   }
   model.page = clamped_page;
   model.snapshot = std::make_shared<const GridSnapshot>(GridSnapshot{.rows = std::move(page_res.rows)});
-  model.message = std::to_string(model.total) + " 个键 · 第 " + std::to_string(model.page + 1) +
-                  " / " + std::to_string(page_count) + " 页";
+  model.message = TrFmt("{0} keys · Page {1} / {2}", "{0} 个键 · 第 {1} / {2} 页",
+                        {std::to_string(model.total), std::to_string(model.page + 1),
+                         std::to_string(page_count)});
   if (page_res.scan_capped) {
-    model.message += "（最多扫描 " + std::to_string(kMaxScanKeys) + " 键）";
+    model.message += TrFmt(" (scan limit {0} keys)", "（最多扫描 {0} 键）",
+                           {std::to_string(kMaxScanKeys)});
   }
   return model;
 }
@@ -2414,7 +2439,7 @@ AdbcQueryResult ExecuteSingleRedisCommandBlocking(RedisClient& client,
     return result;
   }
   if (parsed.args.empty()) {
-    result.error = "Redis 命令不能为空";
+    result.error = Tr("Redis command cannot be empty", "Redis 命令不能为空");
     return result;
   }
 
@@ -2425,7 +2450,8 @@ AdbcQueryResult ExecuteSingleRedisCommandBlocking(RedisClient& client,
   if (cmd == "SELECT" && parsed.args.size() == 2) {
     const auto db_num = ParseStrictInt64(parsed.args[1]);
     if (!db_num.has_value() || *db_num < 0 || *db_num > 1000000) {
-      result.error = "无效的数据库编号: " + parsed.args[1];
+      result.error = TrFmt("Invalid database index: {0}", "无效的数据库编号: {0}",
+                           {parsed.args[1]});
       return result;
     }
     if (!client.EnsureDb(static_cast<int>(*db_num), result.error)) {
@@ -2540,7 +2566,9 @@ AdbcQueryResult ExecuteRedisCommandBlocking(RedisClient& client, std::string_vie
   if (lines.empty()) {
     AdbcQueryResult result;
     const RedisCommandParseResult syntax_check = ParseRedisCommandLine(command_text);
-    result.error = !syntax_check.error.empty() ? syntax_check.error : "Redis 命令不能为空";
+    result.error = !syntax_check.error.empty()
+                       ? syntax_check.error
+                       : std::string(Tr("Redis command cannot be empty", "Redis 命令不能为空"));
     return result;
   }
   if (lines.size() == 1) {
@@ -2550,7 +2578,8 @@ AdbcQueryResult ExecuteRedisCommandBlocking(RedisClient& client, std::string_vie
   for (std::size_t i = 0; i < lines.size(); ++i) {
     AdbcQueryResult step = ExecuteSingleRedisCommandBlocking(client, lines[i], max_rows);
     if (!step.error.empty()) {
-      step.error = "第 " + std::to_string(i + 1) + " 条命令失败: " + step.error;
+      step.error = TrFmt("Command {0} failed: {1}", "第 {0} 条命令失败: {1}",
+                         {std::to_string(i + 1), step.error});
       return step;
     }
     last_result = std::move(step);
@@ -2563,12 +2592,13 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
                                         const std::string& text) {
   AdbcQueryResult result;
   if (!model.snapshot || row_index >= model.snapshot->rows.size() || column_index >= 5) {
-    result.error = "目标行或列已失效";
+    result.error = Tr("Target row or column is invalid", "目标行或列已失效");
     return result;
   }
   const std::optional<int> db = ParseRedisDbName(model.object);
   if (!db.has_value()) {
-    result.error = "无效的 Redis 数据库: " + model.object;
+    result.error = TrFmt("Invalid Redis database: {0}", "无效的 Redis 数据库: {0}",
+                         {model.object});
     return result;
   }
   if (!client.EnsureDb(*db, result.error)) {
@@ -2577,7 +2607,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
 
   const GridRow& row = model.snapshot->rows[row_index];
   if (row.values.size() < 5) {
-    result.error = "行数据不完整";
+    result.error = Tr("Incomplete row data", "行数据不完整");
     return result;
   }
   const std::string& key = row.values[0].text;
@@ -2585,7 +2615,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
 
   if (column_index == 0) {
     if (text.empty()) {
-      result.error = "键名不能为空";
+      result.error = Tr("Key name cannot be empty", "键名不能为空");
       return result;
     }
     if (text == key) {
@@ -2600,7 +2630,8 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
       return result;
     }
     if (reply.kind == RedisValueKind::Integer && reply.integer == 0) {
-      result.error = "目标键已存在，无法覆盖: " + text;
+      result.error = TrFmt("Target key already exists: {0}", "目标键已存在，无法覆盖: {0}",
+                           {text});
       return result;
     }
     result.affected = 1;
@@ -2608,7 +2639,8 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
   }
 
   if (column_index == 1) {
-    result.error = "不支持直接修改已有键的类型，请删除后新增";
+    result.error = Tr("Changing key type in place is not supported; delete and re-add instead",
+                      "不支持直接修改已有键的类型，请删除后新增");
     return result;
   }
 
@@ -2628,7 +2660,8 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     }
     const auto ttl_val = ParseStrictInt64(trimmed);
     if (!ttl_val.has_value() || *ttl_val <= 0) {
-      result.error = "TTL 必须为正整数（秒）或 -1（永不过期）";
+      result.error = Tr("TTL must be a positive integer (seconds) or -1 (no expiry)",
+                        "TTL 必须为正整数（秒）或 -1（永不过期）");
       return result;
     }
     RedisValue reply;
@@ -2644,7 +2677,7 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
   }
 
   if (column_index == 3) {
-    result.error = "size 为只读统计列";
+    result.error = Tr("size is a read-only computed column", "size 为只读统计列");
     return result;
   }
 
@@ -2674,12 +2707,13 @@ AdbcQueryResult DeleteRedisKeyBlocking(RedisClient& client, const TableModel& mo
   AdbcQueryResult result;
   if (!model.snapshot || row_index >= model.snapshot->rows.size() ||
       model.snapshot->rows[row_index].values.empty()) {
-    result.error = "目标行已失效";
+    result.error = Tr("Target row is invalid", "目标行已失效");
     return result;
   }
   const std::optional<int> db = ParseRedisDbName(model.object);
   if (!db.has_value()) {
-    result.error = "无效的 Redis 数据库: " + model.object;
+    result.error = TrFmt("Invalid Redis database: {0}", "无效的 Redis 数据库: {0}",
+                         {model.object});
     return result;
   }
   if (!client.EnsureDb(*db, result.error)) {
@@ -2706,7 +2740,8 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
   const std::optional<int> db = ParseRedisDbName(model.object);
   if (!db.has_value()) {
     return BatchInsertResult{.inserted = 0, .rolled_back = true,
-                             .error = "无效的 Redis 数据库: " + model.object};
+                             .error = TrFmt("Invalid Redis database: {0}",
+                                            "无效的 Redis 数据库: {0}", {model.object})};
   }
 
   std::vector<ParsedWriteSpec> specs;
@@ -2717,14 +2752,18 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
       return col < rows[i].values.size() ? std::string_view(rows[i].values[col])
                                          : std::string_view{};
     };
-    const std::string prefix = "第 " + std::to_string(i + 1) + " 行";
+    const std::string row_num = std::to_string(i + 1);
+    const std::string prefix = TrFmt("Row {0}", "第 {0} 行", {row_num});
     const std::string key(cell_at(0));
     if (key.empty()) {
-      return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = prefix + " 键名不能为空"};
+      return BatchInsertResult{.inserted = 0, .rolled_back = true,
+                               .error = TrFmt("Row {0}: key name cannot be empty",
+                                              "第 {0} 行键名不能为空", {row_num})};
     }
     if (!batch_keys.insert(key).second) {
       return BatchInsertResult{.inserted = 0, .rolled_back = true,
-                               .error = prefix + " 键名与前面重复: " + key};
+                               .error = TrFmt("Row {0}: duplicate key {1}",
+                                              "第 {0} 行键名与前面重复: {1}", {row_num, key})};
     }
 
     std::string norm_type;
@@ -2740,7 +2779,8 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
       if (!parsed.has_value() || *parsed <= 0) {
         return BatchInsertResult{
             .inserted = 0, .rolled_back = true,
-            .error = prefix + ": TTL 必须为正整数或 -1"};
+            .error = TrFmt("Row {0}: TTL must be a positive integer or -1",
+                           "第 {0} 行: TTL 必须为正整数或 -1", {row_num})};
       }
       ttl = *parsed;
     }
@@ -2775,8 +2815,9 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
   for (std::size_t i = 0; i < specs.size() && i < exists_replies.size(); ++i) {
     if (exists_replies[i].kind == RedisValueKind::Integer && exists_replies[i].integer > 0) {
       return BatchInsertResult{.inserted = 0, .rolled_back = true,
-                               .error = "第 " + std::to_string(i + 1) + " 行键已存在: " +
-                                        specs[i].key};
+                               .error = TrFmt("Row {0}: key already exists: {1}",
+                                              "第 {0} 行键已存在: {1}",
+                                              {std::to_string(i + 1), specs[i].key})};
     }
   }
 
@@ -2786,7 +2827,8 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
                             std::nullopt, err)) {
       return BatchInsertResult{.inserted = inserted,
                                .rolled_back = (inserted == 0),
-                               .error = "写入 " + spec.key + " 失败: " + err};
+                               .error = TrFmt("Failed to write {0}: {1}", "写入 {0} 失败: {1}",
+                                              {spec.key, err})};
     }
     ++inserted;
   }

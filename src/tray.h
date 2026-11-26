@@ -1,18 +1,15 @@
 #pragma once
 
-#include "instance.h"
-
 #include <huxerui/app.h>
 
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dbpp {
-
-struct SettingsModel;
 
 /// Window options shared by the application declaration and the tray
 /// runtime's OpenWindow rebuild path; the two must stay identical.
@@ -28,14 +25,17 @@ struct TrayRuntime : std::enable_shared_from_this<TrayRuntime> {
   std::optional<huxerui::ApplicationHandle> application;
   std::optional<huxerui::WindowHandle> window;
   huxerui::SystemTrayHandle tray;
+  std::shared_ptr<huxerui::Resources> resources;
   std::shared_ptr<SettingsModel> settings;
   huxerui::TaskScope tasks;
   bool retired = true;
   bool exit_requested = false;
   bool tray_refresh_failed = false;
   bool window_visible = false;
+  bool system_dark = false;
   std::uint64_t window_generation = 0;
   std::string presentation_key;
+  std::optional<std::pair<int, bool>> applied_menu_theme;
   std::function<void(InstanceOpenRequest)> open_request_handler;
   std::optional<InstanceOpenRequest> pending_open_request;
 
@@ -44,6 +44,7 @@ struct TrayRuntime : std::enable_shared_from_this<TrayRuntime> {
   void RequestExit();
   void ToggleTray();
   void ToggleLightweight();
+  void UpdateSystemDark(bool dark);
   void RefreshTray();
   void HideTray();
   void SetOpenRequestHandler(std::function<void(InstanceOpenRequest)> handler);

@@ -1,6 +1,12 @@
-#include "theme.h"
+#include <huxerui/huxerui.h>
 #include "app_resources.h"
-#include "model.h"
+
+import dbpp.settings;
+import dbpp.types;
+import dbpp.adbc;
+
+#include "theme_palette.h"
+#include "theme.h"
 
 #include <algorithm>
 #include <utility>
@@ -155,8 +161,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
       break;
   }
 
-  ThemeDefinition definition;
-  definition.Set(style);
+  ThemeDefinition definition = OverrideButtonStyle(std::move(style));
   View button = action;
   button = std::move(button).With(Border{border_color, 1.0F}, CornerRadius{6.0F});
   return Theme(std::move(definition), std::move(button));
@@ -187,8 +192,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
     style.indication =
         TintedIndication(semantic.hover_fill, semantic.press_fill, spec.colors.primary);
   }
-  ThemeDefinition definition;
-  definition.Set(style);
+  ThemeDefinition definition = OverrideButtonStyle(std::move(style));
   View button = Button(std::move(label))
                     .OnClick(std::move(on_click))
                     .With(Border{border_color, 1.0F}, CornerRadius{6.0F});
@@ -278,7 +282,7 @@ View StatusBadge(std::string text, Color foreground, Color background, Color bor
                      : (options.active_hint ? WithAlpha(spec.colors.primary, 0.28F)
                                             : Color::Transparent()));
 
-  const float left_padding = 8.0F + static_cast<float>(std::max(0, options.indent_level)) * 14.0F;
+  const float left_padding = 8.0F + static_cast<float>(std::max(0, options.indent_level)) * 12.0F;
 
   Views children;
   if (options.selected) {
@@ -445,10 +449,30 @@ View PageTitle(std::string title, View actions) {
   TextFieldStyle style = UseEnvironment<TextFieldStyle>();
   style.text_style.font = Font::Monospace(13.0F);
   style.floating_label_style.font = Font::Monospace(11.0F);
-  ThemeDefinition definition;
-  definition.Set(style);
+  ThemeDefinition definition = OverrideTextFieldStyle(std::move(style));
   View field_view = std::move(field);
   return Theme(std::move(definition), std::move(field_view));
+}
+
+[[huxerui::composable]] View PasswordField(State<TextEditingValue> value, StringVariant label,
+                                           std::function<void()> on_submitted) {
+  auto visible = UseState(false);
+  const bool is_visible = visible.Get();
+  TextField field = TextField(value)
+                        .Label(std::move(label))
+                        .Variant(TextFieldVariant::Outlined)
+                        .LineLimits(TextFieldLineLimits::SingleLine())
+                        .Secure(!is_visible)
+                        .TrailingIcon(is_visible ? app::images::visibility_off
+                                                 : app::images::visibility,
+                                      is_visible ? app::strings::password_hide_label
+                                                 : app::strings::password_show_label)
+                        .OnTrailingIconClick([visible] { visible = !visible.Get(); })
+                        .OnChanged([value](const TextEditingValue& next) { value = next; });
+  if (on_submitted) {
+    return std::move(field).OnSubmitted(std::move(on_submitted));
+  }
+  return field;
 }
 
 [[huxerui::composable]] View DialogCard(View content) {

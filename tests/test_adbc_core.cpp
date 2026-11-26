@@ -1,20 +1,11 @@
-#include "adbc_session.h"
-#include "driver_installer.h"
-#include "model.h"
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <vector>
+
+import std;
+import dbpp.settings;
+import dbpp.i18n;
+import dbpp.types;
+import dbpp.adbc;
+import dbpp.driver_installer;
 
 namespace fs = std::filesystem;
 
@@ -645,6 +636,114 @@ void TestDatabaseBrandDetection() {
          "generic fallback to Custom");
 }
 
+void TestI18nResolutionAndFormatting() {
+  struct LangRestoreGuard {
+    dbpp::UiLanguage prev = dbpp::ActiveUiLanguage();
+    ~LangRestoreGuard() { dbpp::SetActiveUiLanguage(prev); }
+  } restore_guard;
+
+  using dbpp::LanguageMode;
+  using dbpp::ResolveUiLanguage;
+  using dbpp::UiLanguage;
+  Expect(ResolveUiLanguage(LanguageMode::System, "zh") == UiLanguage::Zh, "system zh");
+  Expect(ResolveUiLanguage(LanguageMode::System, "zh-CN") == UiLanguage::Zh, "system zh-CN");
+  Expect(ResolveUiLanguage(LanguageMode::System, "zh-Hans-CN") == UiLanguage::Zh,
+         "system zh-Hans-CN");
+  Expect(ResolveUiLanguage(LanguageMode::System, "ZH_cn") == UiLanguage::Zh, "system ZH_cn");
+  Expect(ResolveUiLanguage(LanguageMode::System, "en-US") == UiLanguage::En, "system en-US");
+  Expect(ResolveUiLanguage(LanguageMode::System, "fr") == UiLanguage::En, "system fr fallback");
+  Expect(ResolveUiLanguage(LanguageMode::System, "") == UiLanguage::En, "system empty fallback");
+  Expect(ResolveUiLanguage(LanguageMode::Zh, "en-US") == UiLanguage::Zh, "explicit zh");
+  Expect(ResolveUiLanguage(LanguageMode::En, "zh-CN") == UiLanguage::En, "explicit en");
+
+  dbpp::SetActiveUiLanguage(UiLanguage::En);
+  Expect(dbpp::ActiveUiLanguage() == UiLanguage::En && !dbpp::IsChineseUi(),
+         "ActiveUiLanguage En check");
+  Expect(dbpp::Tr("Connected", "已连接") == "Connected", "Tr En check");
+  Expect(dbpp::TrFmt("Loaded {0} of {1} {{ok}}", "已加载 {0}/{1} {{ok}}", {"12", "40"}) ==
+             "Loaded 12 of 40 {ok}",
+         "TrFmt En check");
+
+  dbpp::SetActiveUiLanguage(UiLanguage::Zh);
+  Expect(dbpp::ActiveUiLanguage() == UiLanguage::Zh && dbpp::IsChineseUi(),
+         "ActiveUiLanguage Zh check");
+  Expect(dbpp::Tr("Connected", "已连接") == "已连接", "Tr Zh check");
+  Expect(dbpp::TrFmt("Loaded {0} of {1} {{ok}}", "已加载 {0}/{1} {{ok}}", {"12", "40"}) ==
+             "已加载 12/40 {ok}",
+         "TrFmt Zh check");
+}
+
+void TestUriDecomposeAndDatabaseHierarchy() {
+  const auto& pg = dbpp::ResolvePresetForProfile("postgresql", "postgresql://127.0.0.1:5432/app");
+  Expect(pg.id == "postgresql", "ResolvePresetForProfile postgresql");
+  const auto pg_parts = dbpp::DecomposePresetUri(
+      pg, "postgresql://alice:s%40cret@db.example.com:5433/app%20db?sslmode=require");
+  Expect(pg_parts.parsed && pg_parts.host == "db.example.com" && pg_parts.port == "5433" &&
+             pg_parts.database == "app db" && pg_parts.username == "alice" &&
+             pg_parts.password == "s@cret" && pg_parts.extra_query == "sslmode=require",
+         "DecomposePresetUri postgresql fields mismatch");
+  Expect(dbpp::ComposePresetUri(pg, pg_parts.host, pg_parts.port, pg_parts.database,
+                                pg_parts.extra_query) ==
+             "postgresql://db.example.com:5433/app%20db?sslmode=require",
+         "ComposePresetUri round-trip with extra query mismatch");
+
+  const auto& mysql = dbpp::ResolvePresetForProfile("mysql", "mysql://127.0.0.1:3306/shop");
+  Expect(mysql.id == "mysql", "ResolvePresetForProfile mysql");
+  const auto mysql_v6 = dbpp::DecomposePresetUri(mysql, "mysql://[::1]:3307/orders");
+  Expect(mysql_v6.parsed && mysql_v6.host == "::1" && mysql_v6.port == "3307" &&
+             mysql_v6.database == "orders",
+         "DecomposePresetUri IPv6 mismatch");
+  Expect(dbpp::ComposePresetUri(mysql, mysql_v6.host, mysql_v6.port, mysql_v6.database) ==
+             "mysql://[::1]:3307/orders",
+         "ComposePresetUri IPv6 mismatch");
+
+  const auto& mssql = dbpp::ResolvePresetForProfile("mssql", "mssql://127.0.0.1:1433");
+  const auto mssql_parts = dbpp::DecomposePresetUri(
+      mssql, "mssql://10.0.0.2:1434?database=erp&encrypt=true");
+  Expect(mssql_parts.parsed && mssql_parts.host == "10.0.0.2" && mssql_parts.port == "1434" &&
+             mssql_parts.database == "erp" && mssql_parts.extra_query == "encrypt=true",
+         "DecomposePresetUri mssql query database mismatch");
+  Expect(dbpp::ComposePresetUri(mssql, mssql_parts.host, mssql_parts.port, mssql_parts.database,
+                                mssql_parts.extra_query) ==
+             "mssql://10.0.0.2:1434?database=erp&encrypt=true",
+         "ComposePresetUri mssql round-trip mismatch");
+
+  const auto& ch = dbpp::ResolvePresetForProfile("clickhouse", "http://127.0.0.1:8123/");
+  const auto ch_parts =
+      dbpp::DecomposePresetUri(ch, "http://ch.local:8123/?database=analytics&ssl=1");
+  Expect(ch_parts.parsed && ch_parts.host == "ch.local" && ch_parts.port == "8123" &&
+             ch_parts.database == "analytics" && ch_parts.extra_query == "ssl=1",
+         "DecomposePresetUri clickhouse mismatch");
+
+  const auto& redis = dbpp::ResolvePresetForProfile("redis", "redis://127.0.0.1:6379/2");
+  Expect(redis.id == "redis", "ResolvePresetForProfile redis");
+  const auto redis_parts = dbpp::DecomposePresetUri(redis, "redis://:tok%2F1@127.0.0.1:6379/2");
+  Expect(redis_parts.parsed && redis_parts.password == "tok/1" && redis_parts.database == "2",
+         "DecomposePresetUri redis token password mismatch");
+
+  dbpp::DbObject mysql_cat_obj;
+  mysql_cat_obj.name = "users";
+  mysql_cat_obj.catalog = "shop";
+  Expect(dbpp::ObjectDatabaseName(dbpp::Dialect::Mysql, mysql_cat_obj) == "shop",
+         "ObjectDatabaseName mysql catalog fallback");
+  Expect(dbpp::QualifiedName(dbpp::Dialect::Mysql, mysql_cat_obj) == "`shop`.`users`",
+         "QualifiedName mysql catalog fallback");
+
+  dbpp::DbObject mysql_def_obj;
+  mysql_def_obj.name = "users";
+  mysql_def_obj.catalog = "def";
+  mysql_def_obj.db_schema = "app_db";
+  Expect(dbpp::ObjectDatabaseName(dbpp::Dialect::Mysql, mysql_def_obj) == "app_db",
+         "ObjectDatabaseName mysql schema over def catalog");
+
+  Expect(dbpp::IsSystemDatabaseOrSchema("information_schema") &&
+             dbpp::IsSystemDatabaseOrSchema("PERFORMANCE_SCHEMA") &&
+             dbpp::IsSystemDatabaseOrSchema("pg_catalog") &&
+             dbpp::IsSystemDatabaseOrSchema("pg_temp_3") &&
+             !dbpp::IsSystemDatabaseOrSchema("shop"),
+         "IsSystemDatabaseOrSchema classification check");
+}
+
 } // namespace
 
 int main() {
@@ -658,6 +757,8 @@ int main() {
   TestDatabasePresetsAndUriComposer(temp.path);
   TestUtf8ValidationAndSanitization();
   TestDatabaseBrandDetection();
+  TestI18nResolutionAndFormatting();
+  TestUriDecomposeAndDatabaseHierarchy();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

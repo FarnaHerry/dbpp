@@ -1,26 +1,9 @@
-#include "driver_installer.h"
-#include "model.h"
+module;
 
+#include <huxerui/file.h>
+#include <huxerui/http.h>
+#include <huxerui/task.h>
 #include <toml++/toml.hpp>
-
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <cctype>
-#include <charconv>
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
 
 #if defined(_WIN32)
 #define NOMINMAX
@@ -31,6 +14,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+#include <cstdio>
+#include <cstring>
+
+module dbpp.driver_installer;
+
+import std;
+import dbpp.types;
+import dbpp.i18n;
+import dbpp.adbc;
 
 namespace dbpp {
 
@@ -402,7 +395,7 @@ struct ProcessResult {
 ProcessResult RunProcess(const std::vector<std::string>& args) {
   ProcessResult result;
   if (args.empty()) {
-    result.spawn_error = "空命令";
+    result.spawn_error = Tr("Empty command", "空命令");
     return result;
   }
 
@@ -463,7 +456,7 @@ ProcessResult RunProcess(const std::vector<std::string>& args) {
   HANDLE read_pipe = nullptr;
   HANDLE write_pipe = nullptr;
   if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
-    result.spawn_error = "无法创建管道";
+    result.spawn_error = Tr("Failed to create pipe", "无法创建管道");
     return result;
   }
   SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
@@ -481,7 +474,8 @@ ProcessResult RunProcess(const std::vector<std::string>& args) {
   CloseHandle(write_pipe);
   if (!created) {
     CloseHandle(read_pipe);
-    result.spawn_error = "无法启动进程: " + args.front();
+    result.spawn_error = TrFmt("Failed to launch process: {0}", "无法启动进程: {0}",
+                               {args.front()});
     return result;
   }
 
@@ -502,7 +496,7 @@ ProcessResult RunProcess(const std::vector<std::string>& args) {
 #else
   int pipefd[2]{-1, -1};
   if (pipe(pipefd) != 0) {
-    result.spawn_error = "创建管道失败";
+    result.spawn_error = Tr("Failed to create pipe", "创建管道失败");
     return result;
   }
 
@@ -510,7 +504,7 @@ ProcessResult RunProcess(const std::vector<std::string>& args) {
   if (pid < 0) {
     close(pipefd[0]);
     close(pipefd[1]);
-    result.spawn_error = "fork 进程失败";
+    result.spawn_error = Tr("Failed to fork process", "fork 进程失败");
     return result;
   }
 
@@ -660,10 +654,12 @@ std::string FormatProgressText(std::string_view slug, std::uint64_t received,
     const double ratio =
         std::clamp(static_cast<double>(received) / static_cast<double>(*total), 0.0, 1.0);
     const int percent = static_cast<int>(ratio * 100.0);
-    return "正在下载 " + std::string(slug) + ": " + to_mb(received) + " / " +
-           to_mb(*total) + " MB (" + std::to_string(percent) + "%)";
+    return TrFmt("Downloading {0}: {1} / {2} MB ({3}%)",
+                 "正在下载 {0}: {1} / {2} MB ({3}%)",
+                 {slug, to_mb(received), to_mb(*total), std::to_string(percent)});
   }
-  return "正在下载 " + std::string(slug) + ": " + to_mb(received) + " MB";
+  return TrFmt("Downloading {0}: {1} MB", "正在下载 {0}: {1} MB",
+               {slug, to_mb(received)});
 }
 
 std::optional<std::filesystem::path> ParseFileUrlPath(std::string_view url) {
@@ -714,13 +710,14 @@ bool DownloadUrlToFileBlocking(std::string_view url, const std::filesystem::path
   if (const auto local_path = ParseFileUrlPath(url)) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(*local_path, ec)) {
-      error_out = "本地文件不存在: " + local_path->string();
+      error_out = TrFmt("Local file not found: {0}", "本地文件不存在: {0}",
+                        {local_path->string()});
       return false;
     }
     std::filesystem::copy_file(*local_path, dest_path,
                                std::filesystem::copy_options::overwrite_existing, ec);
     if (ec) {
-      error_out = "复制文件失败: " + ec.message();
+      error_out = TrFmt("Failed to copy file: {0}", "复制文件失败: {0}", {ec.message()});
       return false;
     }
     return true;
@@ -728,7 +725,7 @@ bool DownloadUrlToFileBlocking(std::string_view url, const std::filesystem::path
 
   const std::string lower = LowerAscii(url);
   if (!lower.starts_with("http://") && !lower.starts_with("https://")) {
-    error_out = "不支持的 URL 协议: " + std::string(url);
+    error_out = TrFmt("Unsupported URL scheme: {0}", "不支持的 URL 协议: {0}", {url});
     return false;
   }
 
@@ -756,8 +753,10 @@ bool DownloadUrlToFileBlocking(std::string_view url, const std::filesystem::path
   }
   if (proc.exit_code != 0) {
     const std::string_view detail = TrimAscii(proc.output);
-    error_out = detail.empty() ? ("curl 退出码 " + std::to_string(proc.exit_code))
-                               : std::string(detail);
+    error_out = detail.empty()
+                    ? TrFmt("curl exit code {0}", "curl 退出码 {0}",
+                            {std::to_string(proc.exit_code)})
+                    : std::string(detail);
     return false;
   }
   return true;
@@ -1079,19 +1078,20 @@ DriverInstallResult InstallDriverArchiveBlocking(
   result.slug = driver.slug;
 
   if (!IsValidSlug(driver.slug)) {
-    result.message = "非法的驱动标识: " + driver.slug;
+    result.message = TrFmt("Invalid driver slug: {0}", "非法的驱动标识: {0}", {driver.slug});
     return result;
   }
 
   const std::filesystem::path drivers_dir = ResolveUserDriversDir(user_drivers_dir);
   if (drivers_dir.empty()) {
-    result.message = "无法确定用户 ADBC 驱动目录";
+    result.message = Tr("Cannot determine user ADBC driver directory", "无法确定用户 ADBC 驱动目录");
     return result;
   }
 
   std::error_code ec;
   if (!std::filesystem::is_regular_file(archive_path, ec)) {
-    result.message = "驱动安装包不存在: " + archive_path.string();
+    result.message = TrFmt("Driver archive not found: {0}", "驱动安装包不存在: {0}",
+                           {archive_path.string()});
     return result;
   }
 
@@ -1099,8 +1099,10 @@ DriverInstallResult InstallDriverArchiveBlocking(
     const std::string expected = NormalizeSha256(driver.sha256);
     const std::string actual = Sha256HexFile(archive_path);
     if (expected.empty() || actual.empty() || actual != expected) {
-      result.message = "SHA-256 校验失败: 预期 " + expected + "，实际 " +
-                       (actual.empty() ? "<读取失败>" : actual);
+      result.message = TrFmt(
+          "SHA-256 mismatch: expected {0}, got {1}",
+          "SHA-256 校验失败: 预期 {0}，实际 {1}",
+          {expected, actual.empty() ? std::string(Tr("<read failed>", "<读取失败>")) : actual});
       return result;
     }
   }
@@ -1114,11 +1116,12 @@ DriverInstallResult InstallDriverArchiveBlocking(
   // Inspect archive member paths before extracting to prevent path traversal.
   const ProcessResult listing = RunProcess({tar_exe, "-tzf", archive_path.string()});
   if (!listing.spawn_error.empty()) {
-    result.message = "无法执行 tar: " + listing.spawn_error;
+    result.message = TrFmt("Failed to run tar: {0}", "无法执行 tar: {0}", {listing.spawn_error});
     return result;
   }
   if (listing.exit_code != 0) {
-    result.message = "无法读取压缩包目录: " + listing.output;
+    result.message = TrFmt("Failed to list archive: {0}", "无法读取压缩包目录: {0}",
+                           {listing.output});
     return result;
   }
 
@@ -1133,27 +1136,29 @@ DriverInstallResult InstallDriverArchiveBlocking(
       continue;
     }
     if (!IsSafeRelativeArchivePath(entry)) {
-      result.message = "压缩包包含不安全路径: " + entry;
+      result.message = TrFmt("Unsafe path in archive: {0}", "压缩包包含不安全路径: {0}", {entry});
       return result;
     }
     ++entry_count;
   }
   if (entry_count == 0) {
-    result.message = "驱动压缩包为空";
+    result.message = Tr("Driver archive is empty", "驱动压缩包为空");
     return result;
   }
 
   const std::filesystem::path staging_root = drivers_dir / ".staging";
   std::filesystem::create_directories(staging_root, ec);
   if (ec) {
-    result.message = "创建暂存目录失败: " + ec.message();
+    result.message = TrFmt("Failed to create staging dir: {0}", "创建暂存目录失败: {0}",
+                           {ec.message()});
     return result;
   }
   const std::filesystem::path staging_dir =
       staging_root / (driver.slug + "-" + NextUniqueSuffix());
   std::filesystem::create_directories(staging_dir, ec);
   if (ec) {
-    result.message = "创建解压目录失败: " + ec.message();
+    result.message = TrFmt("Failed to create extract dir: {0}", "创建解压目录失败: {0}",
+                           {ec.message()});
     return result;
   }
   ScopedDirectoryRemoval staging_cleanup{staging_dir};
@@ -1161,30 +1166,32 @@ DriverInstallResult InstallDriverArchiveBlocking(
   const ProcessResult extracted =
       RunProcess({tar_exe, "-xzf", archive_path.string(), "-C", staging_dir.string()});
   if (!extracted.spawn_error.empty()) {
-    result.message = "解压失败: " + extracted.spawn_error;
+    result.message = TrFmt("Extraction failed: {0}", "解压失败: {0}", {extracted.spawn_error});
     return result;
   }
   if (extracted.exit_code != 0) {
-    result.message = "解压驱动包失败: " + extracted.output;
+    result.message = TrFmt("Failed to extract driver archive: {0}", "解压驱动包失败: {0}",
+                           {extracted.output});
     return result;
   }
 
   const std::filesystem::path canonical_staging = std::filesystem::canonical(staging_dir, ec);
   if (ec) {
-    result.message = "校验解压目录失败: " + ec.message();
+    result.message = TrFmt("Failed to validate extract dir: {0}", "校验解压目录失败: {0}",
+                           {ec.message()});
     return result;
   }
 
   const std::filesystem::path package_manifest = staging_dir / "MANIFEST";
   if (std::filesystem::is_symlink(package_manifest, ec) ||
       !std::filesystem::is_regular_file(package_manifest, ec)) {
-    result.message = "驱动包缺少有效的 MANIFEST 文件";
+    result.message = Tr("Driver package lacks a valid MANIFEST file", "驱动包缺少有效的 MANIFEST 文件");
     return result;
   }
   const std::filesystem::path canonical_manifest =
       std::filesystem::canonical(package_manifest, ec);
   if (ec || !IsPathWithin(canonical_staging, canonical_manifest)) {
-    result.message = "MANIFEST 路径越界";
+    result.message = Tr("MANIFEST path escapes staging dir", "MANIFEST 路径越界");
     return result;
   }
 
@@ -1192,7 +1199,8 @@ DriverInstallResult InstallDriverArchiveBlocking(
   try {
     pkg_toml = toml::parse_file(canonical_manifest.native());
   } catch (const std::exception& err) {
-    result.message = std::string("解析 MANIFEST 失败: ") + err.what();
+    result.message = TrFmt("Failed to parse MANIFEST: {0}", "解析 MANIFEST 失败: {0}",
+                           {err.what()});
     return result;
   }
 
@@ -1201,19 +1209,21 @@ DriverInstallResult InstallDriverArchiveBlocking(
     driver_rel_str = drv_node->get();
   }
   if (!IsSafeRelativeArchivePath(driver_rel_str)) {
-    result.message = "MANIFEST 中的 Files.driver 无效";
+    result.message = Tr("Invalid Files.driver in MANIFEST", "MANIFEST 中的 Files.driver 无效");
     return result;
   }
   const std::filesystem::path driver_rel(driver_rel_str);
   const std::filesystem::path staged_driver = staging_dir / driver_rel;
   if (std::filesystem::is_symlink(staged_driver, ec) ||
       !std::filesystem::is_regular_file(staged_driver, ec)) {
-    result.message = "驱动包缺少驱动文件: " + driver_rel_str;
+    result.message = TrFmt("Driver library missing from archive: {0}", "驱动包缺少驱动文件: {0}",
+                           {driver_rel_str});
     return result;
   }
   const std::filesystem::path canonical_driver = std::filesystem::canonical(staged_driver, ec);
   if (ec || !IsPathWithin(canonical_staging, canonical_driver)) {
-    result.message = "驱动文件路径越界: " + driver_rel_str;
+    result.message = TrFmt("Driver library path escapes staging dir: {0}", "驱动文件路径越界: {0}",
+                           {driver_rel_str});
     return result;
   }
 
@@ -1246,7 +1256,8 @@ DriverInstallResult InstallDriverArchiveBlocking(
   const std::filesystem::path pkg_slug_dir = drivers_dir / ".packages" / driver.slug;
   std::filesystem::create_directories(pkg_slug_dir, ec);
   if (ec) {
-    result.message = "创建驱动安装目录失败: " + ec.message();
+    result.message = TrFmt("Failed to create driver install dir: {0}", "创建驱动安装目录失败: {0}",
+                           {ec.message()});
     return result;
   }
 
@@ -1254,7 +1265,8 @@ DriverInstallResult InstallDriverArchiveBlocking(
       pkg_slug_dir / (".tmp-" + safe_version + "-" + NextUniqueSuffix());
   std::filesystem::create_directories(tmp_pkg_dir, ec);
   if (ec) {
-    result.message = "创建临时包目录失败: " + ec.message();
+    result.message = TrFmt("Failed to create temp package dir: {0}", "创建临时包目录失败: {0}",
+                           {ec.message()});
     return result;
   }
   ScopedDirectoryRemoval tmp_pkg_cleanup{tmp_pkg_dir};
@@ -1264,7 +1276,8 @@ DriverInstallResult InstallDriverArchiveBlocking(
        end;
        it != end; it.increment(ec)) {
     if (ec) {
-      result.message = "遍历解压内容失败: " + ec.message();
+      result.message = TrFmt("Failed to walk extracted files: {0}", "遍历解压内容失败: {0}",
+                             {ec.message()});
       return result;
     }
     const auto& entry_path = it->path();
@@ -1282,14 +1295,16 @@ DriverInstallResult InstallDriverArchiveBlocking(
     if (dest.has_parent_path()) {
       std::filesystem::create_directories(dest.parent_path(), ec);
       if (ec) {
-        result.message = "创建目标子目录失败: " + ec.message();
+        result.message = TrFmt("Failed to create target subdir: {0}", "创建目标子目录失败: {0}",
+                               {ec.message()});
         return result;
       }
     }
     std::filesystem::copy_file(entry_path, dest,
                                std::filesystem::copy_options::overwrite_existing, ec);
     if (ec) {
-      result.message = "复制驱动文件失败: " + ec.message();
+      result.message = TrFmt("Failed to copy driver file: {0}", "复制驱动文件失败: {0}",
+                             {ec.message()});
       return result;
     }
   }
@@ -1299,7 +1314,8 @@ DriverInstallResult InstallDriverArchiveBlocking(
   ec.clear();
   std::filesystem::rename(tmp_pkg_dir, final_pkg_dir, ec);
   if (ec) {
-    result.message = "提交驱动安装目录失败: " + ec.message();
+    result.message = TrFmt("Failed to finalize driver install dir: {0}",
+                           "提交驱动安装目录失败: {0}", {ec.message()});
     return result;
   }
   tmp_pkg_cleanup.path.clear();
@@ -1307,7 +1323,8 @@ DriverInstallResult InstallDriverArchiveBlocking(
   const std::filesystem::path installed_driver =
       std::filesystem::absolute(final_pkg_dir / driver_rel, ec);
   if (ec || !std::filesystem::is_regular_file(installed_driver, ec)) {
-    result.message = "安装后未找到驱动库文件: " + installed_driver.string();
+    result.message = TrFmt("Installed driver library not found: {0}",
+                           "安装后未找到驱动库文件: {0}", {installed_driver.string()});
     return result;
   }
 
@@ -1350,20 +1367,23 @@ DriverInstallResult InstallDriverArchiveBlocking(
   {
     std::ofstream out(tmp_manifest, std::ios::binary | std::ios::trunc);
     if (!out) {
-      result.message = "写入 manifest 临时文件失败: " + tmp_manifest.string();
+      result.message = TrFmt("Failed to write temp manifest: {0}", "写入 manifest 临时文件失败: {0}",
+                             {tmp_manifest.string()});
       return result;
     }
     out << out_manifest << '\n';
     out.flush();
     if (!out) {
-      result.message = "刷新 manifest 临时文件失败: " + tmp_manifest.string();
+      result.message = TrFmt("Failed to flush temp manifest: {0}", "刷新 manifest 临时文件失败: {0}",
+                             {tmp_manifest.string()});
       return result;
     }
   }
 
   std::filesystem::rename(tmp_manifest, final_manifest, ec);
   if (ec) {
-    result.message = "替换 manifest 文件失败: " + ec.message();
+    result.message = TrFmt("Failed to replace manifest file: {0}", "替换 manifest 文件失败: {0}",
+                           {ec.message()});
     return result;
   }
   tmp_manifest_cleanup.path.clear();
@@ -1371,8 +1391,10 @@ DriverInstallResult InstallDriverArchiveBlocking(
   result.ok = true;
   result.version = resolved_version;
   result.manifest_path = final_manifest.string();
-  result.message = "已安装 " + resolved_name +
-                   (resolved_version.empty() ? std::string{} : " (" + resolved_version + ")");
+  result.message =
+      resolved_version.empty()
+          ? TrFmt("Installed {0}", "已安装 {0}", {resolved_name})
+          : TrFmt("Installed {0} ({1})", "已安装 {0} ({1})", {resolved_name, resolved_version});
   return result;
 }
 
@@ -1382,13 +1404,13 @@ DriverInstallResult UninstallUserAdbcDriverBlocking(
   result.slug = std::string(slug);
 
   if (!IsValidSlug(slug)) {
-    result.message = "非法的驱动标识: " + std::string(slug);
+    result.message = TrFmt("Invalid driver slug: {0}", "非法的驱动标识: {0}", {slug});
     return result;
   }
 
   const std::filesystem::path drivers_dir = ResolveUserDriversDir(user_drivers_dir);
   if (drivers_dir.empty()) {
-    result.message = "无法确定用户 ADBC 驱动目录";
+    result.message = Tr("Cannot determine user ADBC driver directory", "无法确定用户 ADBC 驱动目录");
     return result;
   }
 
@@ -1400,7 +1422,8 @@ DriverInstallResult UninstallUserAdbcDriverBlocking(
   if (had_manifest) {
     std::filesystem::remove(manifest, ec);
     if (ec) {
-      result.message = "删除 manifest 失败: " + ec.message();
+      result.message = TrFmt("Failed to delete manifest: {0}", "删除 manifest 失败: {0}",
+                             {ec.message()});
       return result;
     }
   }
@@ -1413,20 +1436,25 @@ DriverInstallResult UninstallUserAdbcDriverBlocking(
       if (had_manifest) {
         result.ok = true;
         result.manifest_path = manifest.string();
-        result.message = "已卸载 " + std::string(slug) +
-                         "（驱动库当前被进程占用，重启后可清理残留文件）";
+        result.message = TrFmt(
+            "Uninstalled {0} (library currently in use; leftover files can be cleaned up after restart)",
+            "已卸载 {0}（驱动库当前被进程占用，重启后可清理残留文件）",
+            {slug});
         return result;
       }
 #endif
-      result.message = "删除驱动文件失败: " + pkg_ec.message();
+      result.message = TrFmt("Failed to delete driver files: {0}", "删除驱动文件失败: {0}",
+                             {pkg_ec.message()});
       return result;
     }
   }
 
   result.ok = true;
   result.manifest_path = manifest.string();
-  result.message = had_manifest ? ("已卸载 " + std::string(slug))
-                                : (std::string(slug) + " 未在用户目录安装");
+  result.message = had_manifest
+                       ? TrFmt("Uninstalled {0}", "已卸载 {0}", {slug})
+                       : TrFmt("{0} is not installed in user directory",
+                               "{0} 未在用户目录安装", {slug});
   return result;
 }
 
@@ -1434,7 +1462,7 @@ huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
     std::shared_ptr<huxerui::HttpClient> http) {
   RegistryCatalogResult result;
   if (!http) {
-    result.error = "HTTP 客户端不可用";
+    result.error = Tr("HTTP client is unavailable", "HTTP 客户端不可用");
     co_return result;
   }
 
@@ -1446,13 +1474,16 @@ huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
   const huxerui::HttpResult<huxerui::HttpResponse> response =
       co_await http->SendAsync(std::move(request));
   if (!response.Succeeded()) {
-    result.error = "获取驱动目录失败: " + response.Error().message;
+    result.error = TrFmt("Failed to fetch driver catalog: {0}", "获取驱动目录失败: {0}",
+                         {response.Error().message});
     co_return result;
   }
 
   const huxerui::HttpResponse& http_resp = response.Value();
   if (http_resp.status_code < 200 || http_resp.status_code >= 300) {
-    result.error = "获取驱动目录失败: HTTP " + std::to_string(http_resp.status_code);
+    result.error = TrFmt("Failed to fetch driver catalog: HTTP {0}",
+                         "获取驱动目录失败: HTTP {0}",
+                         {std::to_string(http_resp.status_code)});
     co_return result;
   }
 
@@ -1469,7 +1500,8 @@ huxerui::Task<RegistryCatalogResult> FetchRegistryCatalogAsync(
   auto parsed = co_await huxerui::RunWorker(std::move(parse_job));
   result.drivers = std::move(parsed);
   if (result.drivers.empty()) {
-    result.error = "当前平台 (" + platform + ") 暂无可用的在线驱动";
+    result.error = TrFmt("No online drivers available for current platform ({0})",
+                         "当前平台 ({0}) 暂无可用的在线驱动", {platform});
   }
   co_return result;
 }
@@ -1487,12 +1519,14 @@ RegistryCatalogResult FetchRegistryCatalogBlocking(std::string_view registry_url
   if (const auto local_index = ParseFileUrlPath(index_url)) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(*local_index, ec)) {
-      result.error = "驱动目录文件不存在: " + local_index->string();
+      result.error = TrFmt("Driver catalog file not found: {0}", "驱动目录文件不存在: {0}",
+                           {local_index->string()});
       return result;
     }
     std::ifstream in(*local_index, std::ios::binary);
     if (!in) {
-      result.error = "无法读取驱动目录文件: " + local_index->string();
+      result.error = TrFmt("Failed to read driver catalog file: {0}", "无法读取驱动目录文件: {0}",
+                           {local_index->string()});
       return result;
     }
     std::ostringstream oss;
@@ -1502,7 +1536,7 @@ RegistryCatalogResult FetchRegistryCatalogBlocking(std::string_view registry_url
     std::error_code ec;
     const std::filesystem::path temp_dir = std::filesystem::temp_directory_path(ec);
     if (ec || temp_dir.empty()) {
-      result.error = "无法获取临时目录";
+      result.error = Tr("Failed to resolve temp directory", "无法获取临时目录");
       return result;
     }
     const std::filesystem::path tmp_yaml =
@@ -1511,12 +1545,13 @@ RegistryCatalogResult FetchRegistryCatalogBlocking(std::string_view registry_url
 
     std::string download_error;
     if (!DownloadUrlToFileBlocking(index_url, tmp_yaml, "application/yaml", 30, download_error)) {
-      result.error = "获取驱动目录失败: " + download_error;
+      result.error = TrFmt("Failed to fetch driver catalog: {0}", "获取驱动目录失败: {0}",
+                           {download_error});
       return result;
     }
     std::ifstream in(tmp_yaml, std::ios::binary);
     if (!in) {
-      result.error = "读取驱动目录临时文件失败";
+      result.error = Tr("Failed to read temp driver catalog file", "读取驱动目录临时文件失败");
       return result;
     }
     std::ostringstream oss;
@@ -1527,7 +1562,8 @@ RegistryCatalogResult FetchRegistryCatalogBlocking(std::string_view registry_url
   const std::string platform = CurrentPlatformTuple();
   result.drivers = ParseRegistryIndexYaml(yaml_text, base_url, platform);
   if (result.drivers.empty()) {
-    result.error = "当前平台 (" + platform + ") 暂无可用的在线驱动";
+    result.error = TrFmt("No online drivers available for current platform ({0})",
+                         "当前平台 ({0}) 暂无可用的在线驱动", {platform});
   }
   return result;
 }
@@ -1538,24 +1574,25 @@ DriverInstallResult InstallRegistryDriverBlocking(const RegistryDriverInfo& driv
   result.slug = driver.slug;
 
   if (!IsValidSlug(driver.slug)) {
-    result.message = "非法的驱动标识: " + driver.slug;
+    result.message = TrFmt("Invalid driver slug: {0}", "非法的驱动标识: {0}", {driver.slug});
     return result;
   }
   if (driver.package_url.empty()) {
-    result.message = "驱动缺少下载地址";
+    result.message = Tr("Driver lacks a download URL", "驱动缺少下载地址");
     return result;
   }
 
   const std::filesystem::path drivers_dir = ResolveUserDriversDir(user_drivers_dir);
   if (drivers_dir.empty()) {
-    result.message = "无法确定用户 ADBC 驱动目录";
+    result.message = Tr("Cannot determine user ADBC driver directory", "无法确定用户 ADBC 驱动目录");
     return result;
   }
 
   if (const auto local_archive = ParseFileUrlPath(driver.package_url)) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(*local_archive, ec)) {
-      result.message = "本地安装包不存在: " + local_archive->string();
+      result.message = TrFmt("Local archive not found: {0}", "本地安装包不存在: {0}",
+                             {local_archive->string()});
       return result;
     }
     return InstallDriverArchiveBlocking(driver, *local_archive, drivers_dir);
@@ -1565,7 +1602,8 @@ DriverInstallResult InstallRegistryDriverBlocking(const RegistryDriverInfo& driv
   std::error_code ec;
   std::filesystem::create_directories(downloads_dir, ec);
   if (ec) {
-    result.message = "创建下载目录失败: " + ec.message();
+    result.message = TrFmt("Failed to create download dir: {0}", "创建下载目录失败: {0}",
+                           {ec.message()});
     return result;
   }
 
@@ -1576,7 +1614,7 @@ DriverInstallResult InstallRegistryDriverBlocking(const RegistryDriverInfo& driv
   std::string download_error;
   if (!DownloadUrlToFileBlocking(driver.package_url, tmp_archive, "application/octet-stream", 300,
                                  download_error)) {
-    result.message = "下载失败: " + download_error;
+    result.message = TrFmt("Download failed: {0}", "下载失败: {0}", {download_error});
     return result;
   }
 
@@ -1590,21 +1628,21 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
   result.slug = driver.slug;
 
   if (!http) {
-    result.message = "HTTP 客户端不可用";
+    result.message = Tr("HTTP client is unavailable", "HTTP 客户端不可用");
     co_return result;
   }
   if (!IsValidSlug(driver.slug)) {
-    result.message = "非法的驱动标识: " + driver.slug;
+    result.message = TrFmt("Invalid driver slug: {0}", "非法的驱动标识: {0}", {driver.slug});
     co_return result;
   }
   if (driver.package_url.empty()) {
-    result.message = "驱动缺少下载地址";
+    result.message = Tr("Driver lacks a download URL", "驱动缺少下载地址");
     co_return result;
   }
 
   const std::string user_dir = UserAdbcDriversDir();
   if (user_dir.empty()) {
-    result.message = "无法确定用户 ADBC 驱动目录";
+    result.message = Tr("Cannot determine user ADBC driver directory", "无法确定用户 ADBC 驱动目录");
     co_return result;
   }
 
@@ -1612,7 +1650,8 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
   std::error_code ec;
   std::filesystem::create_directories(downloads_dir, ec);
   if (ec) {
-    result.message = "创建下载目录失败: " + ec.message();
+    result.message = TrFmt("Failed to create download dir: {0}", "创建下载目录失败: {0}",
+                           {ec.message()});
     co_return result;
   }
 
@@ -1621,7 +1660,7 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
   ScopedFileRemoval archive_cleanup{tmp_archive};
 
   if (on_progress) {
-    on_progress("正在连接下载 " + driver.slug + " ...");
+    on_progress(TrFmt("Connecting to download {0} ...", "正在连接下载 {0} ...", {driver.slug}));
   }
 
   huxerui::HttpRequest request;
@@ -1636,38 +1675,44 @@ huxerui::Task<DriverInstallResult> InstallRegistryDriverAsync(
   auto stream_result =
       co_await http->SendStreamAsync(std::move(request), std::move(progress_cb));
   if (!stream_result.Succeeded()) {
-    result.message = "下载失败: " + stream_result.Error().message;
+    result.message = TrFmt("Download failed: {0}", "下载失败: {0}",
+                           {stream_result.Error().message});
     co_return result;
   }
 
   huxerui::HttpResponseStream stream = std::move(stream_result).Value();
   const int status_code = stream.StatusCode();
   if (status_code < 200 || status_code >= 300) {
-    result.message = "下载被拒绝: HTTP " + std::to_string(status_code);
+    result.message = TrFmt("Download rejected: HTTP {0}", "下载被拒绝: HTTP {0}",
+                           {std::to_string(status_code)});
     co_return result;
   }
 
   const huxerui::File output_file(tmp_archive.string());
   auto opened_output = co_await output_file.OpenWriteAsync();
   if (!opened_output.Succeeded()) {
-    result.message = "打开临时文件失败: " + opened_output.Error().message;
+    result.message = TrFmt("Failed to open temp file: {0}", "打开临时文件失败: {0}",
+                           {opened_output.Error().message});
     co_return result;
   }
 
   huxerui::AsyncOutputStream output_stream = std::move(opened_output).Value();
   auto copied = co_await stream.Body().CopyToAsync(output_stream, 64U * 1024U);
   if (!copied.Succeeded()) {
-    result.message = "保存安装包失败: " + copied.Error().message;
+    result.message = TrFmt("Failed to save archive: {0}", "保存安装包失败: {0}",
+                           {copied.Error().message});
     co_return result;
   }
   auto closed = co_await output_stream.CloseAsync();
   if (!closed.Succeeded()) {
-    result.message = "写入安装包失败: " + closed.Error().message;
+    result.message = TrFmt("Failed to write archive: {0}", "写入安装包失败: {0}",
+                           {closed.Error().message});
     co_return result;
   }
 
   if (on_progress) {
-    on_progress("正在校验并解压安装 " + driver.slug + " ...");
+    on_progress(TrFmt("Verifying and extracting {0} ...", "正在校验并解压安装 {0} ...",
+                      {driver.slug}));
   }
 
   auto install_job = [driver = std::move(driver), tmp_archive]() {

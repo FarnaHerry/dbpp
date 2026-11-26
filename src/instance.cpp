@@ -1,21 +1,4 @@
-#include "instance.h"
-#include "model.h"
-
-#include <algorithm>
-#include <cctype>
-#include <chrono>
-#include <csignal>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <thread>
-#include <utility>
-#include <vector>
+module;
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -37,6 +20,15 @@
 #include <mach-o/dyld.h>
 #endif
 #endif
+
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+
+module dbpp.instance;
+
+import std;
+import dbpp.adbc;
 
 namespace dbpp {
 

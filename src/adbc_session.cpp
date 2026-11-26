@@ -1,33 +1,11 @@
-#include "adbc_session.h"
-#include "redis_client.h"
+module;
 
 #include <arrow-adbc/adbc.h>
 #include <arrow-adbc/adbc_driver_manager.h>
 #include <nanoarrow/nanoarrow.h>
 #include <toml++/toml.hpp>
-
-#include <algorithm>
-#include <cctype>
-#include <cerrno>
-#include <charconv>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <iomanip>
-#include <limits>
-#include <map>
-#include <memory>
-#include <optional>
-#include <set>
-#include <sstream>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+#include <huxerui/datatable.h>
+#include <huxerui/task.h>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -42,6 +20,16 @@
 #else
 #include <unistd.h>
 #endif
+
+#include <cerrno>
+#include <cstdio>
+
+module dbpp.adbc;
+
+import std;
+import dbpp.types;
+import dbpp.i18n;
+import dbpp.redis;
 
 namespace dbpp {
 
@@ -895,24 +883,24 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
   };
 
   if (AdbcDatabaseNew(&session->database, &error) != ADBC_STATUS_OK) {
-    return fail("创建 ADBC database");
+    return fail(Tr("create ADBC database", "创建 ADBC database"));
   }
   session->database_created = true;
 
   if (AdbcDriverManagerDatabaseSetLoadFlags(&session->database, ADBC_LOAD_FLAG_DEFAULT,
                                             &error) != ADBC_STATUS_OK) {
-    return fail("设置 ADBC 加载标志");
+    return fail(Tr("set ADBC load flags", "设置 ADBC 加载标志"));
   }
   const std::string extra_paths = BuildAdditionalSearchPathList();
   if (!extra_paths.empty() &&
       AdbcDriverManagerDatabaseSetAdditionalSearchPathList(
           &session->database, extra_paths.c_str(), &error) != ADBC_STATUS_OK) {
-    return fail("设置 ADBC 搜索路径");
+    return fail(Tr("set ADBC search paths", "设置 ADBC 搜索路径"));
   }
 
   if (AdbcDatabaseSetOption(&session->database, "driver",
                             request.driver_path.c_str(), &error) != ADBC_STATUS_OK) {
-    return fail("设置 ADBC driver");
+    return fail(Tr("set ADBC driver", "设置 ADBC driver"));
   }
 
   const std::string lower_uri = LowerAscii(request.uri);
@@ -934,7 +922,7 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
   if (!effective_uri.empty() &&
       AdbcDatabaseSetOption(&session->database, ADBC_OPTION_URI, effective_uri.c_str(),
                             &error) != ADBC_STATUS_OK) {
-    return fail("设置 URI");
+    return fail(Tr("set URI", "设置 URI"));
   }
 
   if (dialect == Dialect::Sqlite && !request.uri.empty() &&
@@ -950,25 +938,25 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
     if (!request.username.empty() &&
         AdbcDatabaseSetOption(&session->database, "username", request.username.c_str(),
                               &error) != ADBC_STATUS_OK) {
-      return fail("设置用户名");
+      return fail(Tr("set username", "设置用户名"));
     }
     if (!request.password.empty() &&
         AdbcDatabaseSetOption(&session->database, "password", request.password.c_str(),
                               &error) != ADBC_STATUS_OK) {
-      return fail("设置密码");
+      return fail(Tr("set password", "设置密码"));
     }
   }
   if (AdbcDatabaseInit(&session->database, &error) != ADBC_STATUS_OK) {
-    return fail("初始化数据库");
+    return fail(Tr("initialize database", "初始化数据库"));
   }
 
   if (AdbcConnectionNew(&session->connection, &error) != ADBC_STATUS_OK) {
-    return fail("创建连接");
+    return fail(Tr("create connection", "创建连接"));
   }
   session->connection_created = true;
   if (AdbcConnectionInit(&session->connection, &session->database, &error) !=
       ADBC_STATUS_OK) {
-    return fail("初始化连接");
+    return fail(Tr("initialize connection", "初始化连接"));
   }
 
   session->dialect = dialect;
@@ -1347,8 +1335,48 @@ std::string QuoteIdentifier(Dialect dialect, std::string_view identifier) {
   return result;
 }
 
+std::string ObjectDatabaseName(Dialect dialect, const DbObject& object) {
+  if (dialect == Dialect::Redis) {
+    return {};
+  }
+  if (dialect == Dialect::Mysql) {
+    if (!object.db_schema.empty()) {
+      return object.db_schema;
+    }
+    if (!object.catalog.empty() && LowerAscii(object.catalog) != "def") {
+      return object.catalog;
+    }
+    return {};
+  }
+  if (!object.db_schema.empty()) {
+    return object.db_schema;
+  }
+  if (!object.catalog.empty()) {
+    const std::string lower = LowerAscii(object.catalog);
+    if (lower != "def" && lower != "main") {
+      return object.catalog;
+    }
+  }
+  return {};
+}
+
+bool IsSystemDatabaseOrSchema(std::string_view name) {
+  const std::string lower = LowerAscii(TrimAscii(name));
+  if (lower.empty()) {
+    return false;
+  }
+  return lower == "information_schema" || lower == "performance_schema" || lower == "mysql" ||
+         lower == "sys" || lower == "pg_catalog" || lower == "pg_toast" ||
+         lower == "sqlite_temp_master" || lower.starts_with("pg_temp_") ||
+         lower.starts_with("pg_toast_temp_");
+}
+
 std::string QualifiedName(Dialect dialect, const DbObject& object) {
   if (object.db_schema.empty()) {
+    if (dialect == Dialect::Mysql && !object.catalog.empty() &&
+        LowerAscii(object.catalog) != "def") {
+      return QuoteIdentifier(dialect, object.catalog) + "." + QuoteIdentifier(dialect, object.name);
+    }
     return QuoteIdentifier(dialect, object.name);
   }
   return QuoteIdentifier(dialect, object.db_schema) + "." +
@@ -1859,7 +1887,8 @@ const std::vector<DatabasePreset>& SupportedDatabasePresets() {
 }
 
 std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host,
-                             std::string_view port, std::string_view database) {
+                             std::string_view port, std::string_view database,
+                             std::string_view extra_query) {
   std::string_view h = TrimAscii(host);
   if (h.find("://") != std::string_view::npos) {
     return std::string(h);
@@ -1870,6 +1899,10 @@ std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host
   }
   const std::string_view p = TrimAscii(port);
   const std::string_view db = TrimAscii(database);
+  std::string_view q = TrimAscii(extra_query);
+  if (!q.empty() && q.front() == '?') {
+    q.remove_prefix(1);
+  }
 
   std::string formatted_host(h);
   const std::size_t first_colon = formatted_host.find(':');
@@ -1899,15 +1932,37 @@ std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host
   const std::string enc_db = PercentEncodeUriComponent(db);
   if (preset.id == "mssql") {
     std::string uri = "mssql://" + authority;
+    std::string query;
     if (!enc_db.empty()) {
-      uri += "?database=" + enc_db;
+      query = "database=" + enc_db;
+    }
+    if (!q.empty()) {
+      if (!query.empty()) {
+        query.push_back('&');
+      }
+      query.append(q);
+    }
+    if (!query.empty()) {
+      uri.push_back('?');
+      uri += query;
     }
     return uri;
   }
   if (preset.id == "clickhouse") {
     std::string uri = "http://" + authority + "/";
+    std::string query;
     if (!enc_db.empty()) {
-      uri += "?database=" + enc_db;
+      query = "database=" + enc_db;
+    }
+    if (!q.empty()) {
+      if (!query.empty()) {
+        query.push_back('&');
+      }
+      query.append(q);
+    }
+    if (!query.empty()) {
+      uri.push_back('?');
+      uri += query;
     }
     return uri;
   }
@@ -1920,7 +1975,149 @@ std::string ComposePresetUri(const DatabasePreset& preset, std::string_view host
     uri.push_back('/');
     uri += enc_db;
   }
+  if (!q.empty()) {
+    uri.push_back('?');
+    uri.append(q);
+  }
   return uri;
+}
+
+DecomposedPresetUri DecomposePresetUri(const DatabasePreset& preset, std::string_view uri) {
+  DecomposedPresetUri out;
+  const std::string_view trimmed = TrimAscii(uri);
+  const std::size_t scheme_pos = trimmed.find("://");
+  if (scheme_pos == std::string_view::npos) {
+    return out;
+  }
+
+  const std::string_view scheme = trimmed.substr(0, scheme_pos);
+  const std::size_t pos = scheme_pos + 3;
+  const std::size_t auth_end_pos = trimmed.find_first_of("/?#", pos);
+  const std::size_t auth_end =
+      auth_end_pos == std::string_view::npos ? trimmed.size() : auth_end_pos;
+  std::string_view authority = trimmed.substr(pos, auth_end - pos);
+
+  if (const std::size_t at = authority.rfind('@'); at != std::string_view::npos) {
+    const std::string_view userinfo = authority.substr(0, at);
+    authority.remove_prefix(at + 1);
+    if (const std::size_t colon = userinfo.find(':'); colon != std::string_view::npos) {
+      out.username = PercentDecodeUriComponent(userinfo.substr(0, colon));
+      out.password = PercentDecodeUriComponent(userinfo.substr(colon + 1));
+    } else if (EqualsIgnoreCase(scheme, "redis") || EqualsIgnoreCase(scheme, "rediss")) {
+      out.password = PercentDecodeUriComponent(userinfo);
+    } else {
+      out.username = PercentDecodeUriComponent(userinfo);
+    }
+  }
+
+  if (authority.empty()) {
+    return out;
+  }
+  if (authority.front() == '[') {
+    const std::size_t close = authority.find(']');
+    if (close == std::string_view::npos) {
+      return out;
+    }
+    out.host = std::string(authority.substr(1, close - 1));
+    if (close + 1 < authority.size()) {
+      if (authority[close + 1] != ':') {
+        return out;
+      }
+      out.port = std::string(authority.substr(close + 2));
+    }
+  } else {
+    const std::size_t colon = authority.rfind(':');
+    if (colon != std::string_view::npos && authority.find(':') == colon) {
+      out.host = std::string(authority.substr(0, colon));
+      out.port = std::string(authority.substr(colon + 1));
+    } else {
+      out.host = std::string(authority);
+    }
+  }
+
+  std::string_view rest = trimmed.substr(auth_end);
+  if (const std::size_t hash = rest.find('#'); hash != std::string_view::npos) {
+    rest = rest.substr(0, hash);
+  }
+  std::string_view path;
+  std::string_view query;
+  if (const std::size_t qmark = rest.find('?'); qmark != std::string_view::npos) {
+    path = rest.substr(0, qmark);
+    query = rest.substr(qmark + 1);
+  } else {
+    path = rest;
+  }
+
+  if (!path.empty() && path.front() == '/') {
+    path.remove_prefix(1);
+  }
+
+  if (preset.id == "mssql" || preset.id == "clickhouse") {
+    std::string remaining_query;
+    std::size_t qpos = 0;
+    while (qpos <= query.size() && !query.empty()) {
+      const std::size_t amp = query.find('&', qpos);
+      const std::string_view param =
+          amp == std::string_view::npos ? query.substr(qpos) : query.substr(qpos, amp - qpos);
+      const std::size_t eq = param.find('=');
+      const std::string_view key = eq == std::string_view::npos ? param : param.substr(0, eq);
+      const std::string_view val =
+          eq == std::string_view::npos ? std::string_view{} : param.substr(eq + 1);
+      if (EqualsIgnoreCase(key, "database") && out.database.empty()) {
+        out.database = PercentDecodeUriComponent(val);
+      } else if (!param.empty()) {
+        if (!remaining_query.empty()) {
+          remaining_query.push_back('&');
+        }
+        remaining_query.append(param);
+      }
+      if (amp == std::string_view::npos) {
+        break;
+      }
+      qpos = amp + 1;
+    }
+    if (out.database.empty() && !path.empty()) {
+      out.database = PercentDecodeUriComponent(path);
+    }
+    out.extra_query = std::move(remaining_query);
+  } else {
+    if (!path.empty()) {
+      out.database = PercentDecodeUriComponent(path);
+    }
+    out.extra_query = std::string(query);
+  }
+
+  out.parsed = !out.host.empty();
+  return out;
+}
+
+const DatabasePreset& ResolvePresetForProfile(std::string_view driver_path, std::string_view uri) {
+  const auto& presets = SupportedDatabasePresets();
+  const DatabaseBrand brand = DetectDatabaseBrand(driver_path, uri);
+  std::string_view target_id = "custom";
+  switch (brand) {
+    case DatabaseBrand::Sqlite: target_id = "sqlite"; break;
+    case DatabaseBrand::Postgresql: target_id = "postgresql"; break;
+    case DatabaseBrand::Mysql: target_id = "mysql"; break;
+    case DatabaseBrand::Mariadb: target_id = "mariadb"; break;
+    case DatabaseBrand::Duckdb: target_id = "duckdb"; break;
+    case DatabaseBrand::Redis: target_id = "redis"; break;
+    case DatabaseBrand::Mssql: target_id = "mssql"; break;
+    case DatabaseBrand::Clickhouse: target_id = "clickhouse"; break;
+    case DatabaseBrand::FlightSql: target_id = "flightsql"; break;
+    case DatabaseBrand::Snowflake: target_id = "snowflake"; break;
+    case DatabaseBrand::BigQuery: target_id = "bigquery"; break;
+    case DatabaseBrand::Trino: target_id = "trino"; break;
+    case DatabaseBrand::Databricks: target_id = "databricks"; break;
+    case DatabaseBrand::Redshift: target_id = "redshift"; break;
+    case DatabaseBrand::Custom: target_id = "custom"; break;
+  }
+  for (const DatabasePreset& preset : presets) {
+    if (preset.id == target_id) {
+      return preset;
+    }
+  }
+  return presets.back();
 }
 
 std::optional<AdbcDriverInfo> FindInstalledDriverForPreset(
@@ -1929,7 +2126,7 @@ std::optional<AdbcDriverInfo> FindInstalledDriverForPreset(
     return AdbcDriverInfo{
         .name = "Redis",
         .path = "redis",
-        .detail = "内置 RESP2/RESP3 客户端",
+        .detail = std::string(Tr("Built-in RESP2/RESP3 client", "内置 RESP2/RESP3 客户端")),
         .version = {},
         .is_manifest = false,
     };

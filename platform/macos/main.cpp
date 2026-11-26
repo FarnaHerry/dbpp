@@ -1,7 +1,8 @@
 #include <huxerui/app.h>
 
-#include "../../src/cli.h"
-#include "../../src/instance.h"
+import std;
+import dbpp.cli;
+import dbpp.instance;
 
 int main(int argc, char** argv) {
   if (const auto exit_code = dbpp::TryRunCli(argc, argv)) {

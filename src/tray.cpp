@@ -2,11 +2,29 @@
 // 参考 Clash-Flux 的 DesktopTrayRuntime：托盘拥有应用生命周期
 // （quit_on_last_window_closed = false），窗口只是托盘之上的展示层。
 
-#include "tray.h"
-#include "config_db.h"
-#include "root.h"
-#include "settings.h"
+#include <huxerui/huxerui.h>
 #include "app_resources.h"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+import dbpp.settings;
+import dbpp.i18n;
+import dbpp.types;
+import dbpp.db;
+import dbpp.config_db;
+import dbpp.instance;
+
+#include "theme_palette.h"
+#include "tray.h"
+#include "root.h"
 
 #include <chrono>
 #include <cstdio>
@@ -17,11 +35,73 @@
 
 namespace dbpp {
 
+#ifdef __APPLE__
+void ApplyMacOsTrayAppearance(int mode, bool effective_dark) noexcept;
+#endif
+
 using namespace huxerui;
 
 namespace {
 
 constexpr std::chrono::duration<double> kPollInterval{0.25};
+
+#ifdef _WIN32
+void ApplyNativeTrayMenuTheme(ThemeMode, bool effective_dark) noexcept {
+  using RtlGetVersionFunction = LONG(WINAPI*)(OSVERSIONINFOW*);
+  using SetPreferredAppModeFunction = int(WINAPI*)(int);
+  using FlushMenuThemesFunction = void(WINAPI*)();
+
+  const HMODULE native_lib = GetModuleHandleW(L"ntdll.dll");
+  const auto get_version = reinterpret_cast<RtlGetVersionFunction>(
+      native_lib ? GetProcAddress(native_lib, "RtlGetVersion") : nullptr);
+  if (!get_version) {
+    return;
+  }
+
+  OSVERSIONINFOW version{};
+  version.dwOSVersionInfoSize = sizeof(version);
+  if (get_version(&version) < 0 || version.dwMajorVersion < 10 ||
+      version.dwBuildNumber < 17763) {
+    return;
+  }
+
+  static const HMODULE theme_lib = LoadLibraryW(L"uxtheme.dll");
+  if (!theme_lib) {
+    return;
+  }
+
+  auto set_preferred_app_mode = reinterpret_cast<SetPreferredAppModeFunction>(
+      GetProcAddress(theme_lib, "SetPreferredAppMode"));
+  const bool modern_api =
+      set_preferred_app_mode != nullptr || version.dwBuildNumber >= 18362;
+  if (!set_preferred_app_mode) {
+    set_preferred_app_mode = reinterpret_cast<SetPreferredAppModeFunction>(
+        GetProcAddress(theme_lib, MAKEINTRESOURCEA(135)));
+  }
+  if (!set_preferred_app_mode) {
+    return;
+  }
+
+  const int app_mode = modern_api ? (effective_dark ? 2 : 3) : (effective_dark ? 1 : 0);
+  (void)set_preferred_app_mode(app_mode);
+
+  auto flush_menu_themes = reinterpret_cast<FlushMenuThemesFunction>(
+      GetProcAddress(theme_lib, "FlushMenuThemes"));
+  if (!flush_menu_themes) {
+    flush_menu_themes = reinterpret_cast<FlushMenuThemesFunction>(
+        GetProcAddress(theme_lib, MAKEINTRESOURCEA(136)));
+  }
+  if (flush_menu_themes) {
+    flush_menu_themes();
+  }
+}
+#elif defined(__APPLE__)
+void ApplyNativeTrayMenuTheme(ThemeMode mode, bool effective_dark) noexcept {
+  ApplyMacOsTrayAppearance(static_cast<int>(mode), effective_dark);
+}
+#else
+void ApplyNativeTrayMenuTheme(ThemeMode, bool) noexcept {}
+#endif
 
 } // namespace
 
@@ -81,44 +161,91 @@ void TrayRuntime::ToggleLightweight() {
   }
 }
 
+void TrayRuntime::UpdateSystemDark(bool dark) {
+  if (system_dark == dark) {
+    return;
+  }
+  system_dark = dark;
+  if (settings) {
+    const ThemeMode mode = settings->theme_mode.Get();
+    const bool effective_dark = ui::ResolveIsDark(mode, system_dark);
+    const std::pair<int, bool> target{static_cast<int>(mode), effective_dark};
+    if (!applied_menu_theme.has_value() || *applied_menu_theme != target) {
+      ApplyNativeTrayMenuTheme(mode, effective_dark);
+      applied_menu_theme = target;
+    }
+  }
+}
+
 // Rebuilds the tray presentation only when its state key changes; the poll
 // loop calls this every tick so menu checkboxes follow settings changes.
 void TrayRuntime::RefreshTray() {
   if (!application || !settings) {
     return;
   }
+  const ThemeMode theme_mode = settings->theme_mode.Get();
+  const bool effective_dark = ui::ResolveIsDark(theme_mode, system_dark);
+  const std::pair<int, bool> desired_menu_theme{static_cast<int>(theme_mode), effective_dark};
+  if (!applied_menu_theme.has_value() || *applied_menu_theme != desired_menu_theme) {
+    ApplyNativeTrayMenuTheme(theme_mode, effective_dark);
+    applied_menu_theme = desired_menu_theme;
+  }
+
+  const LanguageMode language_mode = settings->language.Get();
+  const Locale effective_locale =
+      resources ? EffectiveLocale(language_mode, resources->Configuration().locale)
+                : Locale::Default();
+  SetActiveUiLanguage(ResolveUiLanguage(language_mode, effective_locale.LanguageTag()));
+
   const bool enabled = settings->tray_enabled.Get();
   const bool lightweight = settings->lightweight.Get();
   std::string key = enabled ? "1" : "0";
   key += lightweight ? "1" : "0";
+  key += effective_dark ? "D" : "L";
   key += std::to_string(window_generation);
+  key.push_back('|');
+  key.append(effective_locale.LanguageTag());
   if (key == presentation_key) {
     return;
   }
+
+  const ResourceConfiguration resource_config{.locale = effective_locale};
+  const auto tr_res = [&](const StringResource& res_id, std::string_view fallback_en,
+                          std::string_view fallback_zh) -> std::string {
+    if (resources) {
+      return resources->GetString(res_id, resource_config);
+    }
+    return std::string(Tr(fallback_en, fallback_zh));
+  };
+
   const std::weak_ptr<TrayRuntime> weak = shared_from_this();
   std::vector<MenuEntry> menu;
-  menu.emplace_back(MenuItem("显示主窗口", [weak] {
-    if (const auto runtime = weak.lock()) {
-      runtime->ShowWindow();
-    }
-  }));
+  menu.emplace_back(MenuItem(
+      tr_res(app::strings::tray_show_window, "Show Window", "显示主窗口"), [weak] {
+        if (const auto runtime = weak.lock()) {
+          runtime->ShowWindow();
+        }
+      }));
   menu.emplace_back(MenuSection{});
-  menu.emplace_back(MenuItem("启用托盘图标", [weak] {
-    if (const auto runtime = weak.lock()) {
-      runtime->ToggleTray();
-    }
-  }).Checked(enabled));
-  menu.emplace_back(MenuItem("轻量级模式", [weak] {
-    if (const auto runtime = weak.lock()) {
-      runtime->ToggleLightweight();
-    }
-  }).Checked(lightweight));
+  menu.emplace_back(MenuItem(
+      tr_res(app::strings::tray_enable_icon, "Enable Tray Icon", "启用托盘图标"), [weak] {
+        if (const auto runtime = weak.lock()) {
+          runtime->ToggleTray();
+        }
+      }).Checked(enabled));
+  menu.emplace_back(MenuItem(
+      tr_res(app::strings::tray_lightweight, "Lightweight Mode", "轻量级模式"), [weak] {
+        if (const auto runtime = weak.lock()) {
+          runtime->ToggleLightweight();
+        }
+      }).Checked(lightweight));
   menu.emplace_back(MenuSection{});
-  menu.emplace_back(MenuItem("退出 db++", [weak] {
-    if (const auto runtime = weak.lock()) {
-      runtime->RequestExit();
-    }
-  }));
+  menu.emplace_back(MenuItem(
+      tr_res(app::strings::tray_quit, "Quit db++", "退出 db++"), [weak] {
+        if (const auto runtime = weak.lock()) {
+          runtime->RequestExit();
+        }
+      }));
   tray.Show(app::images::tray, {.tooltip = "db++", .menu = std::move(menu)});
   presentation_key = std::move(key);
 }
@@ -174,10 +301,29 @@ void InstallTrayRuntime(ApplicationContext& context) {
   settings->lightweight = startup.lightweight;
   settings->theme_mode = startup.theme_mode;
   settings->theme_preset = startup.theme_preset;
+  settings->language = startup.language;
   settings->persist_setting = [config_db](std::string key, std::string value) {
     config_db->PersistSetting(std::move(key), std::move(value));
   };
+  try {
+    runtime->resources = UseService<Resources>();
+  } catch (const std::exception&) {
+    runtime->resources.reset();
+  }
+  {
+    const Locale effective =
+        runtime->resources
+            ? EffectiveLocale(startup.language, runtime->resources->Configuration().locale)
+            : Locale::Default();
+    SetActiveUiLanguage(ResolveUiLanguage(startup.language, effective.LanguageTag()));
+  }
   runtime->settings = settings;
+  {
+    const bool effective_dark = ui::ResolveIsDark(startup.theme_mode, runtime->system_dark);
+    ApplyNativeTrayMenuTheme(startup.theme_mode, effective_dark);
+    runtime->applied_menu_theme = std::pair<int, bool>{
+        static_cast<int>(startup.theme_mode), effective_dark};
+  }
   context.Provide(config_db);
   context.Provide(std::move(settings));
   context.Provide(runtime);

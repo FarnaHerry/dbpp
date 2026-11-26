@@ -1,6 +1,13 @@
-#include "theme.h"
+#include <huxerui/huxerui.h>
 
+#include <algorithm>
+#include <string>
 #include <utility>
+#include <vector>
+
+import dbpp.settings;
+
+#include "theme_palette.h"
 
 namespace dbpp::ui {
 
@@ -804,6 +811,18 @@ ThemeDefinition AppThemeDefinition(const ResolvedTheme& resolved) {
   toasts.maximum_width = 560.0F;
   definition.Set(toasts);
 
+  return definition;
+}
+
+ThemeDefinition OverrideButtonStyle(ButtonStyle style) {
+  ThemeDefinition definition;
+  definition.Set(std::move(style));
+  return definition;
+}
+
+ThemeDefinition OverrideTextFieldStyle(TextFieldStyle style) {
+  ThemeDefinition definition;
+  definition.Set(std::move(style));
   return definition;
 }
 

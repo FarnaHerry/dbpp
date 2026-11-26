@@ -1,25 +1,19 @@
-#include "model.h"
+module;
 
-#include "adbc_session.h"
-#include "redis_client.h"
-
+#include <huxerui/datatable.h>
+#include <huxerui/http.h>
 #include <huxerui/huxerui.h>
+#include <huxerui/task.h>
 #include <sqlite3.h>
 
-#include <algorithm>
-#include <cctype>
-#include <charconv>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <memory>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+module dbpp.db;
+
+import std;
+import dbpp.settings;
+import dbpp.i18n;
+import dbpp.types;
+import dbpp.adbc;
+import dbpp.redis;
 
 namespace dbpp {
 
@@ -40,7 +34,9 @@ const DbObject* FindObject(const DbSession& session, std::string_view name,
                            std::string_view schema = {}) {
   if (!schema.empty()) {
     for (const auto& object : session.objects) {
-      if (object.name == name && object.db_schema == schema) {
+      if (object.name == name &&
+          (object.db_schema == schema ||
+           (object.db_schema.empty() && ObjectDatabaseName(session.dialect, object) == schema))) {
         return &object;
       }
     }
@@ -56,12 +52,13 @@ const DbObject* FindObject(const DbSession& session, std::string_view name,
 bool SessionHasMultiSchemas(const DbSession& session) {
   std::string first;
   for (const auto& object : session.objects) {
-    if (object.db_schema.empty()) {
+    const std::string db_name = ObjectDatabaseName(session.dialect, object);
+    if (db_name.empty()) {
       continue;
     }
     if (first.empty()) {
-      first = object.db_schema;
-    } else if (object.db_schema != first) {
+      first = db_name;
+    } else if (db_name != first) {
       return true;
     }
   }
@@ -213,7 +210,9 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   const AdbcQueryResult count = ExecuteBlocking(
       session, "SELECT COUNT(*) FROM " + model.qualified_name + where, true, 1);
   if (!count.error.empty() || count.rows.empty() || count.rows.front().values.empty()) {
-    model.error = count.error.empty() ? "COUNT 查询没有返回结果" : count.error;
+    model.error = count.error.empty()
+                      ? std::string(Tr("COUNT query returned no result", "COUNT 查询没有返回结果"))
+                      : count.error;
     return model;
   }
   model.total = ParseInt64(count.rows.front().values.front().text);
@@ -298,9 +297,9 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   if (!data.error.empty()) {
     model.error = data.error;
   }
-  model.message = std::to_string(model.total) + " 行 · 第 " +
-                  std::to_string(model.page + 1) + " / " + std::to_string(page_count) +
-                  " 页";
+  model.message = TrFmt("{0} rows · Page {1} / {2}", "{0} 行 · 第 {1} / {2} 页",
+                        {std::to_string(model.total), std::to_string(model.page + 1),
+                         std::to_string(page_count)});
   return model;
 }
 
@@ -315,17 +314,17 @@ AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model
   AdbcQueryResult result;
   if (!model.snapshot || row_index >= model.snapshot->rows.size() ||
       column_index >= model.columns.size()) {
-    result.error = "目标行或列已失效";
+    result.error = Tr("Target row or column is invalid", "目标行或列已失效");
     return result;
   }
   if (!model.editable) {
-    result.error = "当前对象不允许编辑";
+    result.error = Tr("Current object is not editable", "当前对象不允许编辑");
     return result;
   }
   const GridRow& row = model.snapshot->rows[row_index];
   const std::string where = BuildWhere(session.dialect, model, row);
   if (where.empty()) {
-    result.error = "该表没有可用的行标识";
+    result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
     return result;
   }
   const ColumnMeta& column = model.columns[column_index];
@@ -344,17 +343,17 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
   }
   AdbcQueryResult result;
   if (!model.snapshot || row_index >= model.snapshot->rows.size()) {
-    result.error = "目标行已失效";
+    result.error = Tr("Target row is invalid", "目标行已失效");
     return result;
   }
   if (!model.editable) {
-    result.error = "当前对象不允许删除行";
+    result.error = Tr("Current object does not allow deleting rows", "当前对象不允许删除行");
     return result;
   }
   const GridRow& row = model.snapshot->rows[row_index];
   const std::string where = BuildWhere(session.dialect, model, row);
   if (where.empty()) {
-    result.error = "该表没有可用的行标识";
+    result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
     return result;
   }
   return ExecuteBlocking(session,
@@ -366,7 +365,7 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
                                   std::vector<std::string> values) {
   AdbcQueryResult result;
   if (!model.editable) {
-    result.error = "当前对象不允许插入行";
+    result.error = Tr("Current object does not allow inserting rows", "当前对象不允许插入行");
     return result;
   }
   if (values.size() < model.columns.size()) {
@@ -407,7 +406,8 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
                         ConnectionRequest request, AdbcObjectsResult objects,
                         NotifyFn notify) {
   if (!opened.session) {
-    const std::string message = "连接失败: " + opened.error;
+    const std::string message =
+        TrFmt("Connection failed: {0}", "连接失败: {0}", {opened.error});
     app.Update([](AppModel& model) {
       model.status.clear();
       model.error.clear();
@@ -497,11 +497,12 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
 
   if (notify) {
     if (duplicated) {
-      notify("该连接已存在");
+      notify(std::string(Tr("Connection already open", "该连接已存在")));
     } else if (!objects.error.empty()) {
-      notify("已连接，但读取对象失败: " + objects.error);
+      notify(TrFmt("Connected, but failed to load objects: {0}", "已连接，但读取对象失败: {0}",
+                   {objects.error}));
     } else {
-      notify("已连接 " + session->name);
+      notify(TrFmt("Connected to {0}", "已连接 {0}", {session->name}));
     }
   }
 }
@@ -513,7 +514,7 @@ Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
                                         std::size_t max_rows) {
   if (!session) {
     AdbcQueryResult result;
-    result.error = "连接已关闭";
+    result.error = Tr("Connection is closed", "连接已关闭");
     co_return result;
   }
   co_return co_await session->sequence.Run(
@@ -527,7 +528,7 @@ Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session, Tabl
                                       std::string text) {
   if (!session) {
     AdbcQueryResult result;
-    result.error = "连接已关闭";
+    result.error = Tr("Connection is closed", "连接已关闭");
     co_return result;
   }
   co_return co_await session->sequence.Run(
@@ -541,7 +542,7 @@ Task<AdbcQueryResult> DeleteRowAsync(std::shared_ptr<AdbcSession> session, Table
                                      std::size_t row_index) {
   if (!session) {
     AdbcQueryResult result;
-    result.error = "连接已关闭";
+    result.error = Tr("Connection is closed", "连接已关闭");
     co_return result;
   }
   co_return co_await session->sequence.Run(
@@ -578,7 +579,8 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
   for (std::size_t i = 0; i < rows.size(); ++i) {
     AdbcQueryResult result = InsertRowBlocking(session, model, rows[i].values);
     if (!result.error.empty()) {
-      const std::string msg = "第 " + std::to_string(i + 1) + " 行插入失败: " + result.error;
+      const std::string msg = TrFmt("Row {0} insert failed: {1}", "第 {0} 行插入失败: {1}",
+                                    {std::to_string(i + 1), result.error});
       if (in_tx) {
         (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
         return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = msg};
@@ -592,7 +594,10 @@ BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& mod
     if (!committed.error.empty()) {
       (void)ExecuteBlocking(session, "ROLLBACK", false, 0);
       return BatchInsertResult{
-          .inserted = 0, .rolled_back = true, .error = "提交事务失败: " + committed.error};
+          .inserted = 0,
+          .rolled_back = true,
+          .error = TrFmt("Failed to commit transaction: {0}", "提交事务失败: {0}",
+                         {committed.error})};
     }
   }
 
@@ -701,12 +706,12 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
     }
     if (!load_error.empty() && !has_snapshot) {
       if (notify) {
-        notify("加载失败: " + load_error);
+        notify(TrFmt("Failed to load: {0}", "加载失败: {0}", {load_error}));
       }
       co_return;
     }
     if (!load_error.empty() && notify) {
-      notify("加载警告: " + load_error);
+      notify(TrFmt("Load warning: {0}", "加载警告: {0}", {load_error}));
     }
   });
 }
@@ -763,7 +768,7 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
     if (!result.error.empty()) {
       const std::string message = result.error;
       if (notify) {
-        notify("保存失败: " + message);
+        notify(TrFmt("Failed to save: {0}", "保存失败: {0}", {message}));
       }
       co_return;
     }
@@ -811,7 +816,7 @@ void RequestDeleteSelected(const State<AppModel>& app, const State<WorkspaceMode
     if (!result.error.empty()) {
       const std::string message = result.error;
       if (notify) {
-        notify("删除失败: " + message);
+        notify(TrFmt("Failed to delete: {0}", "删除失败: {0}", {message}));
       }
       co_return;
     }
@@ -824,7 +829,7 @@ void RequestDeleteSelected(const State<AppModel>& app, const State<WorkspaceMode
     RequestLoadTable(app, workspace, tasks, tab_id, next_page, table_value.sort,
                      table_value.filter, false, notify);
     if (notify) {
-      notify("已删除 1 行");
+      notify(std::string(Tr("Deleted 1 row", "已删除 1 行")));
     }
   });
 }
@@ -841,7 +846,7 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
   const DbSession* session = FindSession(app.Get(), tab->session_id);
   if (session == nullptr || !session->session) {
     if (notify) {
-      notify("连接已关闭");
+      notify(std::string(Tr("Connection is closed", "连接已关闭")));
     }
     return;
   }
@@ -891,7 +896,7 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
         }
       });
       if (notify) {
-        notify("提交失败: " + res.error);
+        notify(TrFmt("Commit failed: {0}", "提交失败: {0}", {res.error}));
       }
       if (partial_reload) {
         RequestLoadTable(app, workspace, tasks, tab_id, reload_page, reload_sort,
@@ -934,7 +939,7 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
                        std::move(reload_filter), false, notify);
     }
     if (notify) {
-      notify("已提交 " + std::to_string(res.inserted) + " 行");
+      notify(TrFmt("Committed {0} row(s)", "已提交 {0} 行", {std::to_string(res.inserted)}));
     }
   });
 }
@@ -999,8 +1004,9 @@ std::uint64_t OpenSqlTab(const State<AppModel>& app, const State<WorkspaceModel>
     tab.session_name = session->name;
     tab.session_uri = session->uri;
     const bool is_redis = session->dialect == Dialect::Redis;
+    const std::string tab_prefix = is_redis ? "Redis " : std::string(Tr("Query ", "查询 "));
     tab.title = custom_title.empty()
-                    ? ((is_redis ? "Redis " : "查询 ") + std::to_string(ws.next_sql_index++))
+                    ? (tab_prefix + std::to_string(ws.next_sql_index++))
                     : std::move(custom_title);
     tab.sql.editor = TextEditingValue::FromText(
         initial_sql.empty() ? std::string{is_redis ? "PING" : "SELECT 1;"}
@@ -1058,14 +1064,17 @@ void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& wor
                     const TaskScope& tasks, ConnectionRequest request, NotifyFn notify) {
   app.Update([&](AppModel& model) {
     model.error.clear();
-    model.status = "正在连接 " + DisplayNameFromUri(request.uri, "数据库") + "…";
+    model.status =
+        TrFmt("Connecting to {0}...", "正在连接 {0}…",
+              {DisplayNameFromUri(request.uri, Tr("Database", "数据库"))});
   });
   tasks.Launch([app, workspace, tasks, request = std::move(request),
                 notify = std::move(notify)]() mutable -> Task<void> {
     AdbcOpenResult opened =
         co_await RunWorker([request] { return OpenAdbcBlocking(request); });
     if (!opened.session) {
-      const std::string message = "连接失败: " + opened.error;
+      const std::string message =
+          TrFmt("Connection failed: {0}", "连接失败: {0}", {opened.error});
       app.Update([](AppModel& model) {
         model.status.clear();
         model.error.clear();
@@ -1133,7 +1142,7 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
         [adbc](std::stop_token) { return LoadObjectsBlocking(*adbc); });
     if (!objects.error.empty()) {
       if (notify) {
-        notify("刷新失败: " + objects.error);
+        notify(TrFmt("Refresh failed: {0}", "刷新失败: {0}", {objects.error}));
       }
       co_return;
     }
@@ -1177,7 +1186,8 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
                        active_tab->table.sort, active_tab->table.filter, true, notify);
     }
     if (notify && notify_success) {
-      notify("已刷新 " + session_name + "（" + std::to_string(object_count) + " 个对象）");
+      notify(TrFmt("Refreshed {0} ({1} objects)", "已刷新 {0}（{1} 个对象）",
+                   {session_name, std::to_string(object_count)}));
     }
   });
 }

@@ -1,6 +1,45 @@
-cmake_minimum_required(VERSION 3.30)
+cmake_minimum_required(VERSION 4.4)
 
 project(dbpp VERSION 0.2.3 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+
+# `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(CxxImportStdGate)
+enable_language(C)
+enable_language(CXX)
+if (WIN32)
+    enable_language(RC)
+endif ()
+
+if (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_GENERATOR MATCHES "^Ninja")
+    set(_show_includes_dir "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/DbppShowIncludes")
+    file(WRITE "${_show_includes_dir}/dbpp_include_probe.h" "\n")
+    file(WRITE "${_show_includes_dir}/probe.cpp" "#include \"dbpp_include_probe.h\"\n")
+    execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" /nologo /showIncludes /Zs probe.cpp
+        WORKING_DIRECTORY "${_show_includes_dir}"
+        RESULT_VARIABLE _show_includes_result OUTPUT_VARIABLE _show_includes_output
+        ERROR_QUIET ENCODING NONE)
+    if (_show_includes_result STREQUAL "0" AND
+        _show_includes_output MATCHES "(^|\n)([^\r\n]*:[ \t]+)[A-Za-z]:[^\r\n]*dbpp_include_probe\\.h")
+        if (NOT CMAKE_CL_SHOWINCLUDES_PREFIX STREQUAL CMAKE_MATCH_2)
+            message(STATUS "db++: corrected the MSVC /showIncludes prefix for Ninja")
+            set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CMAKE_MATCH_2}")
+        endif ()
+    endif ()
+endif ()
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS ON)
+set(CMAKE_CXX_MODULE_STD OFF)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif ()
 
 # HuxerUI 源码目录：优先使用 CI/本地检出的 third_party/huxerui，回落到同级 ../HuxerUI-fork。
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/huxerui/CMakeLists.txt")
@@ -41,29 +80,7 @@ set(HUXERUI_BUILD_CLI OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${DBPP_HUXERUI_DIR}" "${CMAKE_BINARY_DIR}/huxerui-sdk" EXCLUDE_FROM_ALL)
 
-enable_language(C)
-enable_language(CXX)
-if (WIN32)
-    enable_language(RC)
-endif ()
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
-endif ()
-
-list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-
 # ---- Apache Arrow ADBC (driver manager + SQLite driver) -------------------
-# ADBC is the database abstraction: every connection goes through the driver
-# manager, so building against PostgreSQL/MySQL/DuckDB/etc. is a driver swap,
-# not an application change.
 if (NOT EXISTS "${DBPP_ADBC_DIR}/c/CMakeLists.txt")
     message(FATAL_ERROR "DBPP_ADBC_DIR does not contain an ADBC source tree: ${DBPP_ADBC_DIR}")
 endif ()
@@ -83,8 +100,6 @@ set(ADBC_USE_CCACHE OFF CACHE BOOL "" FORCE)
 set(ADBC_INSTALL_NAME_RPATH ON CACHE BOOL "" FORCE)
 add_subdirectory("${DBPP_ADBC_DIR}/c" "${CMAKE_BINARY_DIR}/adbc" EXCLUDE_FROM_ALL)
 
-# ADBC 25 generates driver/sqlite/config.h under ${CMAKE_BINARY_DIR}/adbc but
-# adds top-level ${CMAKE_BINARY_DIR} to sqlite target include paths.
 foreach (_adbc_sqlite_target IN ITEMS adbc_driver_sqlite_objlib adbc_driver_sqlite_shared adbc_driver_sqlite_static)
     if (TARGET "${_adbc_sqlite_target}")
         target_include_directories("${_adbc_sqlite_target}" PRIVATE "${CMAKE_BINARY_DIR}/adbc")
@@ -104,17 +119,20 @@ if (APPLE)
     endforeach ()
 endif ()
 
-file(GLOB_RECURSE DBPP_SOURCES CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cxx"
+# ---- dbpp GUI + platform sources (领域层改由 C++23 模块库 dbpp_core 提供) ----
+set(DBPP_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/app.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tray.cpp"
 )
 
 if (WIN32)
     list(APPEND DBPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/main.cpp")
     include("${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/huxerui.cmake")
 elseif (APPLE)
-    list(APPEND DBPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/main.cpp")
+    list(APPEND DBPP_SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/main.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/native_theme.mm")
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND DBPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/main.cpp")
 endif ()
@@ -142,7 +160,6 @@ if (WIN32)
     target_compile_definitions(dbpp PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif ()
 
-# macOS bundle icon and Info.plist.
 if (APPLE AND NOT IOS)
     set_target_properties(dbpp PROPERTIES
             MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist.in"
@@ -162,20 +179,78 @@ huxerui_use_library(dbpp
         PATH "${DBPP_SQLITE_LIB_DIR}"
 )
 
-target_include_directories(dbpp PRIVATE
+# ---- dbpp_core C++23 模块静态库（供 dbpp 与无窗口单元测试复用） -----------
+add_library(dbpp_core STATIC
+        src/settings.cpp
+        src/i18n.cpp
+        src/redis_client.cpp
+        src/adbc_session.cpp
+        src/driver_installer.cpp
+        src/instance.cpp
+        src/db.cpp
+        src/config_db.cpp
+        src/cli.cpp
+        src/theme_palette.cpp
+)
+target_sources(dbpp_core PUBLIC
+        FILE_SET CXX_MODULES
+        BASE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}"
+        FILES
+            src/settings.cppm
+            src/i18n.cppm
+            src/types.cppm
+            src/redis_client.cppm
+            src/adbc_session.cppm
+            src/driver_installer.cppm
+            src/instance.cppm
+            src/db.cppm
+            src/config_db.cppm
+            src/cli.cppm
+)
+set_target_properties(dbpp_core PROPERTIES
+        CXX_MODULE_STD ON
+        CXX_SCAN_FOR_MODULES ON
+)
+target_compile_features(dbpp_core PUBLIC cxx_std_23)
+target_include_directories(dbpp_core PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${DBPP_ADBC_DIR}/c/include"
 )
-target_include_directories(dbpp SYSTEM PRIVATE
+target_include_directories(dbpp_core SYSTEM PRIVATE
         "${DBPP_ADBC_DIR}/c/vendor"
 )
-target_link_libraries(dbpp PRIVATE
+target_link_libraries(dbpp_core PUBLIC
+        HuxerUI::huxerui
+        HuxerUI::DataTable
+        HuxerUI::SQLite
         SQLite::SQLite3
         adbc_driver_manager_shared
         nanoarrow
 )
 if (WIN32)
-    target_link_libraries(dbpp PRIVATE ws2_32)
+    target_link_libraries(dbpp_core PUBLIC ws2_32)
+    target_compile_definitions(dbpp_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif ()
+target_compile_definitions(dbpp_core PRIVATE
+        DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+        DBPP_VERSION="${PROJECT_VERSION}"
+)
+add_dependencies(dbpp_core adbc_driver_sqlite_shared)
+if (MSVC)
+    target_compile_options(dbpp_core PRIVATE /utf-8 /wd4737 /bigobj)
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(dbpp_core PRIVATE -Wall -Wextra -Wpedantic)
+endif ()
+
+set_target_properties(dbpp PROPERTIES
+        CXX_MODULE_STD ON
+        CXX_SCAN_FOR_MODULES ON
+)
+target_compile_features(dbpp PRIVATE cxx_std_23)
+target_include_directories(dbpp PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(dbpp PRIVATE dbpp_core)
 target_compile_definitions(dbpp PRIVATE
         DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
         DBPP_VERSION="${PROJECT_VERSION}"
@@ -198,7 +273,10 @@ if (WIN32)
     )
 endif ()
 
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if (MSVC)
+    target_compile_options(dbpp PRIVATE /utf-8 /wd4737 /bigobj)
+    target_link_options(dbpp PRIVATE "/WHOLEARCHIVE:@cmake_cxx_std.lib")
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(dbpp PRIVATE -Wall -Wextra -Wpedantic)
 endif ()
 
@@ -280,217 +358,47 @@ endif ()
 # ---- 无窗口核心单元测试 ---------------------------------------------------
 if (DBPP_BUILD_TESTS)
     enable_testing()
-    add_executable(test_adbc_core
-            tests/test_adbc_core.cpp
-            src/adbc_session.cpp
-            src/redis_client.cpp
-            src/driver_installer.cpp
-    )
-    target_compile_features(test_adbc_core PRIVATE cxx_std_20)
-    target_include_directories(test_adbc_core PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${DBPP_ADBC_DIR}/c/include"
-    )
-    target_include_directories(test_adbc_core SYSTEM PRIVATE
-            "${DBPP_ADBC_DIR}/c/vendor"
-    )
-    target_link_libraries(test_adbc_core PRIVATE
-            HuxerUI::huxerui
-            HuxerUI::DataTable
-            adbc_driver_manager_shared
-            nanoarrow
-    )
-    if (WIN32)
-        target_link_libraries(test_adbc_core PRIVATE ws2_32)
-    endif ()
-    target_compile_definitions(test_adbc_core PRIVATE
-            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
-    )
-    add_dependencies(test_adbc_core adbc_driver_sqlite_shared)
-    if (MSVC)
-        target_compile_options(test_adbc_core PRIVATE /utf-8)
-    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_adbc_core PRIVATE -Wall -Wextra -Wpedantic)
-    endif ()
-    if (WIN32)
-        target_compile_definitions(test_adbc_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-        add_custom_command(TARGET test_adbc_core POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:HuxerUI::huxerui>"
-                        "$<TARGET_FILE_DIR:test_adbc_core>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_manager_shared>"
-                        "$<TARGET_FILE_DIR:test_adbc_core>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
-                        "$<TARGET_FILE_DIR:test_adbc_core>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
-                COMMENT "Copying runtime DLLs next to test_adbc_core.exe"
-                VERBATIM
-        )
-    endif ()
-    add_test(NAME adbc_core COMMAND test_adbc_core)
 
-    add_executable(test_cli
-            tests/test_cli.cpp
-            src/cli.cpp
-            src/config_db.cpp
-            src/db.cpp
-            src/adbc_session.cpp
-            src/redis_client.cpp
-            src/driver_installer.cpp
-            src/settings.cpp
-            src/theme_palette.cpp
-    )
-    target_compile_features(test_cli PRIVATE cxx_std_20)
-    target_include_directories(test_cli PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${DBPP_ADBC_DIR}/c/include"
-    )
-    target_include_directories(test_cli SYSTEM PRIVATE
-            "${DBPP_ADBC_DIR}/c/vendor"
-    )
-    target_link_libraries(test_cli PRIVATE
-            HuxerUI::huxerui
-            HuxerUI::DataTable
-            HuxerUI::SQLite
-            SQLite::SQLite3
-            adbc_driver_manager_shared
-            nanoarrow
-    )
-    if (WIN32)
-        target_link_libraries(test_cli PRIVATE ws2_32)
-    endif ()
-    target_compile_definitions(test_cli PRIVATE
-            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
-            DBPP_VERSION="${PROJECT_VERSION}"
-    )
-    add_dependencies(test_cli adbc_driver_sqlite_shared)
-    if (MSVC)
-        target_compile_options(test_cli PRIVATE /utf-8)
-    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_cli PRIVATE -Wall -Wextra -Wpedantic)
-    endif ()
-    if (WIN32)
-        target_compile_definitions(test_cli PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-        add_custom_command(TARGET test_cli POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:HuxerUI::huxerui>"
-                        "$<TARGET_FILE_DIR:test_cli>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_manager_shared>"
-                        "$<TARGET_FILE_DIR:test_cli>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
-                        "$<TARGET_FILE_DIR:test_cli>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
-                COMMENT "Copying runtime DLLs next to test_cli.exe"
-                VERBATIM
+    function(dbpp_add_module_test target test_name source_file)
+        add_executable("${target}" "${source_file}")
+        set_target_properties("${target}" PROPERTIES
+                CXX_MODULE_STD ON
+                CXX_SCAN_FOR_MODULES ON
         )
-    endif ()
-    add_test(NAME cli COMMAND test_cli)
+        target_compile_features("${target}" PRIVATE cxx_std_23)
+        target_include_directories("${target}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries("${target}" PRIVATE dbpp_core)
+        target_compile_definitions("${target}" PRIVATE
+                DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                DBPP_VERSION="${PROJECT_VERSION}"
+        )
+        if (MSVC)
+            target_compile_options("${target}" PRIVATE /utf-8 /wd4737 /bigobj)
+            target_link_options("${target}" PRIVATE "/WHOLEARCHIVE:@cmake_cxx_std.lib")
+            target_compile_definitions("${target}" PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+            add_custom_command(TARGET "${target}" POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                            "$<TARGET_FILE:HuxerUI::huxerui>"
+                            "$<TARGET_FILE_DIR:${target}>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                            "$<TARGET_FILE:adbc_driver_manager_shared>"
+                            "$<TARGET_FILE_DIR:${target}>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                            "$<TARGET_FILE:adbc_driver_sqlite_shared>"
+                            "$<TARGET_FILE_DIR:${target}>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
+                    COMMENT "Copying runtime DLLs next to ${target}.exe"
+                    VERBATIM
+            )
+        elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options("${target}" PRIVATE -Wall -Wextra -Wpedantic)
+        endif ()
+        add_test(NAME "${test_name}" COMMAND "${target}")
+    endfunction()
 
-    add_executable(test_instance
-            tests/test_instance.cpp
-            src/instance.cpp
-            src/adbc_session.cpp
-            src/redis_client.cpp
-    )
-    target_compile_features(test_instance PRIVATE cxx_std_20)
-    target_include_directories(test_instance PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${DBPP_ADBC_DIR}/c/include"
-    )
-    target_include_directories(test_instance SYSTEM PRIVATE
-            "${DBPP_ADBC_DIR}/c/vendor"
-    )
-    target_link_libraries(test_instance PRIVATE
-            HuxerUI::huxerui
-            HuxerUI::DataTable
-            adbc_driver_manager_shared
-            nanoarrow
-    )
-    if (WIN32)
-        target_link_libraries(test_instance PRIVATE ws2_32)
-    endif ()
-    target_compile_definitions(test_instance PRIVATE
-            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
-    )
-    add_dependencies(test_instance adbc_driver_sqlite_shared)
-    if (MSVC)
-        target_compile_options(test_instance PRIVATE /utf-8)
-    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_instance PRIVATE -Wall -Wextra -Wpedantic)
-    endif ()
-    if (WIN32)
-        target_compile_definitions(test_instance PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-        add_custom_command(TARGET test_instance POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:HuxerUI::huxerui>"
-                        "$<TARGET_FILE_DIR:test_instance>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_manager_shared>"
-                        "$<TARGET_FILE_DIR:test_instance>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
-                        "$<TARGET_FILE_DIR:test_instance>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
-                COMMENT "Copying runtime DLLs next to test_instance.exe"
-                VERBATIM
-        )
-    endif ()
-    add_test(NAME instance COMMAND test_instance)
-
-    add_executable(test_redis
-            tests/test_redis.cpp
-            src/redis_client.cpp
-            src/adbc_session.cpp
-            src/db.cpp
-            src/cli.cpp
-            src/driver_installer.cpp
-            src/settings.cpp
-            src/theme_palette.cpp
-    )
-    target_compile_features(test_redis PRIVATE cxx_std_20)
-    target_include_directories(test_redis PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "${DBPP_ADBC_DIR}/c/include"
-    )
-    target_include_directories(test_redis SYSTEM PRIVATE
-            "${DBPP_ADBC_DIR}/c/vendor"
-    )
-    target_link_libraries(test_redis PRIVATE
-            HuxerUI::huxerui
-            HuxerUI::DataTable
-            SQLite::SQLite3
-            adbc_driver_manager_shared
-            nanoarrow
-    )
-    target_compile_definitions(test_redis PRIVATE
-            DBPP_SQLITE_DRIVER_PATH="$<TARGET_FILE:adbc_driver_sqlite_shared>"
-            DBPP_VERSION="${PROJECT_VERSION}"
-    )
-    add_dependencies(test_redis adbc_driver_sqlite_shared)
-    if (MSVC)
-        target_compile_options(test_redis PRIVATE /utf-8)
-    elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_redis PRIVATE -Wall -Wextra -Wpedantic)
-    endif ()
-    if (WIN32)
-        target_link_libraries(test_redis PRIVATE ws2_32)
-        target_compile_definitions(test_redis PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-        add_custom_command(TARGET test_redis POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:HuxerUI::huxerui>"
-                        "$<TARGET_FILE_DIR:test_redis>/$<TARGET_FILE_NAME:HuxerUI::huxerui>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_manager_shared>"
-                        "$<TARGET_FILE_DIR:test_redis>/$<TARGET_FILE_NAME:adbc_driver_manager_shared>"
-                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                        "$<TARGET_FILE:adbc_driver_sqlite_shared>"
-                        "$<TARGET_FILE_DIR:test_redis>/$<TARGET_FILE_NAME:adbc_driver_sqlite_shared>"
-                COMMENT "Copying runtime DLLs next to test_redis.exe"
-                VERBATIM
-        )
-    endif ()
-    add_test(NAME redis COMMAND test_redis)
+    dbpp_add_module_test(test_adbc_core adbc_core tests/test_adbc_core.cpp)
+    dbpp_add_module_test(test_cli cli tests/test_cli.cpp)
+    dbpp_add_module_test(test_instance instance tests/test_instance.cpp)
+    dbpp_add_module_test(test_redis redis tests/test_redis.cpp)
 endif ()
 
 add_custom_target(dbpp-run

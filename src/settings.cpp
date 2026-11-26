@@ -1,16 +1,11 @@
-#include "settings.h"
+module;
 
-#include "model.h"
-
+#include <huxerui/state.h>
 #include <sqlite3.h>
 
-#include <cctype>
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
+module dbpp.settings;
+
+import std;
 
 namespace dbpp {
 
@@ -50,6 +45,81 @@ struct StmtGuard {
     }
   }
 };
+
+struct LegacyConnectionRow {
+  std::string name;
+  std::string driver_path;
+  std::string uri;
+  std::string username;
+  std::string password;
+};
+
+std::string DecodeLegacyTsvField(std::string_view text) {
+  const auto hex_value = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string result;
+  result.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '%' && i + 2 < text.size()) {
+      const int high = hex_value(text[i + 1]);
+      const int low = hex_value(text[i + 2]);
+      if (high >= 0 && low >= 0) {
+        result.push_back(static_cast<char>((high << 4) | low));
+        i += 2;
+        continue;
+      }
+    }
+    result.push_back(text[i]);
+  }
+  return result;
+}
+
+std::vector<LegacyConnectionRow> LoadLegacyConnectionTsvRows(const std::string& path) {
+  std::vector<LegacyConnectionRow> rows;
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return rows;
+  }
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    std::vector<std::string_view> fields;
+    std::size_t start = 0;
+    while (start <= line.size() && fields.size() < 5) {
+      const std::size_t tab = line.find('\t', start);
+      if (tab == std::string::npos) {
+        fields.emplace_back(line.data() + start, line.size() - start);
+        break;
+      }
+      fields.emplace_back(line.data() + start, tab - start);
+      start = tab + 1;
+    }
+    if (fields.size() != 4 && fields.size() != 5) {
+      continue;
+    }
+    LegacyConnectionRow row;
+    row.name = DecodeLegacyTsvField(fields[0]);
+    row.driver_path = DecodeLegacyTsvField(fields[1]);
+    row.uri = DecodeLegacyTsvField(fields[2]);
+    row.username = DecodeLegacyTsvField(fields[3]);
+    if (fields.size() == 5) {
+      row.password = DecodeLegacyTsvField(fields[4]);
+    }
+    if (!row.driver_path.empty() && !row.uri.empty()) {
+      rows.push_back(std::move(row));
+    }
+  }
+  return rows;
+}
 
 } // namespace
 
@@ -219,8 +289,8 @@ bool EnsureConfigSqliteSync(const std::string& db_path) {
           existing_count = sqlite3_column_int(cnt_stmt.stmt, 0);
         }
         if (ok && existing_count == 0) {
-          const std::vector<ConnectionProfile> legacy =
-              LoadConnectionProfiles(legacy_conns.string());
+          const std::vector<LegacyConnectionRow> legacy =
+              LoadLegacyConnectionTsvRows(legacy_conns.string());
           StmtGuard ins_stmt;
           if (!legacy.empty()) {
             if (sqlite3_prepare_v2(
@@ -321,6 +391,28 @@ ThemePreset ThemePresetFromKey(std::string_view key) {
   return ThemePreset::GeminiSpark;
 }
 
+std::string_view LanguageModeKey(LanguageMode mode) {
+  switch (mode) {
+    case LanguageMode::Zh: return "zh";
+    case LanguageMode::En: return "en";
+    case LanguageMode::System:
+    default: return "system";
+  }
+}
+
+LanguageMode LanguageModeFromKey(std::string_view key) {
+  const std::string lower = LowerAsciiCopy(key);
+  if (lower == "zh" || lower == "zh-cn" || lower == "zh_cn" || lower == "zh-hans" ||
+      lower == "zh-hans-cn") {
+    return LanguageMode::Zh;
+  }
+  if (lower == "en" || lower == "en-us" || lower == "en_us" || lower == "en-gb" ||
+      lower == "en_gb") {
+    return LanguageMode::En;
+  }
+  return LanguageMode::System;
+}
+
 TraySettings LoadTraySettings(const std::string& path) {
   TraySettings settings;
   if (path.empty()) {
@@ -336,6 +428,8 @@ TraySettings LoadTraySettings(const std::string& path) {
       settings.theme_mode = ThemeModeFromKey(value);
     } else if (key == kSettingThemePreset) {
       settings.theme_preset = ThemePresetFromKey(value);
+    } else if (key == kSettingUiLanguage) {
+      settings.language = LanguageModeFromKey(value);
     }
   };
 
@@ -367,7 +461,8 @@ TraySettings LoadTraySettings(const std::string& path) {
   if (sqlite3_prepare_v2(
           conn.db,
           "SELECT key, value FROM settings "
-          "WHERE key IN ('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset');",
+          "WHERE key IN ('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', "
+          "'ui.language');",
           -1, &stmt.stmt, nullptr) != SQLITE_OK) {
     return settings;
   }
@@ -405,7 +500,8 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
       stream << kSettingTrayEnabled << '\t' << FlagText(settings.tray_enabled) << '\n'
              << kSettingLightweight << '\t' << FlagText(settings.lightweight) << '\n'
              << kSettingThemeMode << '\t' << ThemeModeKey(settings.theme_mode) << '\n'
-             << kSettingThemePreset << '\t' << ThemePresetKey(settings.theme_preset) << '\n';
+             << kSettingThemePreset << '\t' << ThemePresetKey(settings.theme_preset) << '\n'
+             << kSettingUiLanguage << '\t' << LanguageModeKey(settings.language) << '\n';
       stream.flush();
       if (!stream) {
         std::error_code cleanup_error;
@@ -447,6 +543,7 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
       {kSettingLightweight, std::string(FlagText(settings.lightweight))},
       {kSettingThemeMode, std::string(ThemeModeKey(settings.theme_mode))},
       {kSettingThemePreset, std::string(ThemePresetKey(settings.theme_preset))},
+      {kSettingUiLanguage, std::string(LanguageModeKey(settings.language))},
   };
 
   StmtGuard upsert;
@@ -483,6 +580,7 @@ void SettingsModel::Load() {
   lightweight = settings.lightweight;
   theme_mode = settings.theme_mode;
   theme_preset = settings.theme_preset;
+  language = settings.language;
 }
 
 TraySettings SettingsModel::Snapshot() const {
@@ -491,6 +589,7 @@ TraySettings SettingsModel::Snapshot() const {
       .lightweight = lightweight.Get(),
       .theme_mode = theme_mode.Get(),
       .theme_preset = theme_preset.Get(),
+      .language = language.Get(),
   };
 }
 
@@ -532,6 +631,15 @@ bool SettingsModel::SetThemePreset(ThemePreset preset) {
   theme_preset = preset;
   if (persist_setting) {
     persist_setting(std::string(kSettingThemePreset), std::string(ThemePresetKey(preset)));
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetLanguage(LanguageMode mode) {
+  language = mode;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingUiLanguage), std::string(LanguageModeKey(mode)));
     return true;
   }
   return SaveTraySettings(path, Snapshot());

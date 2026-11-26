@@ -1,18 +1,16 @@
-#pragma once
+module;
 
-#include "model.h"
-#include "settings.h"
-
-#include <huxerui/huxerui.h>
 #include <huxerui/sqlite.h>
+#include <huxerui/task.h>
 
-#include <cstdint>
-#include <deque>
-#include <optional>
-#include <string>
-#include <vector>
+export module dbpp.config_db;
 
-namespace dbpp {
+import std;
+import dbpp.settings;
+import dbpp.types;
+import dbpp.db;
+
+export namespace dbpp {
 
 struct SettingRow {
   std::string key;

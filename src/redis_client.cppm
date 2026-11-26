@@ -1,24 +1,14 @@
-#pragma once
+module;
 
-#include "model.h"
+#include <huxerui/datatable.h>
 
-#include <cstddef>
-#include <cstdint>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
+export module dbpp.redis;
 
-namespace dbpp {
+import std;
+import dbpp.types;
+import dbpp.i18n;
 
-/// Built-in zero-dependency Redis RESP2/RESP3 TCP client and db++ adapters.
-///
-/// Implements non-blocking/timed POSIX & WinSock2 TCP transport, URI parsing,
-/// RESP2/RESP3 frame encoding and decoding, pipelined command execution, and
-/// adapters mapping Redis logical databases (`db0`..`dbN`) and keys onto
-/// db++'s `DbObject`, `TableModel`, and command-console `AdbcQueryResult`
-/// workflows. Every blocking network call must run inside the owning
-/// `AdbcSession::sequence` worker, never on UI composition callbacks.
+export namespace dbpp {
 
 struct RedisEndpoint {
   std::string host = "127.0.0.1";

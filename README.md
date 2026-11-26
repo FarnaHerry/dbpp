@@ -7,8 +7,8 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 
 ## 功能
 
-- 顶部工具栏与统一连接树：左上角提供「新建连接 / 新建查询 / 驱动管理」快捷按钮，左侧栏以单一可滚动树统一展示已连接会话与已保存连接（点击原地直接连接并展开/收起其下「表 / 视图 / 物化视图 / 外部表」等对象分组、不改变连接排列顺序，支持拖拽连接行调整顺序并持久化到 `dbpp.sqlite3`，以及右键菜单编辑连接、刷新、新建查询、查看结构、复制名称/URI/SELECT、删除对象和断开/删除配置）
-- 打开/连接数据库：两步式「新建连接」向导先选择数据库类型（SQLite / PostgreSQL / MySQL / MariaDB / DuckDB / Redis / SQL Server / ClickHouse / Arrow Flight SQL / Snowflake / BigQuery / Trino / Databricks / Amazon Redshift / 自定义 ADBC 驱动），显示驱动就绪状态与一键安装，并按类型展示文件选择或主机/端口/库名表单（可切换原始 URI）
+- 顶部工具栏与统一连接树：左上角提供「新建连接 / 新建查询 / 驱动管理」快捷按钮，左侧栏以单一可滚动树统一展示已连接会话与已保存连接；MySQL 等多库/多 Schema 连接自动按「连接 -> 数据库 -> 对象类型（表/视图/物化视图/外部表）-> 对象」四层分类展示并折叠系统库，支持拖拽连接行调整顺序并持久化到 `dbpp.sqlite3`，以及右键菜单编辑连接、刷新、新建查询、查看结构、复制名称/URI/SELECT、删除对象和断开/删除配置
+- 打开/连接与编辑数据库：两步式「新建连接」向导与右键「编辑连接…」共用一致的按类型定制表单字段（文件浏览 / 主机+端口+库名与 URI 双向同步 / 原始 URI），所有密码框内置尾部小眼睛图标切换明/暗文；内置 15 种数据库品牌图标与一键安装 ADBC 驱动
 - Redis 内置支持：零外部依赖 RESP2/RESP3 TCP 客户端，左侧按 `db0`..`db15` 展示逻辑库与键计数，右侧虚拟表格支持 `MATCH` 模式筛选、分页/排序、内联编辑（String 保留 TTL、Hash/List/Set/ZSet JSON 编辑、TTL `EXPIRE`/`PERSIST`、`RENAMENX` 改名、批量新建与删除键），并内置 Redis 命令控制台
 - ADBC 管理器：保存连接配置（默认保留密码）、发现本机驱动、在线安装/更新/卸载 ADBC 驱动、
   从列表中选择驱动/连接并删除配置
@@ -16,18 +16,18 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 - 虚拟化数据表格（Lib-DataTable）：单元格与表头单行显示、超出宽度自动省略号（不换行），首次打开按采样内容自动调节初始列宽，后续保留用户手动拖拽拉伸的列宽；支持底部分页、排序、`WHERE` 筛选（SQLite 使用 `rowid`，其它数据库使用主键约束做行标识）
 - 行内编辑、底部内联空白草稿行添加（未提交前不做入库校验，支持「提交」事务写入或「回滚」放弃）与删除行
 - SQL 控制台：独立查询标签页、结果表格、影响行数、执行后自动刷新对象列表
-- 系统托盘：托盘图标与菜单（显示主窗口 / 启用托盘 / 轻量级模式 / 退出），
-  托盘拥有应用生命周期；托盘不可用时关闭会弹确认退出
+- 系统托盘与深浅色同步：托盘图标与菜单（显示主窗口 / 启用托盘 / 轻量级模式 / 退出），
+  托盘拥有应用生命周期，且原生托盘菜单（Windows / macOS）随设置/系统深浅色自动同步；托盘不可用时关闭会弹确认退出
 - 桌面单实例：同一时间只允许运行一个 GUI 实例；重复启动或通过桌面打开文件会唤醒已有窗口并转发待打开数据库（CLI 子命令仍可并发无头运行）
 - 无头 CLI：`dbpp <command> ...`，无需 GUI/显示服务即可直接查表、执行 SQL、管理 `dbpp.sqlite3` 连接配置与在线安装/卸载 ADBC 驱动，支持 `--json` 结构化输出供 AI Agent 调用
 - 轻量级模式：关闭窗口时销毁整个界面（断开全部 ADBC 会话），从托盘唤出时重建，
   空闲内存占用更低；设置页可开关，持久化在 `dbpp.sqlite3`
-- 多预设主题与图标：默认采用「Gemini 星光」分层配色（蓝-紫-珊瑚星光渐变与四色语义高亮），支持切换翡翠青 / 暖沙琥珀 / 暮光紫 / 极简黑白及跟随系统/深/浅模式并持久化至 `dbpp.sqlite3`；附带应用图标（Windows .ico / macOS .icns / Linux hicolor + desktop 文件）与托盘图标
+- 多预设主题、双语界面与图标：默认采用「Gemini 星光」分层配色（蓝-紫-珊瑚星光渐变与四色语义高亮），支持切换翡翠青 / 暖沙琥珀 / 暮光紫 / 极简黑白及跟随系统/深/浅模式；内置简体中文 / English 双语界面（默认跟随系统语言，可在设置页即时切换）并统一持久化至 `dbpp.sqlite3`；附带应用图标（Windows .ico / macOS .icns / Linux hicolor + desktop 文件）与托盘图标
 - 启动参数：无参或 `dbpp /path/to/file.sqlite`（以及 `dbpp gui` / `dbpp open`）启动 GUI；`dbpp <command>` 走无头 CLI；也可用 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
 
 ## 构建与测试
 
-依赖：CMake ≥ 3.30、Ninja、GCC/Clang/MSVC（C++20）；Linux 需要 GTK4 ≥ 4.14、
+依赖：CMake ≥ 4.4、Ninja、支持 C++23 模块与 `import std` 的现代编译器（GCC ≥ 16 / Clang ≥ 21 + libc++ / MSVC）；Linux 源码构建需要 GTK4 ≥ 4.14、
 libepoxy、libsoup3 开发包。SQLite3 统一使用 [HuxerUI/Lib-SQLite](../HuxerUI-libs/Lib-SQLite) 自带源码（`3.53.4`，无重复 vendored 副本），ADBC 与 Lib-DataTable 均源码构建，开箱即编。
 
 ```sh
@@ -138,19 +138,21 @@ dbpp query  --redis redis://127.0.0.1:6379/0 "INFO server" --read-only --json
 ## 目录
 
 ```
+src/*.cppm             领域层 C++23 模块接口（dbpp.types / dbpp.settings / dbpp.adbc / dbpp.db / dbpp.cli 等）
 src/cli.*              无头 CLI 解析、JSON/TSV/CSV/表格输出、Agent 子命令分发
-src/adbc_session.*     ADBC 句柄、Arrow 流读取、对象/模式元数据、manifest 发现
+src/adbc_session.*     ADBC 句柄、Arrow 流读取、URI 拆解/拼装、多库命名、manifest 发现
 src/redis_client.*     内置零依赖 Redis RESP2/RESP3 客户端、键浏览器与命令控制台适配
 src/driver_installer.* ADBC Driver Registry 目录拉取、SHA-256 校验与安全安装/卸载
-src/db.cpp             表格分页、行编辑/删除/插入、SQL 异步封装
-src/app.cpp            HuxerUI 壳、侧栏、数据表、SQL 页、设置页、对话框
-src/theme.*            黑白主题与共享控件
+src/db.*               表格分页、行编辑/删除/插入、SQL 异步封装
+src/app.cpp            HuxerUI 壳、四层数据库侧栏、统一连接/编辑表单、数据表、SQL 页、设置页
+src/i18n.*             中/英双语解析（跟随系统 / 手动覆盖）与后端消息翻译
+src/theme.*            主题预设（theme_palette.*）、SemanticColors 分层 Token 与共享控件（PasswordField 等）
 src/instance.*         跨平台 GUI 单实例锁与唤出/文件转发通道
-src/tray.*             托盘运行时：图标/菜单、关闭策略、轻量级模式
-src/settings.*         settings.tsv 读写与应用级 SettingsModel
-resources/             运行时资源包（应用内 logo、托盘图标）
+src/tray.*             托盘运行时：图标/菜单（含深浅色原生菜单同步）、关闭策略、轻量级模式
+src/settings.*         dbpp.sqlite3 / 旧版 settings.tsv 读写与应用级 SettingsModel
+resources/             运行时资源包（数据库/密码显隐 SVG、logo、托盘图标、中/英双语 strings/*.properties）
 assets/                平台二进制图标（Linux icon.png、Windows icon.ico）
-cmake/                 构建模块（如 vendored SQLite3 探测 FindSQLite3.cmake）
+cmake/                 构建模块（CxxImportStdGate.cmake 与 vendored SQLite3 探测 FindSQLite3.cmake）
 third_party/           ADBC、Lib-DataTable 与 vendor 依赖
 platform/              平台入口与打包/安装器配置（desktop、WiX、plist、icns）
 tests/                 无窗口核心单元测试（CTest）

@@ -1,15 +1,3 @@
-#include "instance.h"
-
-#include <chrono>
-#include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <iostream>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <vector>
-
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -27,6 +15,9 @@
 #include <mach-o/dyld.h>
 #endif
 #endif
+
+import std;
+import dbpp.instance;
 
 namespace fs = std::filesystem;
 
