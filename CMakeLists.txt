@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.3.3 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.3.4 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -135,6 +135,7 @@ elseif (APPLE)
     list(APPEND DBPP_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/main.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/native_theme.mm")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/huxerui.cmake")
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND DBPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/platform/linux/main.cpp")
 endif ()
@@ -292,14 +293,34 @@ if (WIN32 AND COMMAND huxerui_configure_windows_project_package)
     if (DBPP_APP_INSTALL_COMPONENT AND NOT DBPP_APP_INSTALL_COMPONENT MATCHES "-NOTFOUND$")
         huxerui_configure_windows_project_package(dbpp "${DBPP_APP_INSTALL_COMPONENT}")
     endif ()
-elseif (APPLE AND NOT IOS AND COMMAND _huxerui_install_runtime_dependencies)
-    install(TARGETS dbpp
-            BUNDLE DESTINATION .
-            COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
-    )
-    _huxerui_install_runtime_dependencies(dbpp "${DBPP_APP_INSTALL_COMPONENT}"
-            "$<TARGET_FILE_NAME:dbpp>.app/Contents" "MacOS/$<TARGET_FILE_NAME:dbpp>"
-    )
+elseif (APPLE AND NOT IOS AND COMMAND huxerui_configure_macos_project_package)
+    if (DBPP_APP_INSTALL_COMPONENT AND NOT DBPP_APP_INSTALL_COMPONENT MATCHES "-NOTFOUND$")
+        huxerui_configure_macos_project_package(dbpp "${DBPP_APP_INSTALL_COMPONENT}")
+        if (HUXERUI_PACKAGE)
+            set(_dbpp_macos_runtime_dirs)
+            if (CMAKE_CXX_COMPILER)
+                get_filename_component(_dbpp_cxx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+                get_filename_component(_dbpp_cxx_prefix "${_dbpp_cxx_bin}" DIRECTORY)
+                foreach (_subdir IN ITEMS "lib/c++" "lib/unwind")
+                    if (IS_DIRECTORY "${_dbpp_cxx_prefix}/${_subdir}")
+                        list(APPEND _dbpp_macos_runtime_dirs "${_dbpp_cxx_prefix}/${_subdir}")
+                    endif ()
+                endforeach ()
+            endif ()
+            if (_dbpp_macos_runtime_dirs)
+                huxerui_add_runtime_dependencies(dbpp
+                        SEARCH_DIRECTORIES ${_dbpp_macos_runtime_dirs}
+                )
+            endif ()
+            get_target_property(DBPP_MACOS_RESOURCE_PACKAGE dbpp HUXERUI_RESOURCE_PACKAGE)
+            if (DBPP_MACOS_RESOURCE_PACKAGE AND NOT DBPP_MACOS_RESOURCE_PACKAGE MATCHES "-NOTFOUND$")
+                install(DIRECTORY "${DBPP_MACOS_RESOURCE_PACKAGE}/"
+                        DESTINATION "$<TARGET_FILE_NAME:dbpp>.app/Contents/Resources/HuxerUI"
+                        COMPONENT "${DBPP_APP_INSTALL_COMPONENT}"
+                )
+            endif ()
+        endif ()
+    endif ()
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND COMMAND _huxerui_install_runtime_dependencies)
     get_target_property(DBPP_LINUX_RESOURCE_PACKAGE dbpp HUXERUI_RESOURCE_PACKAGE)
     install(TARGETS dbpp

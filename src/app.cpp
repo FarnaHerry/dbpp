@@ -28,7 +28,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.3.3"
+#define DBPP_VERSION "0.3.4"
 #endif
 
 #include "theme_palette.h"
@@ -3792,6 +3792,69 @@ struct SidebarConnectionEntry {
                         .With(Frame{.width = 740.0F, .height = 560.0F}));
 }
 
+[[huxerui::composable]] View PageSizePopup(PopupContext popup, std::int64_t current_size,
+                                           std::function<void(std::int64_t)> on_apply) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const std::int64_t initial =
+      current_size > 0 ? std::clamp(current_size, kMinPageSize, kMaxPageSize) : kDefaultPageSize;
+  auto custom_input = UseState(TextEditingValue::FromText(std::to_string(initial)));
+  auto invalid = UseState(false);
+
+  const auto submit_custom = [custom_input, invalid, on_apply, popup] {
+    const std::optional<std::int64_t> parsed = TryParsePageSize(custom_input.Get().text);
+    if (!parsed.has_value()) {
+      invalid = true;
+      return;
+    }
+    invalid = false;
+    popup.Dismiss();
+    if (on_apply) {
+      on_apply(*parsed);
+    }
+  };
+
+  static constexpr std::int64_t kPresets[] = {50, 100, 200, 500, 1000};
+  Views preset_rows;
+  preset_rows.Reserve(std::size(kPresets));
+  for (const std::int64_t preset_size : kPresets) {
+    preset_rows.Add(NavItem(UseString(app::strings::table_page_size_option, preset_size), {},
+                            preset_size == initial,
+                            [on_apply, popup, preset_size] {
+                              popup.Dismiss();
+                              if (on_apply) {
+                                on_apply(preset_size);
+                              }
+                            })
+                        .Key("page-size-opt-" + std::to_string(preset_size)));
+  }
+
+  return Column{
+      Column{std::move(preset_rows)}.With(Spacing{2.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+      Divider(),
+      Caption(UseString(app::strings::table_page_size_custom_label)),
+      Row{
+          TextField(custom_input)
+              .Placeholder(app::strings::table_page_size_custom_ph)
+              .Variant(TextFieldVariant::Outlined)
+              .LineLimits(TextFieldLineLimits::SingleLine())
+              .OnChanged([custom_input, invalid](const TextEditingValue& val) {
+                custom_input = val;
+                if (invalid.Get()) {
+                  invalid = false;
+                }
+              })
+              .OnSubmitted(submit_custom)
+              .With(Grow(1.0F)),
+          ActionButton(Button(app::strings::action_apply).OnClick(submit_custom),
+                       ButtonTone::Primary),
+      }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Center}),
+      invalid.Get() ? ErrorText(UseString(app::strings::table_page_size_invalid)) : View{},
+  }.With(Frame{.width = 270.0F}, Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch},
+         Background{VisualFill{spec.colors.surface_container_highest}}, CornerRadius{10.0F},
+         Border{semantic.border_subtle, 1.0F}, Padding{EdgeInsets::Symmetric(10.0F, 10.0F)});
+}
+
 [[huxerui::composable]] View TableBrowserPage(
     State<AppModel> app, State<WorkspaceModel> workspace, std::uint64_t tab_id,
     TaskScope tasks, NotifyFn notify, AppThemeConfig theme_config, LanguageMode language_mode,
@@ -3803,6 +3866,8 @@ struct SidebarConnectionEntry {
   const auto menu = UseMenu();
   const auto sort_anchor = UseViewHandle();
   const auto page_size_anchor = UseViewHandle();
+  const auto page_size_popup = UsePopup();
+  const auto settings = UseService<SettingsModel>();
   auto live_drafts = UseState(std::make_shared<std::unordered_map<std::string, std::string>>());
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
@@ -4215,20 +4280,23 @@ struct SidebarConnectionEntry {
   View toolbar = Row{std::move(toolbar_items)}.With(CrossAlign{CrossAxisAlignment::Center},
                                                     Spacing{8.0F});
 
-  const auto change_page_size = [app, workspace, tasks, tab_id, notify,
+  const auto change_page_size = [app, workspace, tasks, tab_id, notify, settings,
                                  block_if_dirty](std::int64_t next_size) {
     if (block_if_dirty()) {
       return;
     }
+    const std::int64_t clamped = std::clamp(next_size, kMinPageSize, kMaxPageSize);
+    if (settings && settings->default_page_size.Get() != clamped) {
+      (void)settings->SetDefaultPageSize(clamped);
+    }
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
-    if (cur == nullptr || next_size <= 0 || cur->table.page_size == next_size) {
+    if (cur == nullptr || cur->table.page_size == clamped) {
       return;
     }
     RequestLoadTable(app, workspace, tasks, tab_id, 0, cur->table.sort, cur->table.filter, false,
-                     notify, next_size);
+                     notify, clamped);
   };
 
-  static constexpr std::int64_t kPageSizeOptions[] = {50, 100, 200, 500, 1000};
   const std::int64_t current_page_size = model.page_size > 0 ? model.page_size : kPageSize;
   View page_size_selector =
       Row{
@@ -4241,27 +4309,27 @@ struct SidebarConnectionEntry {
                 CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
                 Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
                 page_size_anchor, Enabled{model.pending_inserts.empty()})
-          .OnClick([menu, page_size_anchor, loc, change_page_size, current_page_size] {
-            std::vector<MenuEntry> entries;
-            entries.reserve(std::size(kPageSizeOptions));
-            for (const std::int64_t size : kPageSizeOptions) {
-              entries.emplace_back(
-                  MenuItem(loc.Fmt(app::strings::table_page_size_option, size),
-                           [change_page_size, size] { change_page_size(size); })
-                      .Checked(size == current_page_size));
-            }
-            menu.Show(page_size_anchor, std::move(entries),
-                      MenuOptions{
-                          .placement = {.side = AnchorSide::Above,
-                                        .alignment = AnchorAlignment::End},
-                          .gap = 4.0F,
-                          .viewport_margin = 8.0F,
-                          .offset = {},
-                          .width = std::nullopt,
-                          .dismiss_on_outside_press = true,
-                          .dismiss_on_cancel = true,
-                          .on_dismiss_request = {},
-                      });
+          .OnClick([page_size_popup, page_size_anchor, change_page_size, current_page_size,
+                    theme_config, language_mode, system_dark] {
+            page_size_popup.Show(
+                page_size_anchor,
+                [change_page_size, current_page_size, theme_config, language_mode,
+                 system_dark](PopupContext popup) {
+                  return WithDialogTheme(
+                      theme_config, language_mode, system_dark,
+                      PageSizePopup(popup, current_page_size, change_page_size));
+                },
+                PopupOptions{
+                    .placement = {.side = AnchorSide::Above, .alignment = AnchorAlignment::End},
+                    .gap = 4.0F,
+                    .viewport_margin = 8.0F,
+                    .offset = {},
+                    .dismiss_on_outside_press = true,
+                    .dismiss_on_cancel = true,
+                    .trap_focus = false,
+                    .retain_anchor_focus = false,
+                    .on_dismiss_request = {},
+                });
           });
 
   const std::int64_t page_count =
@@ -4519,13 +4587,18 @@ struct SidebarConnectionEntry {
 
 [[huxerui::composable]] View SqlPage(State<AppModel> app, State<WorkspaceModel> workspace,
                                      State<std::vector<ConnectionProfile>> profiles,
-                                     std::uint64_t tab_id, TaskScope tasks, NotifyFn notify) {
+                                     std::uint64_t tab_id, TaskScope tasks, NotifyFn notify,
+                                     AppThemeConfig theme_config, LanguageMode language_mode,
+                                     bool system_dark) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
+  const auto settings = UseService<SettingsModel>();
   const auto menu = UseMenu();
+  const auto limit_popup = UsePopup();
   const auto conn_anchor = UseViewHandle();
   const auto db_anchor = UseViewHandle();
+  const auto limit_anchor = UseViewHandle();
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Sql) {
     return TableEmptyState(app::strings::sql_tab_closed);
@@ -4565,7 +4638,7 @@ struct SidebarConnectionEntry {
                         ? tab->session_name + " (" + offline_tag + ")"
                         : loc.Get(app::strings::sql_select_connection)));
 
-  const auto run = [app, workspace, tab_id, tasks, notify, loc] {
+  const auto run = [app, workspace, settings, tab_id, tasks, notify, loc] {
     const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
     if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
       return;
@@ -4578,11 +4651,13 @@ struct SidebarConnectionEntry {
     std::shared_ptr<AdbcSession> adbc;
     bool session_found = false;
     bool session_is_redis = false;
+    Dialect session_dialect = Dialect::Generic;
     std::string target_database = TrimmedSql(cur_tab->sql.target_database);
     for (const DbSession& open : app.Get().sessions) {
       if (open.id == session_id) {
         session_found = true;
         adbc = open.session;
+        session_dialect = open.dialect;
         session_is_redis = (open.dialect == Dialect::Redis);
         if (target_database.empty()) {
           target_database = DefaultSessionDatabase(open);
@@ -4599,6 +4674,11 @@ struct SidebarConnectionEntry {
       return;
     }
 
+    const std::int64_t configured_limit =
+        settings ? settings->default_page_size.Get() : kDefaultPageSize;
+    const std::int64_t active_limit =
+        cur_tab->sql.page_size > 0 ? cur_tab->sql.page_size : configured_limit;
+
     const std::string running_status = loc.Get(app::strings::sql_running);
     workspace.Update([tab_id, running_status](WorkspaceModel& ws) {
       if (WorkspaceTab* target = ws.FindTab(tab_id)) {
@@ -4608,11 +4688,22 @@ struct SidebarConnectionEntry {
       }
     });
 
-    tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_is_redis,
-                  text, target_database, loc]() -> Task<void> {
+    tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_dialect,
+                  session_is_redis, text, target_database, active_limit, loc]() -> Task<void> {
       if (session_is_redis || IsSqlReadStatement(text)) {
+        const SqlLimitRewriteResult rewritten =
+            session_is_redis ? SqlLimitRewriteResult{}
+                             : ApplyImplicitSqlLimit(session_dialect, text, active_limit);
+        const std::string exec_sql = rewritten.applied ? rewritten.sql : text;
+        const std::size_t max_rows =
+            session_is_redis
+                ? kMaxQueryRows
+                : (rewritten.applied
+                       ? static_cast<std::size_t>(rewritten.effective_limit)
+                       : std::max<std::size_t>(kMaxQueryRows,
+                                               static_cast<std::size_t>(active_limit)));
         AdbcQueryResult result =
-            co_await ExecuteQueryAsync(adbc, text, true, kMaxQueryRows, target_database);
+            co_await ExecuteQueryAsync(adbc, exec_sql, true, max_rows, target_database);
         if (result.connection_lost) {
           const std::string message = result.error;
           workspace.Update([tab_id](WorkspaceModel& ws) {
@@ -4653,10 +4744,13 @@ struct SidebarConnectionEntry {
                               ComputeAutoColumnWidth(query->columns[i], i, query->snapshot.get()));
         }
         const std::size_t rows = query->snapshot->rows.size();
-        const std::string returned_status = loc.Fmt(
-            query->truncated ? app::strings::sql_returned_rows_truncated
-                             : app::strings::sql_returned_rows,
-            rows);
+        const std::string returned_status =
+            (rewritten.applied && query->truncated)
+                ? loc.Fmt(app::strings::sql_returned_rows_limited, rows,
+                          rewritten.effective_limit)
+                : loc.Fmt(query->truncated ? app::strings::sql_returned_rows_truncated
+                                           : app::strings::sql_returned_rows,
+                          rows);
         const std::string redis_current_db =
             (session_is_redis && adbc && adbc->redis)
                 ? ("db" + std::to_string(adbc->redis->CurrentDb()))
@@ -4970,6 +5064,59 @@ struct SidebarConnectionEntry {
           ? UseString(app::strings::sql_conn_disconnected)
           : sql_model.status;
 
+  const std::int64_t effective_page_size =
+      sql_model.page_size > 0
+          ? sql_model.page_size
+          : (settings ? settings->default_page_size.Get() : kDefaultPageSize);
+  View sql_limit_selector = View{};
+  if (!is_redis) {
+    sql_limit_selector =
+        Row{
+            Text(UseString(app::strings::sql_auto_limit_label, effective_page_size))
+                .Style(TextStyle{Font::System(font_size::kCaption).WithWeight(FontWeight::Medium),
+                                 spec.colors.on_surface}),
+            TintedIcon(app::images::chevron_down, spec.colors.on_surface_variant, 13.0F),
+        }
+            .With(Padding{EdgeInsets::Symmetric(8.0F, 4.0F)}, Spacing{6.0F},
+                  CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+                  Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F},
+                  limit_anchor, Enabled{!sql_model.running})
+            .OnClick([limit_popup, limit_anchor, workspace, tab_id, settings,
+                      effective_page_size, theme_config, language_mode, system_dark] {
+              const auto apply_limit = [workspace, tab_id, settings](std::int64_t next_size) {
+                const std::int64_t clamped = std::clamp(next_size, kMinPageSize, kMaxPageSize);
+                workspace.Update([tab_id, clamped](WorkspaceModel& ws) {
+                  if (WorkspaceTab* target = ws.FindTab(tab_id);
+                      target != nullptr && target->kind == WorkspaceTabKind::Sql) {
+                    target->sql.page_size = clamped;
+                  }
+                });
+                if (settings) {
+                  (void)settings->SetDefaultPageSize(clamped);
+                }
+              };
+              limit_popup.Show(
+                  limit_anchor,
+                  [apply_limit, effective_page_size, theme_config, language_mode,
+                   system_dark](PopupContext popup) {
+                    return WithDialogTheme(
+                        theme_config, language_mode, system_dark,
+                        PageSizePopup(popup, effective_page_size, apply_limit));
+                  },
+                  PopupOptions{
+                      .placement = {.side = AnchorSide::Below, .alignment = AnchorAlignment::End},
+                      .gap = 4.0F,
+                      .viewport_margin = 8.0F,
+                      .offset = {},
+                      .dismiss_on_outside_press = true,
+                      .dismiss_on_cancel = true,
+                      .trap_focus = false,
+                      .retain_anchor_focus = false,
+                      .on_dismiss_request = {},
+                  });
+            });
+  }
+
   return Column{
       Row{
           DatabaseIcon(current_brand, 20.0F),
@@ -5001,9 +5148,10 @@ struct SidebarConnectionEntry {
       Row{
           MutedText(status_display),
           Spacer(),
+          std::move(sql_limit_selector),
           MutedText(UseString(is_redis ? app::strings::sql_hint_redis
                                        : app::strings::sql_hint_sql)),
-      }.With(CrossAlign{CrossAxisAlignment::Center}),
+      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{10.0F}),
       std::move(result_view),
   }.With(Grow(1.0F), Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 }
@@ -5109,6 +5257,17 @@ struct SidebarConnectionEntry {
   auto mcp_host_input = UseState(TextEditingValue::FromText(settings->mcp_host.Get()));
   auto mcp_port_input =
       UseState(TextEditingValue::FromText(std::to_string(settings->mcp_port.Get())));
+  const std::int64_t persisted_page_size = settings->default_page_size.Get();
+  auto page_size_input = UseState(TextEditingValue::FromText(std::to_string(persisted_page_size)));
+  Lifecycle(
+      [page_size_input, persisted_page_size] {
+        const std::string expected = std::to_string(persisted_page_size);
+        if (page_size_input.Get().text != expected) {
+          page_size_input = TextEditingValue::FromText(expected);
+        }
+        return [] {};
+      },
+      persisted_page_size);
   // 动画互斥旗标放 shared_ptr 里改：不经过 State 更新，防抖期间不触发重组。
   struct ThemeAnimationFlag {
     bool animating = false;
@@ -5255,6 +5414,42 @@ struct SidebarConnectionEntry {
             }),
         Caption(UseString(app::strings::settings_section_palette)),
         Column{std::move(preset_rows)}.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
+        Divider(),
+        Caption(UseString(app::strings::settings_section_query)),
+        [&]() -> View {
+          const auto apply_page_size = [settings, page_size_input, notify, loc] {
+            const std::optional<std::int64_t> parsed =
+                TryParsePageSize(page_size_input.Get().text);
+            if (!parsed.has_value()) {
+              if (notify) {
+                notify(loc.Get(app::strings::table_page_size_invalid));
+              }
+              return;
+            }
+            (void)settings->SetDefaultPageSize(*parsed);
+            page_size_input = TextEditingValue::FromText(std::to_string(*parsed));
+            if (notify) {
+              notify(loc.Fmt(app::strings::toast_page_size_applied, *parsed));
+            }
+          };
+          return Column{
+              Row{
+                  TextField(page_size_input)
+                      .Label(app::strings::settings_default_page_size_label)
+                      .Placeholder(app::strings::table_page_size_custom_ph)
+                      .Variant(TextFieldVariant::Outlined)
+                      .LineLimits(TextFieldLineLimits::SingleLine())
+                      .OnChanged([page_size_input](const TextEditingValue& val) {
+                        page_size_input = val;
+                      })
+                      .OnSubmitted(apply_page_size)
+                      .With(Grow(1.0F)),
+                  ActionButton(Button(app::strings::action_apply).OnClick(apply_page_size),
+                               ButtonTone::Primary),
+              }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
+              MutedText(UseString(app::strings::settings_default_page_size_hint)),
+          }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+        }(),
         Divider(),
         Caption(UseString(app::strings::settings_section_tray)),
         Switch(app::strings::settings_tray_enable, settings->tray_enabled)
@@ -5520,6 +5715,15 @@ struct SidebarConnectionEntry {
       system_dark);
   const AppThemeConfig theme_config = settings_model->ThemeConfig();
   const LanguageMode language_mode = settings_model->language.Get();
+  const std::int64_t default_page_size = settings_model->default_page_size.Get();
+  Lifecycle(
+      [app, default_page_size] {
+        app.Update([default_page_size](AppModel& model) {
+          model.default_page_size = default_page_size;
+        });
+        return [] {};
+      },
+      default_page_size);
   const ResolvedTheme resolved = ResolveTheme(theme_config, system_dark);
   const ThemeSpec& spec = resolved.spec;
   const SemanticColors& semantic = resolved.semantic;
@@ -5887,7 +6091,8 @@ struct SidebarConnectionEntry {
                                      theme_config, language_mode, system_dark)
                         .Key("tab-body-" + std::to_string(active_tab->id));
     } else {
-      active_body = SqlPage(app, workspace, profiles, active_tab->id, tasks, notify)
+      active_body = SqlPage(app, workspace, profiles, active_tab->id, tasks, notify,
+                            theme_config, language_mode, system_dark)
                         .Key("tab-body-" + std::to_string(active_tab->id));
     }
 

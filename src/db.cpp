@@ -44,6 +44,15 @@ std::string LowerAsciiCopy(std::string_view text) {
   return out;
 }
 
+std::string UpperAsciiCopy(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char ch : text) {
+    out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+  }
+  return out;
+}
+
 bool ContainsIgnoreCaseCopy(std::string_view haystack, std::string_view needle) {
   return LowerAsciiCopy(haystack).find(LowerAsciiCopy(needle)) != std::string::npos;
 }
@@ -1602,6 +1611,8 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
     return;
   }
 
+  const std::int64_t initial_page_size =
+      app.Get().default_page_size > 0 ? app.Get().default_page_size : kPageSize;
   std::uint64_t created_id = 0;
   workspace.Update([&](WorkspaceModel& ws) {
     WorkspaceTab tab;
@@ -1615,6 +1626,7 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
     tab.object_name = std::move(object);
     tab.object_schema = std::move(db_schema);
     tab.is_view = is_view;
+    tab.table.page_size = initial_page_size;
     ws.tabs.push_back(std::move(tab));
     ws.active_tab_id = created_id;
   });
@@ -1624,7 +1636,7 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
     model.error.clear();
   });
   RequestLoadTable(app, workspace, tasks, created_id, 0, std::nullopt, {}, false,
-                   std::move(notify));
+                   std::move(notify), initial_page_size);
 }
 
 void OpenConnection(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
@@ -2377,6 +2389,262 @@ std::vector<std::string> ReorderConnectionKeys(const std::vector<std::string>& n
   ordered.erase(ordered.begin() + static_cast<std::ptrdiff_t>(from_idx));
   ordered.insert(ordered.begin() + static_cast<std::ptrdiff_t>(to_idx), std::move(moved));
   return ordered;
+}
+
+SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect, std::string_view sql,
+                                            std::int64_t page_size) {
+  if (dialect == Dialect::Redis || page_size <= 0) {
+    return {std::string(sql), false, 0};
+  }
+
+  struct Depth0Token {
+    bool is_word = false;
+    std::string upper;
+  };
+  std::vector<Depth0Token> depth0_tokens;
+  int depth = 0;
+  bool seen_semicolon = false;
+  std::size_t body_end = 0;
+  std::size_t i = 0;
+  const std::size_t n = sql.size();
+
+  const auto is_word_start = [](unsigned char ch) {
+    return std::isalpha(ch) != 0 || ch == '_';
+  };
+  const auto is_word_char = [](unsigned char ch) {
+    return std::isalnum(ch) != 0 || ch == '_';
+  };
+
+  while (i < n) {
+    const unsigned char ch = static_cast<unsigned char>(sql[i]);
+    if (std::isspace(ch) != 0) {
+      ++i;
+      continue;
+    }
+    if (ch == '-' && i + 1 < n && sql[i + 1] == '-') {
+      i += 2;
+      while (i < n && sql[i] != '\n') {
+        ++i;
+      }
+      continue;
+    }
+    if (ch == '/' && i + 1 < n && sql[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < n && !(sql[i] == '*' && sql[i + 1] == '/')) {
+        ++i;
+      }
+      i = (i + 1 < n) ? (i + 2) : n;
+      continue;
+    }
+
+    if (depth == 0 && ch == ';') {
+      seen_semicolon = true;
+      ++i;
+      continue;
+    }
+    if (seen_semicolon) {
+      return {std::string(sql), false, 0};
+    }
+
+    if (ch == '\'') {
+      ++i;
+      while (i < n) {
+        if (dialect == Dialect::Mysql && sql[i] == '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (sql[i] == '\'') {
+          if (i + 1 < n && sql[i + 1] == '\'') {
+            i += 2;
+            continue;
+          }
+          ++i;
+          break;
+        }
+        ++i;
+      }
+      body_end = i;
+      if (depth == 0) {
+        depth0_tokens.push_back({false, {}});
+      }
+      continue;
+    }
+
+    if (ch == '"' || ch == '`') {
+      const char quote = static_cast<char>(ch);
+      ++i;
+      while (i < n) {
+        if (sql[i] == quote) {
+          if (i + 1 < n && sql[i + 1] == quote) {
+            i += 2;
+            continue;
+          }
+          ++i;
+          break;
+        }
+        ++i;
+      }
+      body_end = i;
+      if (depth == 0) {
+        depth0_tokens.push_back({false, {}});
+      }
+      continue;
+    }
+
+    if (ch == '[') {
+      ++i;
+      while (i < n) {
+        if (sql[i] == ']') {
+          if (i + 1 < n && sql[i + 1] == ']') {
+            i += 2;
+            continue;
+          }
+          ++i;
+          break;
+        }
+        ++i;
+      }
+      body_end = i;
+      if (depth == 0) {
+        depth0_tokens.push_back({false, {}});
+      }
+      continue;
+    }
+
+    if (ch == '$') {
+      std::size_t tag_end = i + 1;
+      while (tag_end < n && is_word_char(static_cast<unsigned char>(sql[tag_end]))) {
+        ++tag_end;
+      }
+      if (tag_end < n && sql[tag_end] == '$') {
+        const std::string_view tag = sql.substr(i, tag_end - i + 1);
+        const std::size_t close_pos = sql.find(tag, tag_end + 1);
+        if (close_pos != std::string_view::npos) {
+          i = close_pos + tag.size();
+          body_end = i;
+          if (depth == 0) {
+            depth0_tokens.push_back({false, {}});
+          }
+          continue;
+        }
+      }
+    }
+
+    if (ch == '(') {
+      if (depth == 0) {
+        depth0_tokens.push_back({false, {}});
+      }
+      ++depth;
+      ++i;
+      body_end = i;
+      continue;
+    }
+
+    if (ch == ')') {
+      if (depth > 0) {
+        --depth;
+      }
+      ++i;
+      body_end = i;
+      if (depth == 0) {
+        depth0_tokens.push_back({false, {}});
+      }
+      continue;
+    }
+
+    if (is_word_start(ch)) {
+      const std::size_t start = i;
+      ++i;
+      while (i < n && is_word_char(static_cast<unsigned char>(sql[i]))) {
+        ++i;
+      }
+      body_end = i;
+      if (depth == 0) {
+        depth0_tokens.push_back({true, UpperAsciiCopy(sql.substr(start, i - start))});
+      }
+      continue;
+    }
+
+    ++i;
+    body_end = i;
+    if (depth == 0) {
+      depth0_tokens.push_back({false, {}});
+    }
+  }
+
+  if (depth0_tokens.empty() || !depth0_tokens.front().is_word || body_end == 0) {
+    return {std::string(sql), false, 0};
+  }
+
+  const auto is_select_top = [&](std::size_t select_index) {
+    if (select_index + 1 >= depth0_tokens.size() || !depth0_tokens[select_index + 1].is_word) {
+      return false;
+    }
+    const std::string& next = depth0_tokens[select_index + 1].upper;
+    if (next == "TOP") {
+      return true;
+    }
+    if ((next == "DISTINCT" || next == "ALL") && select_index + 2 < depth0_tokens.size() &&
+        depth0_tokens[select_index + 2].is_word &&
+        depth0_tokens[select_index + 2].upper == "TOP") {
+      return true;
+    }
+    return false;
+  };
+
+  const std::string& first = depth0_tokens.front().upper;
+  if (first == "SELECT") {
+    if (is_select_top(0)) {
+      return {std::string(sql), false, 0};
+    }
+  } else if (first == "WITH") {
+    bool found_read_verb = false;
+    for (std::size_t idx = 1; idx < depth0_tokens.size(); ++idx) {
+      if (!depth0_tokens[idx].is_word) {
+        continue;
+      }
+      const std::string& word = depth0_tokens[idx].upper;
+      if (word == "SELECT" || word == "TABLE" || word == "VALUES") {
+        if (word == "SELECT" && is_select_top(idx)) {
+          return {std::string(sql), false, 0};
+        }
+        found_read_verb = true;
+        break;
+      }
+      if (word == "INSERT" || word == "UPDATE" || word == "DELETE" || word == "MERGE") {
+        return {std::string(sql), false, 0};
+      }
+    }
+    if (!found_read_verb) {
+      return {std::string(sql), false, 0};
+    }
+  } else if (first != "TABLE") {
+    return {std::string(sql), false, 0};
+  }
+
+  for (const Depth0Token& token : depth0_tokens) {
+    if (!token.is_word) {
+      continue;
+    }
+    if (token.upper == "LIMIT" || token.upper == "FETCH" || token.upper == "OFFSET" ||
+        token.upper == "FOR" || token.upper == "INTO" || token.upper == "LOCK") {
+      return {std::string(sql), false, 0};
+    }
+  }
+
+  const std::int64_t limit = std::clamp(page_size, kMinPageSize, kMaxPageSize);
+  std::string_view body = sql.substr(0, body_end);
+  while (!body.empty() && std::isspace(static_cast<unsigned char>(body.back())) != 0) {
+    body.remove_suffix(1);
+  }
+  if (body.empty()) {
+    return {std::string(sql), false, 0};
+  }
+  return SqlLimitRewriteResult{
+      .sql = std::string(body) + "\nLIMIT " + std::to_string(limit + 1),
+      .applied = true,
+      .effective_limit = limit,
+  };
 }
 
 } // namespace dbpp

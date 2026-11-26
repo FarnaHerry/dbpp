@@ -1021,6 +1021,21 @@ void TestMcpSettingsPersistence(const fs::path& dir) {
   Expect(loaded.mcp_enabled && loaded.mcp_host == "127.0.0.1" && loaded.mcp_port == 19200 &&
              !loaded.mcp_read_only,
          "LoadTraySettings MCP roundtrip mismatch");
+
+  Expect(dbpp::TryParsePageSize("250") == std::optional<std::int64_t>{250},
+         "TryParsePageSize valid input mismatch");
+  Expect(!dbpp::TryParsePageSize("0").has_value() &&
+             !dbpp::TryParsePageSize("100001").has_value() &&
+             !dbpp::TryParsePageSize("abc").has_value(),
+         "TryParsePageSize should reject out-of-range or non-numeric values");
+  Expect(dbpp::ParsePageSize("bad", 200) == 200, "ParsePageSize fallback mismatch");
+
+  dbpp::TraySettings page_saved = loaded;
+  page_saved.default_page_size = 250;
+  Expect(dbpp::SaveTraySettings(cfg_db.string(), page_saved),
+         "SaveTraySettings default_page_size failed");
+  const dbpp::TraySettings page_loaded = dbpp::LoadTraySettings(cfg_db.string());
+  Expect(page_loaded.default_page_size == 250, "LoadTraySettings default_page_size mismatch");
 }
 
 void TestSqlDatabaseContextHelpers() {
@@ -1092,6 +1107,114 @@ void TestSqlDatabaseContextHelpers() {
          "Redis session database list/default mismatch");
 }
 
+void TestImplicitSqlLimitAndExecution(const fs::path& dir, const std::string& driver_path) {
+  {
+    const auto r = dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items", 100);
+    Expect(r.applied && r.effective_limit == 100 && r.sql == "SELECT * FROM items\nLIMIT 101",
+           "Bare SELECT implicit LIMIT rewrite mismatch");
+  }
+  {
+    const auto r = dbpp::ApplyImplicitSqlLimit(
+        dbpp::Dialect::Sqlite, "SELECT * FROM items; -- trailing comment", 50);
+    Expect(r.applied && r.effective_limit == 50 && r.sql == "SELECT * FROM items\nLIMIT 51",
+           "SELECT with semicolon and trailing comment rewrite mismatch");
+  }
+  {
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items LIMIT 10", 100)
+                .applied,
+           "Explicit LIMIT should not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(
+                dbpp::Dialect::Postgresql, "SELECT * FROM items FETCH FIRST 10 ROWS ONLY", 100)
+                .applied,
+           "FETCH FIRST should not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Generic, "SELECT TOP 10 * FROM items", 100)
+                .applied,
+           "SELECT TOP should not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Postgresql, "SELECT * FROM items FOR UPDATE",
+                                        100)
+                .applied,
+           "FOR UPDATE should not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Postgresql, "SELECT * FROM items OFFSET 5",
+                                        100)
+                .applied,
+           "OFFSET should not be rewritten");
+  }
+  {
+    const auto r = dbpp::ApplyImplicitSqlLimit(
+        dbpp::Dialect::Sqlite, "SELECT * FROM (SELECT * FROM items LIMIT 5) t", 100);
+    Expect(r.applied &&
+               r.sql == "SELECT * FROM (SELECT * FROM items LIMIT 5) t\nLIMIT 101",
+           "Subquery LIMIT should still allow outer implicit LIMIT");
+  }
+  {
+    const auto r = dbpp::ApplyImplicitSqlLimit(
+        dbpp::Dialect::Sqlite, "SELECT 'LIMIT 5' AS txt FROM items", 100);
+    Expect(r.applied && r.sql == "SELECT 'LIMIT 5' AS txt FROM items\nLIMIT 101",
+           "Quoted LIMIT literal should not block outer implicit LIMIT");
+  }
+  {
+    const auto r = dbpp::ApplyImplicitSqlLimit(
+        dbpp::Dialect::Sqlite, "WITH cte AS (SELECT * FROM items) SELECT * FROM cte", 100);
+    Expect(r.applied &&
+               r.sql == "WITH cte AS (SELECT * FROM items) SELECT * FROM cte\nLIMIT 101",
+           "Read-only WITH CTE implicit LIMIT mismatch");
+  }
+  {
+    Expect(!dbpp::ApplyImplicitSqlLimit(
+                dbpp::Dialect::Postgresql, "WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c",
+                100)
+                .applied,
+           "Writable WITH CTE must not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "PRAGMA table_info(items)", 100)
+                .applied,
+           "PRAGMA must not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT 1; SELECT 2;", 100)
+                .applied,
+           "Multi-statement SQL must not be rewritten");
+    Expect(!dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Redis, "KEYS *", 100).applied,
+           "Redis dialect must not rewrite queries");
+  }
+
+  const fs::path db_file = dir / "implicit_limit_test.sqlite3";
+  const dbpp::AdbcOpenResult opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = driver_path,
+      .uri = db_file.string(),
+      .username = {},
+      .password = {},
+      .title = {},
+  });
+  Expect(opened.session != nullptr, "Failed to open SQLite DB for implicit LIMIT test");
+  if (!opened.session) {
+    return;
+  }
+  Expect(dbpp::ExecuteBlocking(*opened.session,
+                               "CREATE TABLE items (id INTEGER PRIMARY KEY);", false, 0)
+             .error.empty(),
+         "CREATE TABLE items failed");
+  for (int i = 1; i <= 15; ++i) {
+    Expect(dbpp::ExecuteBlocking(*opened.session,
+                                 "INSERT INTO items (id) VALUES (" + std::to_string(i) + ");",
+                                 false, 0)
+               .error.empty(),
+           "INSERT item failed");
+  }
+
+  const auto limited =
+      dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 5);
+  Expect(limited.applied, "Expected implicit LIMIT 5 to apply");
+  const dbpp::AdbcQueryResult five =
+      dbpp::ExecuteBlocking(*opened.session, limited.sql, true, 5);
+  Expect(five.error.empty() && five.rows.size() == 5 && five.truncated,
+         "Expected 5 rows with truncated=true under implicit LIMIT 5");
+
+  const auto larger =
+      dbpp::ApplyImplicitSqlLimit(dbpp::Dialect::Sqlite, "SELECT * FROM items ORDER BY id", 20);
+  const dbpp::AdbcQueryResult all =
+      dbpp::ExecuteBlocking(*opened.session, larger.sql, true, 20);
+  Expect(all.error.empty() && all.rows.size() == 15 && !all.truncated,
+         "Expected all 15 rows with truncated=false under implicit LIMIT 20");
+}
+
 } // namespace
 
 int main() {
@@ -1112,6 +1235,7 @@ int main() {
   TestEditTableDdlGenerationAndExecution(temp.path, driver_path);
   TestMcpSettingsPersistence(temp.path);
   TestSqlDatabaseContextHelpers();
+  TestImplicitSqlLimitAndExecution(temp.path, driver_path);
 
   if (g_failures != 0) {
     std::cerr << g_failures << " test assertion(s) failed\n";

@@ -36,6 +36,7 @@ struct AppModel {
   std::string status;
   std::string error;
   std::uint64_t next_session_id = 1;
+  std::int64_t default_page_size = kPageSize;
   int revision = 0;
 
   [[nodiscard]] const DbSession* ActiveSession() const {
@@ -82,6 +83,15 @@ struct AdbcManagerContext {
   NotifyFn notify;
 };
 
+struct SqlLimitRewriteResult {
+  std::string sql;
+  bool applied = false;
+  std::int64_t effective_limit = 0;
+};
+
+[[nodiscard]] SqlLimitRewriteResult ApplyImplicitSqlLimit(Dialect dialect,
+                                                          std::string_view sql,
+                                                          std::int64_t page_size);
 [[nodiscard]] std::string SingleLineCellPreview(std::string_view text);
 [[nodiscard]] float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
                                            const GridSnapshot* snapshot);

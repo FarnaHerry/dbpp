@@ -452,14 +452,15 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DHUXERUI_PACKAGE=ON \
             -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
             -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
             -DCMAKE_OBJCXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
             -DCMAKE_CXX_FLAGS='-stdlib=libc++ -D_LIBCPP_DISABLE_AVAILABILITY' \
             -DCMAKE_OBJCXX_FLAGS='-stdlib=libc++ -D_LIBCPP_DISABLE_AVAILABILITY' \
-            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
-            -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -lc++ -lc++abi -lunwind" \
+            -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -Wl,-rpath,$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/unwind -Wl,-headerpad_max_install_names -lc++ -lc++abi -lunwind" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -Wl,-rpath,$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/unwind -Wl,-headerpad_max_install_names -lc++ -lc++abi -lunwind" \
+            -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++ -L$LLVM_PREFIX/lib/c++ -L$LLVM_PREFIX/lib/unwind -Wl,-rpath,$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/unwind -Wl,-headerpad_max_install_names -lc++ -lc++abi -lunwind" \
             -DCMAKE_CXX_STDLIB_MODULES_JSON="$LLVM_PREFIX/lib/libc++.modules.json" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DDBPP_BUILD_TESTS=ON -DDBPP_USE_VENDORED_SQLITE3=ON
@@ -470,18 +471,42 @@ jobs:
       - name: Smoke test
         run: ctest --test-dir build --output-on-failure --no-tests=error --timeout 120
 
-      - name: Stage app bundle
+      - name: Package macOS DMG
         run: |
           set -euo pipefail
+          plan_path="build/huxerui-integration/dbpp/Release/app.json"
+          test -f "$plan_path"
+          IFS=$'\t' read -r app_name app_target app_version install_component < <(python3 - "$plan_path" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1]))
+          print(f'{plan["name"]}\t{plan["target"]}\t{plan["version"]}\t{plan["installComponent"]}')
+          PY
+          )
+          package_root=".huxerui/package/macos/release"
+          staging="$package_root/staging"
+          dmg_path="$package_root/${app_target}-${app_version}.dmg"
+          cmake -E rm -rf "$staging"
+          cmake -E make_directory "$staging"
+          cmake --install build --config Release --component "$install_component" --prefix "$staging"
+
+          bundle="$staging/${app_target}.app"
+          test -d "$bundle"
+          test -x "$bundle/Contents/MacOS/${app_target}"
+          test -f "$bundle/Contents/Resources/HuxerUI/huxerui/resources.bin"
+          test -f "$bundle/Contents/Resources/AppIcon.icns"
+          find "$bundle/Contents/Frameworks" -maxdepth 1 -name 'libhuxerui*.dylib' | grep -q .
+          ls "$bundle/Contents/Frameworks"/libadbc_driver_manager*.dylib >/dev/null
+          ls "$bundle/Contents/Frameworks"/libadbc_driver_sqlite*.dylib >/dev/null
+          codesign --verify --deep --strict "$bundle"
+          "$bundle/Contents/MacOS/${app_target}" --version
+
+          cmake -E create_symlink /Applications "$staging/Applications"
+          hdiutil create -volname "$app_name" -srcfolder "$staging" -format UDZO -ov "$dmg_path"
+          test -s "$dmg_path"
           rm -rf dist-src
-          cmake --install build --config Release --component HuxerUIApplication --prefix "$PWD/dist-src"
-          test -x dist-src/dbpp.app/Contents/MacOS/dbpp
-          test -f dist-src/dbpp.app/Contents/Resources/HuxerUI/huxerui/resources.bin
-          test -f dist-src/dbpp.app/Contents/Frameworks/libhuxerui.dylib
-          ls dist-src/dbpp.app/Contents/Frameworks/libadbc_driver_manager*.dylib >/dev/null
-          ls dist-src/dbpp.app/Contents/Frameworks/libadbc_driver_sqlite*.dylib >/dev/null
-          codesign --verify --deep --strict dist-src/dbpp.app
-          ls -la dist-src/dbpp.app/Contents dist-src/dbpp.app/Contents/Frameworks
+          mkdir -p dist-src
+          cp "$dmg_path" dist-src/
+          ls -lh dist-src/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
@@ -540,7 +565,11 @@ jobs:
               done
             elif [[ "$name" == build-macos-* ]]; then
               arch="${name#build-macos-}"
-              tar -C dist -czf "release/dbpp-${release_version}-macos-${arch}.tar.gz" "$name"
+              shopt -s nullglob
+              dmgs=("$artifact"/*.dmg)
+              test "${#dmgs[@]}" -eq 1
+              test -s "${dmgs[0]}"
+              cp "${dmgs[0]}" "release/dbpp-${release_version}-macos-${arch}.dmg"
             else
               echo "Unsupported build artifact: $name" >&2
               exit 1
@@ -548,7 +577,7 @@ jobs:
           done
           test -s "release/dbpp-${release_version}-windows-x86_64.zip"
           test -s "release/dbpp-${release_version}-windows-x86_64.exe"
-          test -s "release/dbpp-${release_version}-macos-arm64.tar.gz"
+          test -s "release/dbpp-${release_version}-macos-arm64.dmg"
           for arch in x86_64 aarch64; do
             test -s "release/dbpp-${release_version}-linux-${arch}.tar.gz"
             test -s "release/dbpp-${release_version}-linux-${arch}.deb"

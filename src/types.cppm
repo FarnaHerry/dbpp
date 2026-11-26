@@ -223,6 +223,7 @@ struct QueryResult {
 struct SqlModel {
   huxerui::TextEditingValue editor;
   std::string target_database;
+  std::int64_t page_size = 0;
   std::shared_ptr<const QueryResult> result;
   std::unordered_map<std::string, float> column_widths;
   std::uint64_t next_result_id = 1;

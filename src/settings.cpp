@@ -443,6 +443,29 @@ std::string NormalizeMcpHost(std::string_view host) {
   return trimmed.empty() ? std::string("127.0.0.1") : trimmed;
 }
 
+std::optional<std::int64_t> TryParsePageSize(std::string_view text) noexcept {
+  const std::string trimmed = TrimAsciiCopy(text);
+  if (trimmed.empty()) {
+    return std::nullopt;
+  }
+  std::int64_t value = 0;
+  const char* begin = trimmed.data();
+  const char* end_ptr = trimmed.data() + trimmed.size();
+  const auto [end, ec] = std::from_chars(begin, end_ptr, value);
+  if (ec != std::errc{} || end != end_ptr || value < kMinPageSize || value > kMaxPageSize) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::int64_t ParsePageSize(std::string_view text, std::int64_t fallback) noexcept {
+  const std::optional<std::int64_t> parsed = TryParsePageSize(text);
+  if (parsed.has_value()) {
+    return *parsed;
+  }
+  return std::clamp(fallback, kMinPageSize, kMaxPageSize);
+}
+
 TraySettings LoadTraySettings(const std::string& path) {
   TraySettings settings;
   if (path.empty()) {
@@ -468,6 +491,8 @@ TraySettings LoadTraySettings(const std::string& path) {
       settings.mcp_port = ParseMcpPort(value);
     } else if (key == kSettingMcpReadOnly) {
       settings.mcp_read_only = value != "false";
+    } else if (key == kSettingDefaultPageSize) {
+      settings.default_page_size = ParsePageSize(value);
     }
   };
 
@@ -500,7 +525,8 @@ TraySettings LoadTraySettings(const std::string& path) {
           conn.db,
           "SELECT key, value FROM settings "
           "WHERE key IN ('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', "
-          "'ui.language', 'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only');",
+          "'ui.language', 'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only', "
+          "'query.page_size');",
           -1, &stmt.stmt, nullptr) != SQLITE_OK) {
     return settings;
   }
@@ -543,7 +569,9 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
              << kSettingMcpEnabled << '\t' << FlagText(settings.mcp_enabled) << '\n'
              << kSettingMcpHost << '\t' << NormalizeMcpHost(settings.mcp_host) << '\n'
              << kSettingMcpPort << '\t' << settings.mcp_port << '\n'
-             << kSettingMcpReadOnly << '\t' << FlagText(settings.mcp_read_only) << '\n';
+             << kSettingMcpReadOnly << '\t' << FlagText(settings.mcp_read_only) << '\n'
+             << kSettingDefaultPageSize << '\t'
+             << std::clamp(settings.default_page_size, kMinPageSize, kMaxPageSize) << '\n';
       stream.flush();
       if (!stream) {
         std::error_code cleanup_error;
@@ -590,6 +618,8 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
       {kSettingMcpHost, NormalizeMcpHost(settings.mcp_host)},
       {kSettingMcpPort, std::to_string(settings.mcp_port)},
       {kSettingMcpReadOnly, std::string(FlagText(settings.mcp_read_only))},
+      {kSettingDefaultPageSize,
+       std::to_string(std::clamp(settings.default_page_size, kMinPageSize, kMaxPageSize))},
   };
 
   StmtGuard upsert;
@@ -631,6 +661,7 @@ void SettingsModel::Load() {
   mcp_host = NormalizeMcpHost(settings.mcp_host);
   mcp_port = settings.mcp_port;
   mcp_read_only = settings.mcp_read_only;
+  default_page_size = settings.default_page_size;
 }
 
 TraySettings SettingsModel::Snapshot() const {
@@ -644,6 +675,7 @@ TraySettings SettingsModel::Snapshot() const {
       .mcp_host = NormalizeMcpHost(mcp_host.Get()),
       .mcp_port = mcp_port.Get(),
       .mcp_read_only = mcp_read_only.Get(),
+      .default_page_size = default_page_size.Get(),
   };
 }
 
@@ -732,6 +764,16 @@ bool SettingsModel::SetMcpReadOnly(bool read_only) {
   mcp_read_only = read_only;
   if (persist_setting) {
     persist_setting(std::string(kSettingMcpReadOnly), std::string(FlagText(read_only)));
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetDefaultPageSize(std::int64_t page_size) {
+  const std::int64_t effective = std::clamp(page_size, kMinPageSize, kMaxPageSize);
+  default_page_size = effective;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingDefaultPageSize), std::to_string(effective));
     return true;
   }
   return SaveTraySettings(path, Snapshot());

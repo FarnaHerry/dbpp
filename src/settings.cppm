@@ -17,7 +17,11 @@ inline constexpr std::string_view kSettingMcpEnabled = "mcp.enabled";
 inline constexpr std::string_view kSettingMcpHost = "mcp.host";
 inline constexpr std::string_view kSettingMcpPort = "mcp.port";
 inline constexpr std::string_view kSettingMcpReadOnly = "mcp.read_only";
+inline constexpr std::string_view kSettingDefaultPageSize = "query.page_size";
 inline constexpr std::uint16_t kDefaultMcpPort = 18765;
+inline constexpr std::int64_t kDefaultPageSize = 100;
+inline constexpr std::int64_t kMinPageSize = 1;
+inline constexpr std::int64_t kMaxPageSize = 100000;
 
 enum class ThemeMode {
   System = 0,
@@ -65,6 +69,7 @@ struct TraySettings {
   std::string mcp_host = "127.0.0.1";
   std::uint16_t mcp_port = kDefaultMcpPort;
   bool mcp_read_only = true;
+  std::int64_t default_page_size = kDefaultPageSize;
 
   bool operator==(const TraySettings&) const = default;
 };
@@ -93,6 +98,7 @@ struct SettingsModel {
   huxerui::State<std::string> mcp_host{"127.0.0.1"};
   huxerui::State<std::uint16_t> mcp_port{kDefaultMcpPort};
   huxerui::State<bool> mcp_read_only{true};
+  huxerui::State<std::int64_t> default_page_size{kDefaultPageSize};
   std::string path;
   std::function<void(std::string, std::string)> persist_setting;
 
@@ -106,6 +112,7 @@ struct SettingsModel {
   bool SetMcpHost(std::string host);
   bool SetMcpPort(std::uint16_t port);
   bool SetMcpReadOnly(bool read_only);
+  bool SetDefaultPageSize(std::int64_t page_size);
 
   [[nodiscard]] TraySettings Snapshot() const;
   [[nodiscard]] AppThemeConfig ThemeConfig() const;
@@ -114,5 +121,8 @@ struct SettingsModel {
 [[nodiscard]] std::uint16_t ParseMcpPort(std::string_view text,
                                          std::uint16_t fallback = kDefaultMcpPort) noexcept;
 [[nodiscard]] std::string NormalizeMcpHost(std::string_view host);
+[[nodiscard]] std::optional<std::int64_t> TryParsePageSize(std::string_view text) noexcept;
+[[nodiscard]] std::int64_t ParsePageSize(std::string_view text,
+                                         std::int64_t fallback = kDefaultPageSize) noexcept;
 
 } // namespace dbpp
