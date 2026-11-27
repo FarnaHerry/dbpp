@@ -56,95 +56,16 @@ using namespace dbpp::ui;
   const auto apply_draft_value = [workspace, tab_id](const std::string& row_id,
                                                      const std::string& col_id,
                                                      const std::string& value) {
-    const auto draft_id = ParseDraftRowId(row_id);
-    if (!draft_id) {
-      return;
-    }
-    const WorkspaceTab* snapshot_tab = workspace.Get().FindTab(tab_id);
-    if (snapshot_tab == nullptr || snapshot_tab->kind != WorkspaceTabKind::Table) {
-      return;
-    }
-    std::size_t col_idx = snapshot_tab->table.columns.size();
-    for (std::size_t i = 0; i < snapshot_tab->table.columns.size(); ++i) {
-      if (snapshot_tab->table.columns[i].name == col_id) {
-        col_idx = i;
-        break;
-      }
-    }
-    if (col_idx >= snapshot_tab->table.columns.size()) {
-      return;
-    }
-    if (const PendingInsertRow* existing =
-            FindDraftRow(snapshot_tab->table.pending_inserts, *draft_id)) {
-      const std::string& cur_val =
-          col_idx < existing->values.size() ? existing->values[col_idx] : std::string{};
-      if (cur_val == value) {
-        return;
-      }
-    } else {
-      return;
-    }
-
-    workspace.Update([&](WorkspaceModel& ws) {
-      WorkspaceTab* target = ws.FindTab(tab_id);
-      if (target == nullptr || target->kind != WorkspaceTabKind::Table) {
-        return;
-      }
-      PendingInsertRow* draft = FindDraftRowMutable(target->table.pending_inserts, *draft_id);
-      if (draft == nullptr) {
-        return;
-      }
-      if (draft->values.size() < target->table.columns.size()) {
-        draft->values.resize(target->table.columns.size());
-      }
-      draft->values[col_idx] = value;
-    });
+    ApplyDraftCellValue(workspace, tab_id, row_id, col_id, value);
   };
 
-  const auto flush_live_drafts = [workspace, tab_id, live_drafts]() {
-    auto live = live_drafts.Get();
-    if (live->empty()) {
-      return;
-    }
-    auto pending = std::move(*live);
-    live->clear();
-    workspace.Update([&](WorkspaceModel& ws) {
-      WorkspaceTab* target = ws.FindTab(tab_id);
-      if (target == nullptr || target->kind != WorkspaceTabKind::Table) {
-        return;
-      }
-      for (const auto& [key, val] : pending) {
-        const std::size_t sep = key.find('\n');
-        if (sep == std::string::npos) {
-          continue;
-        }
-        const std::string_view row_id(key.data(), sep);
-        const std::string_view col_id(key.data() + sep + 1, key.size() - sep - 1);
-        const auto draft_id = ParseDraftRowId(row_id);
-        if (!draft_id) {
-          continue;
-        }
-        PendingInsertRow* draft =
-            FindDraftRowMutable(target->table.pending_inserts, *draft_id);
-        if (draft == nullptr) {
-          continue;
-        }
-        if (draft->values.size() < target->table.columns.size()) {
-          draft->values.resize(target->table.columns.size());
-        }
-        for (std::size_t i = 0; i < target->table.columns.size(); ++i) {
-          if (target->table.columns[i].name == col_id) {
-            draft->values[i] = val;
-            break;
-          }
-        }
-      }
-    });
+  const auto flush_live_drafts = [app, workspace, tab_id, live_drafts]() {
+    FlushLiveTableEdits(app, workspace, tab_id, live_drafts.Get());
   };
 
   const auto block_if_dirty = [workspace, tab_id, notify, loc]() -> bool {
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
-    if (cur != nullptr && !cur->table.pending_inserts.empty()) {
+    if (cur != nullptr && cur->table.HasPendingChanges()) {
       if (notify) {
         notify(loc.Get(app::strings::table_dirty_block));
       }
@@ -229,27 +150,44 @@ using namespace dbpp::ui;
   const bool is_production = session->production_mode;
   const std::string prod_conn_name = session->name;
   const auto commit_inserts = [dialogs, app, workspace, tasks, tab_id, flush_live_drafts, notify,
-                               is_production, prod_conn_name, theme_config, language_mode,
+                               loc, is_production, prod_conn_name, theme_config, language_mode,
                                system_dark] {
     flush_live_drafts();
-    const auto do_commit = [app, workspace, tasks, tab_id, notify] {
-      RequestCommitPendingInserts(app, workspace, tasks, tab_id, notify);
-    };
-    if (is_production) {
-      const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
-      const std::size_t cnt = cur != nullptr ? cur->table.pending_inserts.size() : 0;
-      const std::string summary =
-          "INSERT INTO " + (cur != nullptr ? cur->table.qualified_name : std::string{}) +
-          " (" + std::to_string(cnt) + " row(s))";
-      dialogs.Show([prod_conn_name, summary, do_commit, theme_config, language_mode,
-                    system_dark](DialogContext dialog) {
-        return WithDialogTheme(
-            theme_config, language_mode, system_dark,
-            ProductionWriteConfirmDialog(dialog, prod_conn_name, summary, do_commit));
-      });
+    const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+    if (cur == nullptr || !cur->table.HasPendingChanges()) {
       return;
     }
-    do_commit();
+    const std::string tbl = cur->table.qualified_name;
+    std::string summary;
+    if (!cur->table.pending_edits.empty()) {
+      summary = "UPDATE " + tbl + " (" + std::to_string(cur->table.pending_edits.size()) +
+                " cell(s))";
+    }
+    if (!cur->table.pending_deletes.empty()) {
+      if (!summary.empty()) summary += "; ";
+      summary += "DELETE FROM " + tbl + " (" +
+                 std::to_string(cur->table.pending_deletes.size()) + " row(s))";
+    }
+    if (!cur->table.pending_inserts.empty()) {
+      if (!summary.empty()) summary += "; ";
+      summary += "INSERT INTO " + tbl + " (" +
+                 std::to_string(cur->table.pending_inserts.size()) + " row(s))";
+    }
+    RunGuardedWrite(
+        WriteGuardContext{
+            .read_only = cur->table.read_only,
+            .production_mode = is_production,
+            .connection_name = prod_conn_name,
+            .dialogs = dialogs,
+            .notify = notify,
+            .loc = loc,
+            .theme_config = theme_config,
+            .language_mode = language_mode,
+            .system_dark = system_dark,
+        },
+        std::move(summary), [app, workspace, tasks, tab_id, notify] {
+          RequestCommitTableChanges(app, workspace, tasks, tab_id, notify);
+        });
   };
 
   const auto rollback_inserts = [workspace, tab_id, live_drafts, notify, loc] {
@@ -258,9 +196,11 @@ using namespace dbpp::ui;
     workspace.Update([&](WorkspaceModel& ws) {
       WorkspaceTab* target = ws.FindTab(tab_id);
       if (target == nullptr || target->kind != WorkspaceTabKind::Table ||
-          target->table.pending_inserts.empty() || target->table.committing) {
+          !target->table.HasPendingChanges() || target->table.committing) {
         return;
       }
+      target->table.pending_edits.clear();
+      target->table.pending_deletes.clear();
       target->table.pending_inserts.clear();
       if (target->selected_cell.has_value() && IsDraftRowId(target->selected_cell->row_id)) {
         target->selected_cell = std::nullopt;
@@ -272,11 +212,11 @@ using namespace dbpp::ui;
     }
   };
 
-  const auto delete_selected_action = [dialogs, app, workspace, tab_id, live_drafts,
-                                       flush_live_drafts, tasks, notify, theme_config,
-                                       language_mode, system_dark, is_redis, loc] {
+  const auto delete_selected_action = [workspace, tab_id, live_drafts, flush_live_drafts,
+                                       notify, loc] {
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
-    if (cur == nullptr || !cur->selected_cell.has_value()) {
+    if (cur == nullptr || !cur->selected_cell.has_value() || !cur->table.editable ||
+        cur->table.read_only || cur->table.committing) {
       return;
     }
     if (const auto draft_id = ParseDraftRowId(cur->selected_cell->row_id)) {
@@ -305,11 +245,12 @@ using namespace dbpp::ui;
       }
       return;
     }
-    dialogs.Show([app, workspace, tab_id, tasks, notify, theme_config, language_mode, system_dark,
-                  is_redis](DialogContext dialog) {
-      return WithDialogTheme(theme_config, language_mode, system_dark,
-                             DeleteRowDialog(dialog, app, workspace, tab_id, tasks, notify, is_redis));
-    });
+    const std::size_t row_idx = RowIndexFromId(cur->selected_cell->row_id);
+    if (row_idx == static_cast<std::size_t>(-1)) {
+      return;
+    }
+    flush_live_drafts();
+    (void)ToggleTableRowPendingDelete(workspace, tab_id, row_idx);
   };
 
   const auto apply_sort = [app, workspace, tasks, tab_id, notify,
@@ -382,7 +323,7 @@ using namespace dbpp::ui;
                 Padding{EdgeInsets::Symmetric(8.0F, 0.0F)}, Spacing{5.0F},
                 CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
                 Background{VisualFill{sort_bg}}, Border{sort_border, 1.0F}, sort_anchor,
-                Enabled{!model.columns.empty() && model.pending_inserts.empty()})
+                Enabled{!model.columns.empty() && !model.HasPendingChanges()})
           .OnClick([menu, sort_anchor, loc, apply_sort, sort_cols, current_sort] {
             std::vector<MenuEntry> entries;
             if (current_sort.has_value()) {
@@ -533,10 +474,10 @@ using namespace dbpp::ui;
                               .OnClick(add_draft_row),
                           ButtonTone::Default, kToolbarHeight, 10.0F)
           .With(Enabled{model.editable && !model.read_only && !model.committing}));
-  if (!model.pending_inserts.empty()) {
+  if (model.HasPendingChanges()) {
     const std::string commit_label =
         model.committing ? UseString(app::strings::table_committing)
-                         : UseString(app::strings::table_commit_n, model.pending_inserts.size());
+                         : UseString(app::strings::table_commit_n, model.PendingChangeCount());
     toolbar_items.Add(
         CompactActionButton(Button(commit_label).OnClick(commit_inserts), ButtonTone::Primary,
                             kToolbarHeight, 10.0F)
@@ -546,11 +487,19 @@ using namespace dbpp::ui;
                             ButtonTone::Default, kToolbarHeight, 10.0F)
             .With(Enabled{!model.committing}));
   }
+  bool selected_pending_delete = false;
+  if (tab->selected_cell.has_value() && !IsDraftRowId(tab->selected_cell->row_id)) {
+    selected_pending_delete =
+        model.IsRowPendingDelete(RowIndexFromId(tab->selected_cell->row_id));
+  }
   toolbar_items.Add(
-      CompactActionButton(Button(is_redis ? app::strings::table_delete_key
-                                          : app::strings::table_delete_row)
-                              .OnClick(delete_selected_action),
-                          ButtonTone::Danger, kToolbarHeight, 10.0F)
+      CompactActionButton(
+          Button(selected_pending_delete
+                     ? app::strings::table_undo_delete_row
+                     : (is_redis ? app::strings::table_delete_key : app::strings::table_delete_row))
+              .OnClick(delete_selected_action),
+          selected_pending_delete ? ButtonTone::Default : ButtonTone::Danger, kToolbarHeight,
+          10.0F)
           .With(Enabled{model.editable && !model.read_only && !model.committing &&
                         tab->selected_cell.has_value()}));
 
@@ -588,7 +537,7 @@ using namespace dbpp::ui;
           .With(Frame{.height = 24.0F, .min_height = 24.0F, .max_height = 24.0F},
                 Padding{EdgeInsets::Symmetric(6.0F, 0.0F)}, Spacing{4.0F},
                 CrossAlign{CrossAxisAlignment::Center}, CornerRadius{5.0F},
-                page_size_anchor, Enabled{model.pending_inserts.empty()})
+                page_size_anchor, Enabled{!model.HasPendingChanges()})
           .OnClick([page_size_popup, page_size_anchor, change_page_size, current_page_size,
                     theme_config, language_mode, system_dark] {
             page_size_popup.Show(
@@ -616,8 +565,8 @@ using namespace dbpp::ui;
       model.total <= 0 ? 1
                        : ((model.total - 1) / std::max<std::int64_t>(1, model.page_size) + 1);
   const std::string status_text =
-      !model.pending_inserts.empty()
-          ? UseString(app::strings::table_pending_hint, model.pending_inserts.size())
+      model.HasPendingChanges()
+          ? UseString(app::strings::table_pending_hint, model.PendingChangeCount())
           : (model.message.empty() ? UseString(app::strings::table_no_data) : model.message);
   Views status_items;
   status_items.Add(AuditDurationBadge(model.elapsed_us));
@@ -649,7 +598,7 @@ using namespace dbpp::ui;
                        .With(LayoutPriority(1.0F)));
   status_items.Add(std::move(page_size_selector).With(LayoutPriority(1.0F)));
   status_items.Add(CompactPagerControls(
-      model.page, page_count, model.page + 1 < page_count, model.pending_inserts.empty(),
+      model.page, page_count, model.page + 1 < page_count, !model.HasPendingChanges(),
       model.snapshot_version,
       [reload, filter = model.filter](std::int64_t target) { reload(target, filter); }, notify));
   View pager = BottomStatusBar(std::move(status_items));
@@ -664,10 +613,13 @@ using namespace dbpp::ui;
     }
   } else {
     const std::shared_ptr<const GridSnapshot> snapshot = model.snapshot;
+    const std::vector<PendingCellEdit> pending_edits = model.pending_edits;
+    const std::vector<std::size_t> pending_deletes = model.pending_deletes;
     const std::vector<PendingInsertRow> drafts = model.pending_inserts;
     const std::string draft_first_empty = UseString(app::strings::table_draft_first_col_empty);
     const std::string draft_other_empty = UseString(app::strings::table_draft_other_col_empty);
     const std::string draft_acc_empty = UseString(app::strings::table_draft_accessibility_empty);
+    const std::string pending_del_tip = UseString(app::strings::table_pending_delete_tooltip);
     const Dialect session_dialect = session->dialect;
     const bool table_editable = model.editable;
     const bool table_read_only = model.read_only;
@@ -675,7 +627,8 @@ using namespace dbpp::ui;
     columns.reserve(model.columns.size() + 1);
     columns.push_back(MakeRowNumberColumn(
         SafePageOffset(model.page, current_page_size), snapshot ? snapshot->rows.size() : 0,
-        model.column_widths, spec.colors.on_surface_variant, semantic.draft_accent));
+        model.column_widths, spec.colors.on_surface_variant, semantic.draft_accent,
+        pending_deletes, semantic.danger));
     for (std::size_t index = 0; index < model.columns.size(); ++index) {
       const ColumnMeta& meta = model.columns[index];
       const auto width_it = model.column_widths.find(meta.name);
@@ -692,11 +645,12 @@ using namespace dbpp::ui;
           .max = kMaxColumnWidth,
       };
       column.sortable = true;
-      column.render_cell = [snapshot, drafts, index, spec, semantic, draft_first_empty,
-                            draft_other_empty, draft_acc_empty, menu, dialogs, clipboard, app,
-                            workspace, tab_id, session_dialect, is_redis, is_production,
-                            prod_conn_name, table_editable, table_read_only, meta, tasks, notify,
-                            theme_config, language_mode, system_dark, loc, add_draft_row,
+      column.render_cell = [snapshot, pending_edits, pending_deletes, drafts, index, spec, semantic,
+                            draft_first_empty, draft_other_empty, draft_acc_empty, pending_del_tip,
+                            menu, dialogs, clipboard, app, workspace, tab_id, session_dialect,
+                            is_redis, is_production, prod_conn_name, table_editable,
+                            table_read_only, meta, tasks, notify, theme_config, language_mode,
+                            system_dark, loc, add_draft_row,
                             reload](const DataTableCellContext& cell) -> DataTableCellContent {
         if (const auto draft_id = ParseDraftRowId(cell.id.row_id)) {
           const PendingInsertRow* draft = FindDraftRow(drafts, *draft_id);
@@ -721,27 +675,65 @@ using namespace dbpp::ui;
           };
         }
 
-        const bool is_null = CellIsNull(snapshot, cell.id.row_id, index);
-        const std::string raw = CellText(snapshot, cell.id.row_id, index);
-        const std::string text = CellDisplayText(snapshot, cell.id.row_id, index);
+        const std::size_t row_idx = RowIndexFromId(cell.id.row_id);
+        const bool is_pending_del =
+            row_idx != static_cast<std::size_t>(-1) &&
+            std::ranges::find(pending_deletes, row_idx) != pending_deletes.end();
+        const PendingCellEdit* pe = nullptr;
+        if (row_idx != static_cast<std::size_t>(-1)) {
+          for (const PendingCellEdit& cand : pending_edits) {
+            if (cand.row_index == row_idx && cand.column_index == index) {
+              pe = &cand;
+              break;
+            }
+          }
+        }
+        const bool is_null = pe != nullptr ? pe->is_null : CellIsNull(snapshot, cell.id.row_id, index);
+        const std::string raw =
+            pe != nullptr ? (pe->is_null ? std::string{"NULL"} : pe->raw_text)
+                          : CellText(snapshot, cell.id.row_id, index);
+        const std::string text =
+            pe != nullptr ? (pe->is_null ? std::string{"NULL"} : pe->display_text)
+                          : CellDisplayText(snapshot, cell.id.row_id, index);
         View cell_content;
         if (is_null) {
-          cell_content = NullValueBadge(semantic.null_text);
+          const Color null_c = is_pending_del
+                                   ? semantic.danger
+                                   : (pe != nullptr ? semantic.draft_accent : semantic.null_text);
+          cell_content = NullValueBadge(null_c, is_pending_del);
         } else {
-          TextStyle style{Font::Monospace(13.0F), spec.colors.on_surface};
+          TextStyle style =
+              is_pending_del
+                  ? TextStyle{
+                        .font = Font::Monospace(13.0F).WithWeight(FontWeight::SemiBold),
+                        .foreground = semantic.danger,
+                        .decoration = TextDecoration::StrikeThrough,
+                    }
+                  : (pe != nullptr
+                         ? TextStyle{Font::Monospace(13.0F).WithWeight(FontWeight::SemiBold),
+                                     semantic.draft_accent}
+                         : TextStyle{Font::Monospace(13.0F), spec.colors.on_surface});
           cell_content = Text(SingleLineCellPreview(text))
                              .Style(style)
                              .LineLimit(1)
                              .Overflow(TextOverflow::Ellipsis);
-          if (text != raw && !raw.empty()) {
+          if (is_pending_del) {
+            cell_content = std::move(cell_content).With(Tooltip(StringVariant(pending_del_tip)));
+          } else if (pe != nullptr) {
+            const std::string orig_text = CellIsNull(snapshot, cell.id.row_id, index)
+                                              ? std::string{"NULL"}
+                                              : CellDisplayText(snapshot, cell.id.row_id, index);
+            cell_content = std::move(cell_content).With(Tooltip(StringVariant(orig_text + " -> " + text)));
+          } else if (text != raw && !raw.empty()) {
             cell_content = std::move(cell_content).With(Tooltip(StringVariant(raw)));
           }
         }
-        const std::size_t row_idx = RowIndexFromId(cell.id.row_id);
-        const bool cell_editable =
-            table_editable && !table_read_only && !IsBlobColumn(meta) &&
-            !(is_redis && meta.name == "size") && row_idx != static_cast<std::size_t>(-1);
-        const bool can_set_null = cell_editable && meta.nullable && !is_null;
+        const bool can_modify_row =
+            table_editable && !table_read_only && row_idx != static_cast<std::size_t>(-1);
+        const bool cell_editable = can_modify_row && !is_pending_del && !IsBlobColumn(meta) &&
+                                   !(is_redis && meta.name == "size");
+        const bool can_set_null = can_modify_row && !is_pending_del &&
+                                  !(is_redis && meta.name == "size") && !is_null;
         std::string row_tsv;
         if (const GridRow* gr = RowAt(snapshot, row_idx)) {
           for (std::size_t ci = 0; ci < gr->values.size(); ++ci) {
@@ -749,10 +741,13 @@ using namespace dbpp::ui;
             row_tsv += gr->values[ci].is_null ? std::string{"NULL"} : gr->values[ci].DisplayText();
           }
         }
-        const CellValue raw_cell = (RowAt(snapshot, row_idx) != nullptr &&
-                                    index < RowAt(snapshot, row_idx)->values.size())
-                                       ? RowAt(snapshot, row_idx)->values[index]
-                                       : CellValue{};
+        const CellValue raw_cell =
+            pe != nullptr
+                ? CellValue{.text = pe->raw_text, .is_null = pe->is_null, .display_text = pe->display_text}
+                : ((RowAt(snapshot, row_idx) != nullptr &&
+                    index < RowAt(snapshot, row_idx)->values.size())
+                       ? RowAt(snapshot, row_idx)->values[index]
+                       : CellValue{});
         const std::string copy_text_val = is_null ? std::string{"NULL"} : text;
         const auto apply_val_filter = [workspace, tab_id, reload](std::string f) {
           workspace.Update([tab_id, &f](WorkspaceModel& ws) {
@@ -762,16 +757,21 @@ using namespace dbpp::ui;
           });
           reload(0, std::move(f));
         };
+        const Color cell_bg = is_pending_del
+                                  ? WithAlpha(semantic.danger, 0.12F)
+                                  : (pe != nullptr ? WithAlpha(semantic.draft_accent, 0.10F)
+                                                   : Color::Transparent());
         View cell_box =
             Row{std::move(cell_content)}
-                .With(Frame{.min_height = 26.0F}, CrossAlign{CrossAxisAlignment::Center})
+                .With(Frame{.min_height = 26.0F}, CrossAlign{CrossAxisAlignment::Center},
+                      Background{VisualFill{cell_bg}})
                 .On<ViewEvents::ContextMenuRequested>(
                     [menu, dialogs, clipboard, app, workspace, tab_id, row_idx, index,
-                     session_dialect, is_redis, cell_editable, can_set_null, is_production,
-                     prod_conn_name, copy_text_val, row_tsv = std::move(row_tsv), meta, raw_cell,
-                     tasks, notify, theme_config, language_mode, system_dark,
-                     danger = semantic.status_failed, loc, add_draft_row,
-                     apply_val_filter](Point pos) {
+                     session_dialect, is_redis, cell_editable, can_modify_row, is_pending_del,
+                     can_set_null, is_production, prod_conn_name, copy_text_val,
+                     row_tsv = std::move(row_tsv), meta, raw_cell, tasks, notify, theme_config,
+                     language_mode, system_dark, danger = semantic.status_failed, loc,
+                     add_draft_row, apply_val_filter](Point pos) {
                       if (row_idx == static_cast<std::size_t>(-1)) {
                         return;
                       }
@@ -783,10 +783,10 @@ using namespace dbpp::ui;
                       });
                       ShowTableCellContextMenu(
                           pos, menu, dialogs, clipboard, app, workspace, tab_id, row_idx, index,
-                          session_dialect, is_redis, cell_editable, can_set_null, is_production,
-                          prod_conn_name, copy_text_val, row_tsv, meta, raw_cell, tasks, notify,
-                          theme_config, language_mode, system_dark, danger, loc, add_draft_row,
-                          apply_val_filter);
+                          session_dialect, is_redis, cell_editable, can_modify_row, is_pending_del,
+                          can_set_null, is_production, prod_conn_name, copy_text_val, row_tsv, meta,
+                          raw_cell, tasks, notify, theme_config, language_mode, system_dark, danger,
+                          loc, add_draft_row, apply_val_filter);
                     });
         return DataTableCellContent{
             .view = std::move(cell_box),
@@ -798,13 +798,13 @@ using namespace dbpp::ui;
         column.editor = DataTableEditor{
             .initial_text = [workspace, tab_id, live_drafts, snapshot, index,
                              col_id = meta.name](const DataTableCellContext& cell) {
+              auto live = live_drafts.Get();
+              if (const auto it = live->find(DraftCellBufferKey(cell.id.row_id, col_id));
+                  it != live->end()) {
+                return it->second;
+              }
+              const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
               if (const auto draft_id = ParseDraftRowId(cell.id.row_id)) {
-                auto live = live_drafts.Get();
-                if (const auto it = live->find(DraftCellBufferKey(cell.id.row_id, col_id));
-                    it != live->end()) {
-                  return it->second;
-                }
-                const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
                 if (cur != nullptr) {
                   if (const PendingInsertRow* draft =
                           FindDraftRow(cur->table.pending_inserts, *draft_id)) {
@@ -814,6 +814,12 @@ using namespace dbpp::ui;
                   }
                 }
                 return std::string{};
+              }
+              if (cur != nullptr) {
+                const std::size_t ridx = RowIndexFromId(cell.id.row_id);
+                if (const PendingCellEdit* pe = cur->table.FindPendingEdit(ridx, index)) {
+                  return pe->is_null ? std::string{"NULL"} : pe->display_text;
+                }
               }
               return CellIsNull(snapshot, cell.id.row_id, index)
                          ? std::string{"NULL"}
@@ -832,9 +838,7 @@ using namespace dbpp::ui;
                       .OnChanged([draft = edit.draft, live_drafts, row_id, col_id](
                                      const TextEditingValue& value) {
                         draft = value;
-                        if (IsDraftRowId(row_id)) {
-                          (*live_drafts.Get())[DraftCellBufferKey(row_id, col_id)] = value.text;
-                        }
+                        (*live_drafts.Get())[DraftCellBufferKey(row_id, col_id)] = value.text;
                       })
                       .OnSubmitted(edit.commit)
                       .On<ViewEvents::FocusChanged>(
@@ -907,9 +911,9 @@ using namespace dbpp::ui;
                 [dialogs, app, workspace, tasks, tab_id, live_drafts, apply_draft_value,
                  is_production, prod_conn_name, theme_config, language_mode, system_dark,
                  notify](const DataTableEditRequest& edit) {
+                  live_drafts.Get()->erase(
+                      DraftCellBufferKey(edit.cell_id.row_id, edit.cell_id.column_id));
                   if (IsDraftRowId(edit.cell_id.row_id)) {
-                    live_drafts.Get()->erase(
-                        DraftCellBufferKey(edit.cell_id.row_id, edit.cell_id.column_id));
                     apply_draft_value(edit.cell_id.row_id, edit.cell_id.column_id, edit.text);
                     return;
                   }

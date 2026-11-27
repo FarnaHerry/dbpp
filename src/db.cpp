@@ -636,7 +636,7 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
     }
     if (const WorkspaceTab* active = ws_now.ActiveTab();
         active != nullptr && active->session_id == target_session_id &&
-        active->kind == WorkspaceTabKind::Table && active->table.pending_inserts.empty()) {
+        active->kind == WorkspaceTabKind::Table && !active->table.HasPendingChanges()) {
       reload_tab_id = active->id;
       reload_page = active->table.page;
       reload_sort = active->table.sort;

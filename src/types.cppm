@@ -279,8 +279,27 @@ struct PendingInsertRow {
   bool operator==(const PendingInsertRow&) const = default;
 };
 
+struct PendingCellEdit {
+  std::size_t row_index = 0;
+  std::size_t column_index = 0;
+  std::string raw_text;
+  std::string display_text;
+  bool is_null = false;
+
+  bool operator==(const PendingCellEdit&) const = default;
+};
+
 struct BatchInsertResult {
   std::size_t inserted = 0;
+  bool rolled_back = false;
+  bool connection_lost = false;
+  std::string error;
+};
+
+struct BatchCommitResult {
+  std::size_t updated_rows = 0;
+  std::size_t deleted_rows = 0;
+  std::size_t inserted_rows = 0;
   bool rolled_back = false;
   bool connection_lost = false;
   std::string error;
@@ -321,11 +340,56 @@ struct TableModel {
   std::string message;
   std::string executed_sql;
   std::int64_t elapsed_us = -1;
+  std::vector<PendingCellEdit> pending_edits;
+  std::vector<std::size_t> pending_deletes;
   std::vector<PendingInsertRow> pending_inserts;
   std::uint64_t next_draft_id = 1;
   bool committing = false;
   std::unordered_map<std::string, float> column_widths;
   std::uint64_t snapshot_version = 0;
+
+  [[nodiscard]] bool IsRowPendingDelete(std::size_t row_index) const noexcept {
+    for (const std::size_t idx : pending_deletes) {
+      if (idx == row_index) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool HasPendingChanges() const noexcept {
+    return !pending_edits.empty() || !pending_deletes.empty() || !pending_inserts.empty();
+  }
+
+  [[nodiscard]] std::size_t PendingChangeCount() const noexcept {
+    std::size_t edit_count = 0;
+    for (const PendingCellEdit& edit : pending_edits) {
+      if (!IsRowPendingDelete(edit.row_index)) {
+        ++edit_count;
+      }
+    }
+    return edit_count + pending_deletes.size() + pending_inserts.size();
+  }
+
+  [[nodiscard]] const PendingCellEdit* FindPendingEdit(std::size_t row_index,
+                                                       std::size_t column_index) const noexcept {
+    for (const PendingCellEdit& edit : pending_edits) {
+      if (edit.row_index == row_index && edit.column_index == column_index) {
+        return &edit;
+      }
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] PendingCellEdit* FindPendingEditMutable(std::size_t row_index,
+                                                        std::size_t column_index) noexcept {
+    for (PendingCellEdit& edit : pending_edits) {
+      if (edit.row_index == row_index && edit.column_index == column_index) {
+        return &edit;
+      }
+    }
+    return nullptr;
+  }
 };
 
 struct QueryResult {

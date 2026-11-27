@@ -111,48 +111,6 @@ Task<AdbcQueryResult> ExecutePreparedQueryAsync(std::shared_ptr<AdbcSession> ses
       });
 }
 
-Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session, TableModel model,
-                                      std::size_t row_index, std::size_t column_index,
-                                      std::string text) {
-  if (!session || session->IsClosed()) {
-    AdbcQueryResult result;
-    result.connection_lost = true;
-    result.error = Tr("Connection is closed", "连接已关闭");
-    co_return result;
-  }
-  co_return co_await session->sequence.Run(
-      [session, model = std::move(model), row_index, column_index, text = std::move(text)](
-          std::stop_token) mutable {
-        if (session->IsClosed()) {
-          AdbcQueryResult res;
-          res.connection_lost = true;
-          res.error = Tr("Connection is closed", "连接已关闭");
-          return res;
-        }
-        return detail::DbUpdateCellBlocking(*session, model, row_index, column_index, text);
-      });
-}
-
-Task<AdbcQueryResult> DeleteRowAsync(std::shared_ptr<AdbcSession> session, TableModel model,
-                                     std::size_t row_index) {
-  if (!session || session->IsClosed()) {
-    AdbcQueryResult result;
-    result.connection_lost = true;
-    result.error = Tr("Connection is closed", "连接已关闭");
-    co_return result;
-  }
-  co_return co_await session->sequence.Run(
-      [session, model = std::move(model), row_index](std::stop_token) mutable {
-        if (session->IsClosed()) {
-          AdbcQueryResult res;
-          res.connection_lost = true;
-          res.error = Tr("Connection is closed", "连接已关闭");
-          return res;
-        }
-        return detail::DbDeleteRowBlocking(*session, model, row_index);
-      });
-}
-
 void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                       const TaskScope& tasks, std::uint64_t tab_id, std::int64_t page,
                       std::optional<DataTableSort> sort, std::string filter,
@@ -297,152 +255,121 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
   });
 }
 
-void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                     const TaskScope& tasks, std::uint64_t tab_id,
-                     const DataTableEditRequest& edit, NotifyFn notify) {
+void StageTableCellEdit(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                        std::uint64_t tab_id, const DataTableEditRequest& edit) {
   if (edit.cell_id.row_id.starts_with("draft:")) {
     return;
   }
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
-  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
-    return;
-  }
-  const DbSession* session = detail::DbFindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
-    }
-    return;
-  }
-  TableModel table_value = tab->table;
-  if (!table_value.snapshot) {
+  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table || !tab->table.editable ||
+      tab->table.read_only || tab->table.committing || !tab->table.snapshot) {
     return;
   }
   const std::size_t row_index = detail::DbParseRowIndex(edit.cell_id.row_id);
-  if (row_index >= table_value.snapshot->rows.size()) {
+  if (row_index >= tab->table.snapshot->rows.size() ||
+      tab->table.IsRowPendingDelete(row_index)) {
     return;
   }
-  std::size_t column_index = table_value.columns.size();
-  for (std::size_t i = 0; i < table_value.columns.size(); ++i) {
-    if (table_value.columns[i].name == edit.cell_id.column_id) {
+  std::size_t column_index = tab->table.columns.size();
+  for (std::size_t i = 0; i < tab->table.columns.size(); ++i) {
+    if (tab->table.columns[i].name == edit.cell_id.column_id) {
       column_index = i;
       break;
     }
   }
-  if (column_index >= table_value.columns.size()) {
-    return;
-  }
-  const CellValue& current = table_value.snapshot->rows[row_index].values[column_index];
-  const ColumnMeta& target_col = table_value.columns[column_index];
-  const std::string normalized_text = NormalizeTimestampForWrite(
-      edit.text, current.is_null ? std::string_view{} : std::string_view(current.text),
-      target_col.name, target_col.type, session->session->dialect);
-  if (!current.is_null && current.text == normalized_text) {
-    return;
-  }
-  if (current.is_null && detail::DbEqualsIgnoreCaseAscii(normalized_text, "NULL")) {
+  if (column_index >= tab->table.columns.size()) {
     return;
   }
 
-  auto adbc_session = session->session;
-  const std::uint64_t session_id = session->id;
-  const std::string object_name = table_value.object;
-
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session,
-                table_value = std::move(table_value), tab_id, session_id, object_name,
-                row_index, column_index, text = normalized_text]() mutable -> Task<void> {
-    AdbcQueryResult result =
-        co_await UpdateCellAsync(adbc_session, table_value, row_index, column_index, text);
-    if (result.connection_lost) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, result.error, notify);
-      co_return;
-    }
-    if (!result.error.empty()) {
-      const std::string message = result.error;
-      if (notify) {
-        notify(TrFmt("Failed to save: {0}", "保存失败: {0}", {message}));
-      }
-      co_return;
-    }
-    const WorkspaceTab* current_tab = workspace.Get().FindTab(tab_id);
-    if (current_tab == nullptr || current_tab->kind != WorkspaceTabKind::Table ||
-        current_tab->session_id != session_id || current_tab->object_name != object_name) {
-      co_return;
-    }
-    RequestLoadTable(app, workspace, tasks, tab_id, table_value.page, table_value.sort,
-                     table_value.filter, true, notify);
-    if (notify) {
-      notify(std::string(Tr("Record updated", "记录已更新")));
-    }
-  });
-}
-
-void RequestDeleteSelected(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                           const TaskScope& tasks, std::uint64_t tab_id, NotifyFn notify) {
-  const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
-  if (tab == nullptr || tab->kind != WorkspaceTabKind::Table || !tab->selected_cell.has_value()) {
-    return;
-  }
-  if (tab->selected_cell->row_id.starts_with("draft:")) {
-    return;
-  }
   const DbSession* session = detail::DbFindSession(app.Get(), tab->session_id);
-  if (session == nullptr || !session->session || session->session->IsClosed()) {
-    if (session != nullptr) {
-      HandleSessionDisconnected(app, workspace, tasks, tab->session_id, {}, notify);
-    }
-    return;
-  }
-  TableModel table_value = tab->table;
-  if (!table_value.snapshot) {
-    return;
-  }
-  const std::size_t row_index = detail::DbParseRowIndex(tab->selected_cell->row_id);
-  if (row_index >= table_value.snapshot->rows.size()) {
-    return;
-  }
-  auto adbc_session = session->session;
-  const std::uint64_t session_id = session->id;
-  const std::string object_name = table_value.object;
-  const std::int64_t page = table_value.page;
-  const std::int64_t remaining = static_cast<std::int64_t>(table_value.snapshot->rows.size());
+  const Dialect dialect =
+      (session != nullptr && session->session) ? session->session->dialect : Dialect::Generic;
+  const ColumnMeta& col = tab->table.columns[column_index];
+  const CellValue& orig = tab->table.snapshot->rows[row_index].values[column_index];
+  const std::string lower_type = detail::DbLowerAscii(col.type);
+  const bool is_textual = lower_type.empty() ||
+                          lower_type.find("text") != std::string::npos ||
+                          lower_type.find("char") != std::string::npos ||
+                          lower_type.find("clob") != std::string::npos ||
+                          lower_type.find("string") != std::string::npos ||
+                          lower_type.find("json") != std::string::npos ||
+                          lower_type.find("uuid") != std::string::npos;
+  const std::string trimmed = detail::DbTrimAscii(edit.text);
+  const bool is_null = detail::DbEqualsIgnoreCaseAscii(trimmed, "NULL") ||
+                       (trimmed.empty() && (col.nullable || !is_textual));
+  const std::string normalized_text =
+      is_null ? std::string{"NULL"}
+              : NormalizeTimestampForWrite(
+                    edit.text, orig.is_null ? std::string_view{} : std::string_view(orig.text),
+                    col.name, col.type, dialect);
+  const std::string display_text =
+      is_null ? std::string{}
+              : LocalizeTimestampValue(normalized_text, col.name, col.type)
+                    .value_or(normalized_text);
 
-  tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session,
-                table_value = std::move(table_value), tab_id, session_id, object_name,
-                row_index, page, remaining]() mutable -> Task<void> {
-    AdbcQueryResult result = co_await DeleteRowAsync(adbc_session, table_value, row_index);
-    if (result.connection_lost) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, result.error, notify);
-      co_return;
+  const std::uint64_t expected_session = tab->session_id;
+  const std::string expected_object = tab->table.object;
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab* target = ws.FindTab(tab_id);
+    if (target == nullptr || target->kind != WorkspaceTabKind::Table ||
+        target->session_id != expected_session || target->table.object != expected_object ||
+        !target->table.snapshot || row_index >= target->table.snapshot->rows.size() ||
+        column_index >= target->table.columns.size()) {
+      return;
     }
-    if (!result.error.empty()) {
-      const std::string message = result.error;
-      if (notify) {
-        notify(TrFmt("Failed to delete: {0}", "删除失败: {0}", {message}));
-      }
-      co_return;
+    const CellValue& cur = target->table.snapshot->rows[row_index].values[column_index];
+    const bool matches_original =
+        (cur.is_null && is_null) || (!cur.is_null && !is_null && cur.text == normalized_text);
+    if (matches_original) {
+      std::erase_if(target->table.pending_edits, [&](const PendingCellEdit& pe) {
+        return pe.row_index == row_index && pe.column_index == column_index;
+      });
+      return;
     }
-    const WorkspaceTab* current_tab = workspace.Get().FindTab(tab_id);
-    if (current_tab == nullptr || current_tab->kind != WorkspaceTabKind::Table ||
-        current_tab->session_id != session_id || current_tab->object_name != object_name) {
-      co_return;
-    }
-    const std::int64_t next_page = remaining <= 1 && page > 0 ? page - 1 : page;
-    RequestLoadTable(app, workspace, tasks, tab_id, next_page, table_value.sort,
-                     table_value.filter, false, notify);
-    if (notify) {
-      notify(std::string(Tr("Deleted 1 row", "已删除 1 行")));
+    if (PendingCellEdit* existing = target->table.FindPendingEditMutable(row_index, column_index)) {
+      existing->raw_text = normalized_text;
+      existing->display_text = display_text;
+      existing->is_null = is_null;
+    } else {
+      target->table.pending_edits.push_back(PendingCellEdit{
+          .row_index = row_index,
+          .column_index = column_index,
+          .raw_text = normalized_text,
+          .display_text = display_text,
+          .is_null = is_null,
+      });
     }
   });
 }
 
-void RequestCommitPendingInserts(const State<AppModel>& app,
-                                 const State<WorkspaceModel>& workspace,
-                                 const TaskScope& tasks, std::uint64_t tab_id,
-                                 NotifyFn notify) {
+bool ToggleTableRowPendingDelete(const State<WorkspaceModel>& workspace,
+                                 std::uint64_t tab_id, std::size_t row_index) {
+  bool marked = false;
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab* target = ws.FindTab(tab_id);
+    if (target == nullptr || target->kind != WorkspaceTabKind::Table ||
+        !target->table.editable || target->table.read_only || target->table.committing ||
+        !target->table.snapshot || row_index >= target->table.snapshot->rows.size()) {
+      return;
+    }
+    auto& deletes = target->table.pending_deletes;
+    if (const auto it = std::ranges::find(deletes, row_index); it != deletes.end()) {
+      deletes.erase(it);
+      marked = false;
+    } else {
+      deletes.push_back(row_index);
+      marked = true;
+    }
+  });
+  return marked;
+}
+
+void RequestCommitTableChanges(const State<AppModel>& app,
+                               const State<WorkspaceModel>& workspace,
+                               const TaskScope& tasks, std::uint64_t tab_id, NotifyFn notify) {
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table ||
-      tab->table.pending_inserts.empty() || tab->table.committing) {
+      !tab->table.HasPendingChanges() || tab->table.committing) {
     return;
   }
   const DbSession* session = detail::DbFindSession(app.Get(), tab->session_id);
@@ -459,6 +386,8 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
   const std::uint64_t session_id = tab->session_id;
   const std::string object_name = tab->object_name;
   TableModel table_copy = tab->table;
+  std::vector<PendingCellEdit> edits = tab->table.pending_edits;
+  std::vector<std::size_t> deletes = tab->table.pending_deletes;
   std::vector<PendingInsertRow> rows = tab->table.pending_inserts;
   for (PendingInsertRow& row : rows) {
     for (std::size_t col_idx = 0;
@@ -479,11 +408,14 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
   });
 
   tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc,
-                table_copy = std::move(table_copy), rows = std::move(rows), tab_id,
-                session_id, object_name]() mutable -> Task<void> {
-    BatchInsertResult res = co_await adbc->sequence.Run(
-        [adbc, table_copy = std::move(table_copy), rows = std::move(rows)](
-            std::stop_token) mutable { return InsertRowsBlocking(*adbc, table_copy, rows); });
+                table_copy = std::move(table_copy), edits = std::move(edits),
+                deletes = std::move(deletes), rows = std::move(rows), tab_id, session_id,
+                object_name]() mutable -> Task<void> {
+    BatchCommitResult res = co_await adbc->sequence.Run(
+        [adbc, table_copy = std::move(table_copy), edits = std::move(edits),
+         deletes = std::move(deletes), rows = std::move(rows)](std::stop_token) mutable {
+          return CommitTableChangesBlocking(*adbc, table_copy, edits, deletes, rows);
+        });
 
     if (res.connection_lost) {
       workspace.Update([&](WorkspaceModel& ws) {
@@ -508,29 +440,43 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
           return;
         }
         target->table.committing = false;
-        if (!res.rolled_back && res.inserted > 0) {
-          const std::size_t remove_count =
-              std::min(res.inserted, target->table.pending_inserts.size());
-          target->table.pending_inserts.erase(target->table.pending_inserts.begin(),
-                                              target->table.pending_inserts.begin() +
-                                                  static_cast<std::ptrdiff_t>(remove_count));
-          partial_reload = true;
-          reload_page = target->table.page;
-          reload_sort = target->table.sort;
-          reload_filter = target->table.filter;
+        if (!res.rolled_back) {
+          if (res.updated_rows > 0) {
+            target->table.pending_edits.clear();
+          }
+          if (res.deleted_rows > 0) {
+            target->table.pending_deletes.clear();
+          }
+          if (res.inserted_rows > 0) {
+            const std::size_t remove_count =
+                std::min(res.inserted_rows, target->table.pending_inserts.size());
+            target->table.pending_inserts.erase(target->table.pending_inserts.begin(),
+                                                target->table.pending_inserts.begin() +
+                                                    static_cast<std::ptrdiff_t>(remove_count));
+          }
+          if (res.updated_rows > 0 || res.deleted_rows > 0 || res.inserted_rows > 0) {
+            partial_reload = true;
+            reload_page = target->table.page;
+            reload_sort = target->table.sort;
+            reload_filter = target->table.filter;
+          }
         }
       });
       if (notify) {
-        notify(TrFmt("Commit failed: {0}", "提交失败: {0}", {res.error}));
+        notify(res.rolled_back
+                   ? TrFmt("Commit failed, transaction rolled back (staged changes kept): {0}",
+                           "提交失败，事务已回滚（暂存修改已保留）: {0}", {res.error})
+                   : TrFmt("Commit failed: {0}", "提交失败: {0}", {res.error}));
       }
       if (partial_reload) {
         RequestLoadTable(app, workspace, tasks, tab_id, reload_page, reload_sort,
-                         std::move(reload_filter), false, notify);
+                         std::move(reload_filter), true, notify);
       }
       co_return;
     }
 
     bool should_reload = false;
+    bool keep_sel = res.deleted_rows == 0;
     std::int64_t target_page = 0;
     std::optional<DataTableSort> reload_sort;
     std::string reload_filter;
@@ -541,19 +487,32 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
         return;
       }
       should_reload = true;
+      const std::size_t page_rows =
+          target->table.snapshot ? target->table.snapshot->rows.size() : 0;
+      target->table.pending_edits.clear();
+      target->table.pending_deletes.clear();
       target->table.pending_inserts.clear();
       target->table.committing = false;
-      if (target->selected_cell.has_value() &&
-          target->selected_cell->row_id.starts_with("draft:")) {
+      if (res.deleted_rows > 0 || (target->selected_cell.has_value() &&
+                                   target->selected_cell->row_id.starts_with("draft:"))) {
         target->selected_cell = std::nullopt;
+        keep_sel = false;
       }
       reload_sort = target->table.sort;
       reload_filter = target->table.filter;
-      if (!target->table.sort.has_value() && target->table.filter.empty()) {
+      if (res.inserted_rows > 0 && !target->table.sort.has_value() &&
+          target->table.filter.empty()) {
         const std::int64_t next_total =
-            target->table.total + static_cast<std::int64_t>(res.inserted);
+            std::max<std::int64_t>(0, target->table.total +
+                                          static_cast<std::int64_t>(res.inserted_rows) -
+                                          static_cast<std::int64_t>(res.deleted_rows));
         const std::int64_t page_size = std::max<std::int64_t>(1, target->table.page_size);
         target_page = std::max<std::int64_t>(0, (next_total - 1) / page_size);
+        keep_sel = false;
+      } else if (res.deleted_rows >= page_rows && target->table.page > 0 &&
+                 res.inserted_rows == 0) {
+        target_page = target->table.page - 1;
+        keep_sel = false;
       } else {
         target_page = target->table.page;
       }
@@ -561,10 +520,24 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
 
     if (should_reload) {
       RequestLoadTable(app, workspace, tasks, tab_id, target_page, reload_sort,
-                       std::move(reload_filter), false, notify);
+                       std::move(reload_filter), keep_sel, notify);
     }
     if (notify) {
-      notify(TrFmt("Committed {0} row(s)", "已提交 {0} 行", {std::to_string(res.inserted)}));
+      if (res.updated_rows > 0 && res.deleted_rows == 0 && res.inserted_rows == 0) {
+        notify(TrFmt("Committed {0} updated row(s)", "已提交 {0} 行修改",
+                     {std::to_string(res.updated_rows)}));
+      } else if (res.deleted_rows > 0 && res.updated_rows == 0 && res.inserted_rows == 0) {
+        notify(TrFmt("Committed {0} deleted row(s)", "已提交 {0} 行删除",
+                     {std::to_string(res.deleted_rows)}));
+      } else if (res.inserted_rows > 0 && res.updated_rows == 0 && res.deleted_rows == 0) {
+        notify(TrFmt("Committed {0} row(s)", "已提交 {0} 行",
+                     {std::to_string(res.inserted_rows)}));
+      } else {
+        notify(TrFmt("Committed {0} update(s), {1} delete(s), {2} insert(s)",
+                     "已提交 {0} 行修改、{1} 行删除、{2} 行新增",
+                     {std::to_string(res.updated_rows), std::to_string(res.deleted_rows),
+                      std::to_string(res.inserted_rows)}));
+      }
     }
   });
 }
@@ -694,7 +667,7 @@ void HandleSessionDisconnected(const State<AppModel>& app,
   std::vector<std::uint64_t> tabs_to_close;
   for (const WorkspaceTab& tab : workspace.Get().tabs) {
     if (tab.session_id == session_id && tab.kind == WorkspaceTabKind::Table &&
-        tab.table.pending_inserts.empty()) {
+        !tab.table.HasPendingChanges()) {
       tabs_to_close.push_back(tab.id);
     }
   }
@@ -840,7 +813,7 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
 
     const WorkspaceTab* active_tab = workspace.Get().ActiveTab();
     if (active_tab != nullptr && active_tab->kind == WorkspaceTabKind::Table &&
-        active_tab->session_id == session_id && active_tab->table.pending_inserts.empty()) {
+        active_tab->session_id == session_id && !active_tab->table.HasPendingChanges()) {
       RequestLoadTable(app, workspace, tasks, active_tab->id, active_tab->table.page,
                        active_tab->table.sort, active_tab->table.filter, true, notify);
     }

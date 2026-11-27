@@ -34,7 +34,7 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
 [[huxerui::composable]] View EditCellDialog(DialogContext dialog, State<AppModel> app,
                                              State<WorkspaceModel> workspace, std::uint64_t tab_id,
                                              std::size_t row_index, std::size_t column_index,
-                                             TaskScope tasks, NotifyFn notify) {
+                                             TaskScope /*tasks*/, NotifyFn /*notify*/) {
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
 
@@ -55,26 +55,32 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
 
   const ColumnMeta& col = tab->table.columns[column_index];
   const CellValue& cell = tab->table.snapshot->rows[row_index].values[column_index];
-  const std::string initial_display = cell.is_null ? std::string{} : cell.DisplayText();
+  const PendingCellEdit* pending_edit = tab->table.FindPendingEdit(row_index, column_index);
+  const bool eff_null = pending_edit != nullptr ? pending_edit->is_null : cell.is_null;
+  const std::string eff_raw =
+      pending_edit != nullptr ? (pending_edit->is_null ? std::string{} : pending_edit->raw_text)
+                              : cell.text;
+  const std::string eff_display =
+      eff_null ? std::string{}
+               : (pending_edit != nullptr ? pending_edit->display_text : cell.DisplayText());
   const bool ts_hint = IsTimestampColumnHint(col.name, col.type) ||
-                       (!cell.display_text.empty() && cell.display_text != cell.text);
+                       (!eff_display.empty() && eff_display != eff_raw);
 
-  auto text_state = UseState(TextEditingValue::FromText(initial_display));
-  auto set_null = UseState(cell.is_null);
+  auto text_state = UseState(TextEditingValue::FromText(eff_display));
+  auto set_null = UseState(eff_null);
 
-  const auto save = [dialog, app, workspace, tab_id, row_index, column_index, col_name = col.name,
-                     text_state, set_null, tasks, notify] {
+  const auto save = [dialog, app, workspace, tab_id, row_index, col_name = col.name,
+                     text_state, set_null] {
     const std::string out_val = set_null.Get() ? std::string{"NULL"} : text_state.Get().text;
     dialog.Dismiss();
-    RequestSaveCell(app, workspace, tasks, tab_id,
-                    DataTableEditRequest{
-                        .cell_id = {.row_id = std::to_string(row_index), .column_id = col_name},
-                        .text = out_val,
-                    },
-                    notify);
+    StageTableCellEdit(app, workspace, tab_id,
+                       DataTableEditRequest{
+                           .cell_id = {.row_id = std::to_string(row_index), .column_id = col_name},
+                           .text = out_val,
+                       });
   };
 
-  const bool multiline = ShouldMultilineEdit(col, initial_display);
+  const bool multiline = ShouldMultilineEdit(col, eff_display);
   TextField editor =
       TextField(text_state)
           .Label(col.name)
@@ -99,35 +105,122 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
   }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}));
   body.Add(MutedText(TypeLabel(col)));
   if (ts_hint) {
-    body.Add((!cell.is_null && !cell.display_text.empty() && cell.display_text != cell.text)
-                 ? MutedText(UseString(app::strings::edit_cell_raw_hint, cell.text))
+    body.Add((!eff_null && !eff_display.empty() && eff_display != eff_raw)
+                 ? MutedText(UseString(app::strings::edit_cell_raw_hint, eff_raw))
                  : MutedText(UseString(app::strings::edit_cell_ts_hint)));
   }
   body.Add(MonospaceField(std::move(editor).With(Enabled{!set_null.Get()})));
-  if (col.nullable) {
-    body.Add(
-        Row{
-            Text(app::strings::edit_cell_set_null).With(Grow(1.0F)),
-            Switch(set_null.Get()).OnChanged([set_null](bool next) { set_null = next; }),
-        }
-            .With(CrossAlign{CrossAxisAlignment::Center}, Spacing{10.0F},
-                  Padding{EdgeInsets::Symmetric(2.0F, 4.0F)}, CornerRadius{6.0F},
-                  Background{VisualFill{WithAlpha(semantic.border_subtle, 0.25F)}}));
-  }
+  body.Add(
+      Row{
+          Text(app::strings::edit_cell_set_null).With(Grow(1.0F)),
+          Switch(set_null.Get()).OnChanged([set_null](bool next) { set_null = next; }),
+      }
+          .With(CrossAlign{CrossAxisAlignment::Center}, Spacing{10.0F},
+                Padding{EdgeInsets::Symmetric(2.0F, 4.0F)}, CornerRadius{6.0F},
+                Background{VisualFill{WithAlpha(semantic.border_subtle, 0.25F)}}));
 
   return DialogCard(Column{std::move(body)}.With(
       Frame{.width = 500.0F}, Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
 }
 
-View NullValueBadge(Color null_color) {
+View NullValueBadge(Color null_color, bool strikethrough) {
   return Text("NULL")
-      .Style(TextStyle{Font::Monospace(11.0F).WithSlant(FontSlant::Italic)
-                           .WithWeight(FontWeight::Medium),
-                       null_color})
+      .Style(TextStyle{
+          .font = Font::Monospace(11.0F).WithSlant(FontSlant::Italic).WithWeight(FontWeight::Medium),
+          .foreground = null_color,
+          .decoration = strikethrough ? TextDecoration::StrikeThrough : TextDecoration::None,
+      })
       .LineLimit(1)
       .With(Padding{EdgeInsets::Symmetric(5.0F, 1.0F)}, CornerRadius{4.0F},
             Background{VisualFill{WithAlpha(null_color, 0.14F)}},
             Border{WithAlpha(null_color, 0.30F), 1.0F});
+}
+
+void RunGuardedWrite(const WriteGuardContext& guard, std::string action_summary,
+                     std::function<void()> on_proceed) {
+  if (guard.read_only) {
+    if (guard.notify) {
+      guard.notify(guard.loc.Get(app::strings::toast_readonly_blocked));
+    }
+    return;
+  }
+  if (guard.production_mode) {
+    guard.dialogs.Show([guard, action_summary = std::move(action_summary),
+                        on_proceed = std::move(on_proceed)](DialogContext dialog) {
+      return WithDialogTheme(
+          guard.theme_config, guard.language_mode, guard.system_dark,
+          ProductionWriteConfirmDialog(dialog, guard.connection_name, action_summary, on_proceed));
+    });
+    return;
+  }
+  if (on_proceed) {
+    on_proceed();
+  }
+}
+
+DataTableColumn MakeRowNumberColumn(std::int64_t base_offset, std::size_t row_count,
+                                    const std::unordered_map<std::string, float>& column_widths,
+                                    Color muted_color, Color draft_color,
+                                    std::vector<std::size_t> pending_deletes, Color delete_color) {
+  DataTableColumn column;
+  column.id = std::string(kRowNumberColumnId);
+  column.header = "#";
+  column.sortable = false;
+
+  const std::string max_label =
+      FormatGlobalRowNumber(base_offset, row_count > 0 ? row_count - 1 : 0);
+  const float digits = static_cast<float>(std::max<std::size_t>(2, max_label.size()));
+  float initial_width = std::clamp(26.0F + digits * 8.0F, 44.0F, 96.0F);
+  if (const auto width_it = column_widths.find(column.id); width_it != column_widths.end()) {
+    initial_width = std::clamp(width_it->second, 40.0F, 120.0F);
+  }
+  column.width = DataTableColumnWidth{
+      .initial = initial_width,
+      .min = 40.0F,
+      .max = 120.0F,
+  };
+  column.render_cell = [base_offset, muted_color, draft_color,
+                        pending_deletes = std::move(pending_deletes),
+                        delete_color](const DataTableCellContext& cell) -> DataTableCellContent {
+    if (IsDraftRowId(cell.id.row_id)) {
+      return DataTableCellContent{
+          .view = Text("+")
+                      .Style(TextStyle{Font::Monospace(12.0F).WithWeight(FontWeight::SemiBold),
+                                       draft_color})
+                      .LineLimit(1),
+          .label = "+",
+      };
+    }
+    const std::size_t row_idx = RowIndexFromId(cell.id.row_id);
+    if (row_idx == static_cast<std::size_t>(-1)) {
+      return DataTableCellContent{.view = View{}, .label = {}};
+    }
+    const bool is_del =
+        std::ranges::find(pending_deletes, row_idx) != pending_deletes.end();
+    std::string num_text = FormatGlobalRowNumber(base_offset, row_idx);
+    if (is_del) {
+      return DataTableCellContent{
+          .view = Row{Text(num_text)
+                          .Style(TextStyle{
+                              .font = Font::Monospace(12.0F).WithWeight(FontWeight::SemiBold),
+                              .foreground = delete_color,
+                              .decoration = TextDecoration::StrikeThrough,
+                          })
+                          .LineLimit(1)}
+                      .With(Frame{.min_height = 26.0F}, CrossAlign{CrossAxisAlignment::Center},
+                            Background{VisualFill{WithAlpha(delete_color, 0.14F)}}),
+          .label = num_text,
+      };
+    }
+    return DataTableCellContent{
+        .view = Text(num_text)
+                    .Style(TextStyle{Font::Monospace(12.0F), muted_color})
+                    .LineLimit(1)
+                    .Overflow(TextOverflow::Ellipsis),
+        .label = std::move(num_text),
+    };
+  };
+  return column;
 }
 
 [[huxerui::composable]] View CompactTableCellEditor(huxerui::View field) {
@@ -180,15 +273,16 @@ void ShowTableCellContextMenu(
     Point position, const MenuHandle& menu, const DialogHandle& dialogs,
     const std::shared_ptr<Clipboard>& clipboard, const State<AppModel>& app,
     const State<WorkspaceModel>& workspace, std::uint64_t tab_id, std::size_t row_index,
-    std::size_t col_index, Dialect dialect, bool is_redis, bool can_edit, bool can_set_null,
-    bool is_production, const std::string& prod_conn_name, const std::string& cell_display,
+    std::size_t col_index, Dialect dialect, bool is_redis, bool can_edit_cell,
+    bool can_modify_row, bool is_pending_delete, bool can_set_null, bool /*is_production*/,
+    const std::string& /*prod_conn_name*/, const std::string& cell_display,
     const std::string& row_tsv, const ColumnMeta& col_meta, const CellValue& raw_cell,
     const TaskScope& tasks, const NotifyFn& notify, const AppThemeConfig& theme_config,
     LanguageMode language_mode, bool system_dark, const Color& danger_tint,
     const LocalizedCatalog& loc, const std::function<void()>& add_draft_row,
     const std::function<void(std::string)>& apply_filter_sql) {
   std::vector<MenuEntry> entries;
-  if (can_edit) {
+  if (can_edit_cell) {
     entries.emplace_back(MenuItem(
         app::images::edit, loc.Get(app::strings::table_ctx_edit_cell),
         [dialogs, app, workspace, tab_id, row_index, col_index, tasks, notify, theme_config,
@@ -200,24 +294,23 @@ void ShowTableCellContextMenu(
                 EditCellDialog(dialog, app, workspace, tab_id, row_index, col_index, tasks, notify));
           });
         }));
-    if (col_meta.nullable) {
-      entries.emplace_back(
-          MenuItem(app::images::null_val, loc.Get(app::strings::table_ctx_set_null),
-                   [dialogs, app, workspace, tab_id, row_index, col_name = col_meta.name,
-                    is_production, prod_conn_name, theme_config, language_mode, system_dark, tasks,
-                    notify] {
-                     HandleTableEditSubmitted(
-                         dialogs, app, workspace, tasks, tab_id,
-                         DataTableEditRequest{
-                             .cell_id = {.row_id = std::to_string(row_index),
-                                         .column_id = col_name},
-                             .text = "NULL",
-                         },
-                         is_production, prod_conn_name, theme_config, language_mode, system_dark,
-                         notify);
-                   })
-              .Enabled(can_set_null));
-    }
+  }
+  const bool show_set_null =
+      can_modify_row && !is_pending_delete && !(is_redis && col_meta.name == "size");
+  if (show_set_null) {
+    entries.emplace_back(
+        MenuItem(app::images::null_val, loc.Get(app::strings::table_ctx_set_null),
+                 [app, workspace, tab_id, row_index, col_name = col_meta.name] {
+                   StageTableCellEdit(app, workspace, tab_id,
+                                      DataTableEditRequest{
+                                          .cell_id = {.row_id = std::to_string(row_index),
+                                                      .column_id = col_name},
+                                          .text = "NULL",
+                                      });
+                 })
+            .Enabled(can_set_null));
+  }
+  if (can_edit_cell || show_set_null) {
     entries.emplace_back(MenuSection{});
   }
 
@@ -265,32 +358,31 @@ void ShowTableCellContextMenu(
         }
       }));
 
-  if (can_edit) {
+  if (can_modify_row) {
     entries.emplace_back(MenuSection{});
     entries.emplace_back(MenuItem(
         app::images::add,
         loc.Get(is_redis ? app::strings::table_add_key : app::strings::table_add_row),
         add_draft_row));
-    entries.emplace_back(
-        MenuItem(
-            app::images::trash,
-            loc.Get(is_redis ? app::strings::table_delete_key : app::strings::table_delete_row),
-            [dialogs, app, workspace, tab_id, row_index, col_name = col_meta.name, tasks, notify,
-             theme_config, language_mode, system_dark, is_redis] {
-              workspace.Update([tab_id, row_index, col_name](WorkspaceModel& ws) {
-                if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-                  target->selected_cell =
-                      DataTableCellId{.row_id = std::to_string(row_index), .column_id = col_name};
-                }
-              });
-              dialogs.Show([app, workspace, tab_id, tasks, notify, theme_config, language_mode,
-                            system_dark, is_redis](DialogContext dialog) {
-                return WithDialogTheme(
-                    theme_config, language_mode, system_dark,
-                    DeleteRowDialog(dialog, app, workspace, tab_id, tasks, notify, is_redis));
-              });
-            })
-            .IconTint(danger_tint));
+    const std::string del_label =
+        is_pending_delete
+            ? loc.Get(app::strings::table_undo_delete_row)
+            : loc.Get(is_redis ? app::strings::table_delete_key : app::strings::table_delete_row);
+    MenuItem del_item(
+        app::images::trash, del_label,
+        [workspace, tab_id, row_index, col_name = col_meta.name] {
+          workspace.Update([tab_id, row_index, col_name](WorkspaceModel& ws) {
+            if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+              target->selected_cell =
+                  DataTableCellId{.row_id = std::to_string(row_index), .column_id = col_name};
+            }
+          });
+          (void)ToggleTableRowPendingDelete(workspace, tab_id, row_index);
+        });
+    if (!is_pending_delete) {
+      del_item = std::move(del_item).IconTint(danger_tint);
+    }
+    entries.emplace_back(std::move(del_item));
   }
 
   menu.ShowAt(position, std::move(entries));
@@ -347,18 +439,20 @@ void LaunchTableFileImport(
       }
     });
   };
-  if (is_production) {
-    const std::string summary =
-        std::string(is_jsonl ? "IMPORT JSONL -> " : "IMPORT CSV -> ") + target_table_name;
-    dialogs.Show([prod_conn_name, summary, run_ingest, theme_config, language_mode,
-                  system_dark](DialogContext dialog) {
-      return WithDialogTheme(
-          theme_config, language_mode, system_dark,
-          ProductionWriteConfirmDialog(dialog, prod_conn_name, summary, run_ingest));
-    });
-    return;
-  }
-  run_ingest();
+  RunGuardedWrite(
+      WriteGuardContext{
+          .read_only = false,
+          .production_mode = is_production,
+          .connection_name = prod_conn_name,
+          .dialogs = dialogs,
+          .notify = notify,
+          .loc = loc,
+          .theme_config = theme_config,
+          .language_mode = language_mode,
+          .system_dark = system_dark,
+      },
+      std::string(is_jsonl ? "IMPORT JSONL -> " : "IMPORT CSV -> ") + target_table_name,
+      run_ingest);
 }
 
 namespace {
@@ -499,22 +593,23 @@ void LaunchDatabaseSqlImport(
       });
     };
 
-    if (is_production) {
-      const std::size_t slash = path.find_last_of("/\\");
-      const std::string file_name = slash == std::string::npos ? path : path.substr(slash + 1);
-      const std::string target_label =
-          target_database.empty() ? prod_conn_name : target_database;
-      const std::string summary =
-          "IMPORT SQL -> " + target_label + " (" + file_name + ")";
-      dialogs.Show([prod_conn_name, summary, run_import, theme_config, language_mode,
-                    system_dark](DialogContext dialog) {
-        return WithDialogTheme(
-            theme_config, language_mode, system_dark,
-            ProductionWriteConfirmDialog(dialog, prod_conn_name, summary, run_import));
-      });
-      co_return;
-    }
-    run_import();
+    const std::size_t slash = path.find_last_of("/\\");
+    const std::string file_name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const std::string target_label =
+        target_database.empty() ? prod_conn_name : target_database;
+    RunGuardedWrite(
+        WriteGuardContext{
+            .read_only = false,
+            .production_mode = is_production,
+            .connection_name = prod_conn_name,
+            .dialogs = dialogs,
+            .notify = notify,
+            .loc = loc,
+            .theme_config = theme_config,
+            .language_mode = language_mode,
+            .system_dark = system_dark,
+        },
+        "IMPORT SQL -> " + target_label + " (" + file_name + ")", run_import);
   });
 }
 
@@ -643,57 +738,122 @@ void AppendTableIoMenuEntries(
   }
 }
 
-void HandleTableEditSubmitted(
-    const DialogHandle& dialogs, const State<AppModel>& app,
-    const State<WorkspaceModel>& workspace, const TaskScope& tasks, std::uint64_t tab_id,
-    const DataTableEditRequest& edit, bool is_production, const std::string& prod_conn_name,
-    AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark,
-    const NotifyFn& notify) {
-  if (is_production) {
-    const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
-    bool changed = true;
-    if (cur_tab != nullptr && cur_tab->table.snapshot) {
-      const std::size_t ridx = RowIndexFromId(edit.cell_id.row_id);
-      if (ridx < cur_tab->table.snapshot->rows.size()) {
-        for (std::size_t ci = 0; ci < cur_tab->table.columns.size(); ++ci) {
-          if (cur_tab->table.columns[ci].name == edit.cell_id.column_id) {
-            const CellValue& cv = cur_tab->table.snapshot->rows[ridx].values[ci];
-            const ColumnMeta& cm = cur_tab->table.columns[ci];
-            Dialect dialect = Dialect::Generic;
-            for (const auto& s : app.Get().sessions) {
-              if (s.id == cur_tab->session_id && s.session) {
-                dialect = s.session->dialect;
-                break;
-              }
-            }
-            const std::string norm = NormalizeTimestampForWrite(
-                edit.text, cv.is_null ? std::string_view{} : std::string_view(cv.text), cm.name,
-                cm.type, dialect);
-            if ((!cv.is_null && cv.text == norm) || (cv.is_null && norm == "NULL")) {
-              changed = false;
-            }
-            break;
-          }
+void ApplyDraftCellValue(const State<WorkspaceModel>& workspace, std::uint64_t tab_id,
+                         std::string_view row_id, std::string_view col_id,
+                         const std::string& value) {
+  const auto draft_id = ParseDraftRowId(row_id);
+  if (!draft_id) {
+    return;
+  }
+  const WorkspaceTab* snapshot_tab = workspace.Get().FindTab(tab_id);
+  if (snapshot_tab == nullptr || snapshot_tab->kind != WorkspaceTabKind::Table) {
+    return;
+  }
+  std::size_t col_idx = snapshot_tab->table.columns.size();
+  for (std::size_t i = 0; i < snapshot_tab->table.columns.size(); ++i) {
+    if (snapshot_tab->table.columns[i].name == col_id) {
+      col_idx = i;
+      break;
+    }
+  }
+  if (col_idx >= snapshot_tab->table.columns.size()) {
+    return;
+  }
+  if (const PendingInsertRow* existing =
+          FindDraftRow(snapshot_tab->table.pending_inserts, *draft_id)) {
+    const std::string& cur_val =
+        col_idx < existing->values.size() ? existing->values[col_idx] : std::string{};
+    if (cur_val == value) {
+      return;
+    }
+  } else {
+    return;
+  }
+
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab* target = ws.FindTab(tab_id);
+    if (target == nullptr || target->kind != WorkspaceTabKind::Table) {
+      return;
+    }
+    PendingInsertRow* draft = FindDraftRowMutable(target->table.pending_inserts, *draft_id);
+    if (draft == nullptr) {
+      return;
+    }
+    if (draft->values.size() < target->table.columns.size()) {
+      draft->values.resize(target->table.columns.size());
+    }
+    draft->values[col_idx] = value;
+  });
+}
+
+void FlushLiveTableEdits(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                         std::uint64_t tab_id,
+                         const std::shared_ptr<std::unordered_map<std::string, std::string>>& live) {
+  if (!live || live->empty()) {
+    return;
+  }
+  auto pending = std::move(*live);
+  live->clear();
+  bool has_draft = false;
+  for (const auto& [key, val] : pending) {
+    const std::size_t sep = key.find('\n');
+    if (sep == std::string::npos) {
+      continue;
+    }
+    const std::string_view row_id(key.data(), sep);
+    const std::string_view col_id(key.data() + sep + 1, key.size() - sep - 1);
+    if (IsDraftRowId(row_id)) {
+      has_draft = true;
+    } else {
+      StageTableCellEdit(app, workspace, tab_id,
+                         DataTableEditRequest{.cell_id = {.row_id = std::string(row_id),
+                                                          .column_id = std::string(col_id)},
+                                              .text = val});
+    }
+  }
+  if (!has_draft) {
+    return;
+  }
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab* target = ws.FindTab(tab_id);
+    if (target == nullptr || target->kind != WorkspaceTabKind::Table) {
+      return;
+    }
+    for (const auto& [key, val] : pending) {
+      const std::size_t sep = key.find('\n');
+      if (sep == std::string::npos) {
+        continue;
+      }
+      const std::string_view row_id(key.data(), sep);
+      const std::string_view col_id(key.data() + sep + 1, key.size() - sep - 1);
+      const auto draft_id = ParseDraftRowId(row_id);
+      if (!draft_id) {
+        continue;
+      }
+      PendingInsertRow* draft = FindDraftRowMutable(target->table.pending_inserts, *draft_id);
+      if (draft == nullptr) {
+        continue;
+      }
+      if (draft->values.size() < target->table.columns.size()) {
+        draft->values.resize(target->table.columns.size());
+      }
+      for (std::size_t i = 0; i < target->table.columns.size(); ++i) {
+        if (target->table.columns[i].name == col_id) {
+          draft->values[i] = val;
+          break;
         }
       }
     }
-    if (!changed) {
-      return;
-    }
-    const std::string summary = "UPDATE " + edit.cell_id.column_id + " = " + edit.text;
-    dialogs.Show([app, workspace, tasks, tab_id, edit, notify, prod_conn_name, summary,
-                  theme_config, language_mode, system_dark](DialogContext dialog) {
-      return WithDialogTheme(
-          theme_config, language_mode, system_dark,
-          ProductionWriteConfirmDialog(dialog, prod_conn_name, summary,
-                                       [app, workspace, tasks, tab_id, edit, notify] {
-                                         RequestSaveCell(app, workspace, tasks, tab_id, edit,
-                                                         notify);
-                                       }));
-    });
-    return;
-  }
-  RequestSaveCell(app, workspace, tasks, tab_id, edit, notify);
+  });
+}
+
+void HandleTableEditSubmitted(
+    const DialogHandle& /*dialogs*/, const State<AppModel>& app,
+    const State<WorkspaceModel>& workspace, const TaskScope& /*tasks*/, std::uint64_t tab_id,
+    const DataTableEditRequest& edit, bool /*is_production*/, const std::string& /*prod_conn_name*/,
+    AppThemeConfig /*theme_config*/, LanguageMode /*language_mode*/, bool /*system_dark*/,
+    const NotifyFn& /*notify*/) {
+  StageTableCellEdit(app, workspace, tab_id, edit);
 }
 
 } // namespace dbpp

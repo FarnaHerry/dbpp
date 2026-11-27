@@ -124,6 +124,10 @@ bool SaveSavedQueries(const std::string& path, const std::vector<SavedQuery>& qu
     std::string_view to_key);
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows);
+BatchCommitResult CommitTableChangesBlocking(AdbcSession& session, const TableModel& model,
+                                             const std::vector<PendingCellEdit>& edits,
+                                             const std::vector<std::size_t>& deletes,
+                                             const std::vector<PendingInsertRow>& inserts);
 AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model,
                                    std::size_t row_index, std::size_t column_index,
                                    const std::string& text);
@@ -144,11 +148,6 @@ huxerui::Task<AdbcQueryResult> ExecutePreparedQueryAsync(
     std::shared_ptr<AdbcSession> session, std::string sql,
     std::vector<PreparedParamValue> params, bool want_rows, std::size_t max_rows,
     std::string target_database = {});
-huxerui::Task<AdbcQueryResult> UpdateCellAsync(std::shared_ptr<AdbcSession> session,
-                                               TableModel model, std::size_t row_index,
-                                               std::size_t column_index, std::string text);
-huxerui::Task<AdbcQueryResult> DeleteRowAsync(std::shared_ptr<AdbcSession> session,
-                                              TableModel model, std::size_t row_index);
 
 void RequestLoadTable(const huxerui::State<AppModel>& app,
                       const huxerui::State<WorkspaceModel>& workspace,
@@ -156,18 +155,15 @@ void RequestLoadTable(const huxerui::State<AppModel>& app,
                       std::int64_t page, std::optional<huxerui::DataTableSort> sort,
                       std::string filter, bool keep_selection, NotifyFn notify,
                       std::int64_t page_size = 0);
-void RequestSaveCell(const huxerui::State<AppModel>& app,
-                     const huxerui::State<WorkspaceModel>& workspace,
-                     const huxerui::TaskScope& tasks, std::uint64_t tab_id,
-                     const huxerui::DataTableEditRequest& edit, NotifyFn notify);
-void RequestDeleteSelected(const huxerui::State<AppModel>& app,
-                           const huxerui::State<WorkspaceModel>& workspace,
-                           const huxerui::TaskScope& tasks, std::uint64_t tab_id,
-                           NotifyFn notify);
-void RequestCommitPendingInserts(const huxerui::State<AppModel>& app,
-                                 const huxerui::State<WorkspaceModel>& workspace,
-                                 const huxerui::TaskScope& tasks, std::uint64_t tab_id,
-                                 NotifyFn notify);
+void StageTableCellEdit(const huxerui::State<AppModel>& app,
+                        const huxerui::State<WorkspaceModel>& workspace, std::uint64_t tab_id,
+                        const huxerui::DataTableEditRequest& edit);
+bool ToggleTableRowPendingDelete(const huxerui::State<WorkspaceModel>& workspace,
+                                 std::uint64_t tab_id, std::size_t row_index);
+void RequestCommitTableChanges(const huxerui::State<AppModel>& app,
+                               const huxerui::State<WorkspaceModel>& workspace,
+                               const huxerui::TaskScope& tasks, std::uint64_t tab_id,
+                               NotifyFn notify);
 void SelectObject(const huxerui::State<AppModel>& app,
                   const huxerui::State<WorkspaceModel>& workspace,
                   const huxerui::TaskScope& tasks, std::uint64_t session_id,

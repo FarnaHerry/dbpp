@@ -87,6 +87,100 @@ bool ShouldReportPreparedErrorDirectly(int prep_status, const AdbcQueryResult& p
   return false;
 }
 
+bool SupportsManagedTransactions(Dialect dialect) {
+  return dialect == Dialect::Sqlite || dialect == Dialect::Postgresql ||
+         dialect == Dialect::Mysql || dialect == Dialect::Duckdb;
+}
+
+class ScopedTransaction {
+ public:
+  explicit ScopedTransaction(AdbcSession& session) : session_(session) {
+    if (SupportsManagedTransactions(session_.dialect) && !session_.in_transaction) {
+      std::string tx_err;
+      if (SetAutocommitBlocking(session_, false, tx_err)) {
+        managed_ = true;
+        active_ = true;
+      }
+    }
+  }
+
+  ScopedTransaction(const ScopedTransaction&) = delete;
+  ScopedTransaction& operator=(const ScopedTransaction&) = delete;
+
+  ~ScopedTransaction() { Rollback(false); }
+
+  [[nodiscard]] bool WasManaged() const noexcept { return managed_; }
+
+  bool Rollback(bool connection_lost = false) {
+    if (!active_) {
+      return false;
+    }
+    active_ = false;
+    if (connection_lost) {
+      return false;
+    }
+    std::string rb_err;
+    (void)RollbackTransactionBlocking(session_, rb_err);
+    (void)SetAutocommitBlocking(session_, true, rb_err);
+    return true;
+  }
+
+  bool Commit(std::string& error_out) {
+    if (!active_) {
+      return true;
+    }
+    active_ = false;
+    if (!CommitTransactionBlocking(session_, error_out)) {
+      std::string rb_err;
+      (void)RollbackTransactionBlocking(session_, rb_err);
+      (void)SetAutocommitBlocking(session_, true, rb_err);
+      return false;
+    }
+    std::string ac_err;
+    (void)SetAutocommitBlocking(session_, true, ac_err);
+    return true;
+  }
+
+ private:
+  AdbcSession& session_;
+  bool managed_ = false;
+  bool active_ = false;
+};
+
+template <typename LiteralSqlFn>
+AdbcQueryResult ExecuteWriteWithFallback(AdbcSession& session, bool can_prepare,
+                                         std::string_view param_sql,
+                                         const std::vector<PreparedParamValue>& params,
+                                         const std::vector<std::string>& param_types,
+                                         LiteralSqlFn&& build_literal_sql) {
+  if (can_prepare && !param_sql.empty() &&
+      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
+    int prep_status = 0;
+    AdbcQueryResult prep_res;
+    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
+      if (prep_res.error.empty() || ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
+        if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
+          prep_res.connection_lost = true;
+        }
+        return prep_res;
+      }
+    } else if (!prep_res.error.empty() && prep_status != ADBC_STATUS_NOT_IMPLEMENTED &&
+               ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
+      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
+        prep_res.connection_lost = true;
+      }
+      return prep_res;
+    }
+  }
+  const std::string literal_sql = build_literal_sql();
+  if (literal_sql.empty()) {
+    AdbcQueryResult err;
+    err.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
+    return err;
+  }
+  return ExecuteBlocking(session, literal_sql, false, 0);
+}
+
 bool BuildParameterizedWhere(Dialect dialect, const TableModel& model, const GridRow& row,
                              std::string& where_out, std::vector<PreparedParamValue>& params_out,
                              std::vector<std::string>& types_out, std::size_t& next_param_idx) {
@@ -191,37 +285,22 @@ AdbcQueryResult UpdateRowInternal(AdbcSession& session, const TableModel& model,
           : std::string{};
 
   std::string param_where;
-  if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
-                              next_idx) &&
-      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
-    const std::string param_sql = "UPDATE " + model.qualified_name + " SET " + param_set +
-                                  " WHERE " + param_where + limit_suffix;
-    int prep_status = 0;
-    AdbcQueryResult prep_res;
-    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
-      if (prep_res.error.empty() || ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
-        if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-          prep_res.connection_lost = true;
+  const bool can_prepare = BuildParameterizedWhere(session.dialect, model, row, param_where, params,
+                                                   param_types, next_idx);
+  const std::string param_sql =
+      can_prepare
+          ? ("UPDATE " + model.qualified_name + " SET " + param_set + " WHERE " + param_where +
+             limit_suffix)
+          : std::string{};
+  return ExecuteWriteWithFallback(
+      session, can_prepare, param_sql, params, param_types, [&]() -> std::string {
+        const std::string where = detail::DbBuildWhere(session.dialect, model, row);
+        if (where.empty()) {
+          return {};
         }
-        return prep_res;
-      }
-    } else if (!prep_res.error.empty() && prep_status != ADBC_STATUS_NOT_IMPLEMENTED &&
-               ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
-      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-        prep_res.connection_lost = true;
-      }
-      return prep_res;
-    }
-  }
-
-  const std::string where = detail::DbBuildWhere(session.dialect, model, row);
-  if (where.empty()) {
-    result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
-    return result;
-  }
-  const std::string sql =
-      "UPDATE " + model.qualified_name + " SET " + literal_set + " WHERE " + where + limit_suffix;
-  return ExecuteBlocking(session, sql, false, 0);
+        return "UPDATE " + model.qualified_name + " SET " + literal_set + " WHERE " + where +
+               limit_suffix;
+      });
 }
 
 AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
@@ -262,118 +341,167 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
         SqlLiteral(session.dialect, values[index], model.columns[index].type, is_null);
   }
 
-  if (!columns.empty() &&
-      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
-    const std::string param_sql = "INSERT INTO " + model.qualified_name + " (" + columns +
-                                  ") VALUES (" + param_placeholders + ")";
-    int prep_status = 0;
-    AdbcQueryResult prep_res;
-    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
-      if (prep_res.error.empty() || ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
-        if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-          prep_res.connection_lost = true;
+  const std::string param_sql =
+      !columns.empty() ? ("INSERT INTO " + model.qualified_name + " (" + columns +
+                          ") VALUES (" + param_placeholders + ")")
+                       : std::string{};
+  return ExecuteWriteWithFallback(
+      session, !columns.empty(), param_sql, params, param_types, [&]() -> std::string {
+        if (columns.empty()) {
+          return session.dialect == Dialect::Mysql
+                     ? "INSERT INTO " + model.qualified_name + " () VALUES ()"
+                     : "INSERT INTO " + model.qualified_name + " DEFAULT VALUES";
         }
-        return prep_res;
-      }
-    } else if (!prep_res.error.empty() && prep_status != ADBC_STATUS_NOT_IMPLEMENTED &&
-               ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
-      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-        prep_res.connection_lost = true;
-      }
-      return prep_res;
-    }
-  }
-
-  std::string sql;
-  if (columns.empty()) {
-    sql = session.dialect == Dialect::Mysql
-              ? "INSERT INTO " + model.qualified_name + " () VALUES ()"
-              : "INSERT INTO " + model.qualified_name + " DEFAULT VALUES";
-  } else {
-    sql = "INSERT INTO " + model.qualified_name + " (" + columns + ") VALUES (" +
-          literal_placeholders + ")";
-  }
-  return ExecuteBlocking(session, sql, false, 0);
+        return "INSERT INTO " + model.qualified_name + " (" + columns + ") VALUES (" +
+               literal_placeholders + ")";
+      });
 }
 
 } // namespace
 
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows) {
+  if (rows.size() == 1 && !rows.empty() && session.dialect != Dialect::Redis) {
+    // Preserve single-row insert convenience semantics cleanly via CommitTableChangesBlocking
+  }
+  const BatchCommitResult res = CommitTableChangesBlocking(session, model, {}, {}, rows);
+  return BatchInsertResult{
+      .inserted = res.inserted_rows,
+      .rolled_back = res.rolled_back,
+      .connection_lost = res.connection_lost,
+      .error = res.error,
+  };
+}
+
+BatchCommitResult CommitTableChangesBlocking(AdbcSession& session, const TableModel& model,
+                                             const std::vector<PendingCellEdit>& edits,
+                                             const std::vector<std::size_t>& deletes,
+                                             const std::vector<PendingInsertRow>& inserts) {
   if (session.IsClosed()) {
-    return BatchInsertResult{.inserted = 0,
-                             .rolled_back = true,
+    return BatchCommitResult{.rolled_back = true,
                              .connection_lost = true,
                              .error = std::string(Tr("Connection is closed", "连接已关闭"))};
   }
-  if (session.dialect == Dialect::Redis && session.redis) {
-    return InsertRedisRowsBlocking(*session.redis, model, rows);
-  }
-  if (rows.empty()) {
+  if (edits.empty() && deletes.empty() && inserts.empty()) {
     return {};
   }
-  if (rows.size() == 1) {
-    AdbcQueryResult result = InsertRowBlocking(session, model, rows[0].values);
-    if (!result.error.empty()) {
-      return BatchInsertResult{.inserted = 0,
-                               .rolled_back = true,
-                               .connection_lost = result.connection_lost,
-                               .error = result.error};
-    }
-    return BatchInsertResult{.inserted = 1, .rolled_back = false, .error = {}};
+  if (model.read_only || !model.editable) {
+    return BatchCommitResult{.rolled_back = true,
+                             .error = std::string(Tr("Current object is not editable",
+                                                     "当前对象不允许编辑"))};
   }
 
-  const bool supports_tx = session.dialect == Dialect::Sqlite ||
-                           session.dialect == Dialect::Postgresql ||
-                           session.dialect == Dialect::Mysql ||
-                           session.dialect == Dialect::Duckdb;
-  bool managed_tx = false;
-  if (supports_tx && !session.in_transaction) {
-    std::string tx_err;
-    if (SetAutocommitBlocking(session, false, tx_err)) {
-      managed_tx = true;
+  std::vector<std::size_t> unique_deletes;
+  unique_deletes.reserve(deletes.size());
+  for (const std::size_t row_idx : deletes) {
+    if (std::ranges::find(unique_deletes, row_idx) == unique_deletes.end()) {
+      unique_deletes.push_back(row_idx);
     }
   }
 
-  for (std::size_t i = 0; i < rows.size(); ++i) {
-    AdbcQueryResult result = InsertRowBlocking(session, model, rows[i].values);
-    if (!result.error.empty()) {
-      const std::string msg = TrFmt("Row {0} insert failed: {1}", "第 {0} 行插入失败: {1}",
-                                    {std::to_string(i + 1), result.error});
-      if (managed_tx && !result.connection_lost) {
-        std::string rb_err;
-        (void)RollbackTransactionBlocking(session, rb_err);
-        (void)SetAutocommitBlocking(session, true, rb_err);
-        return BatchInsertResult{.inserted = 0,
-                                 .rolled_back = true,
-                                 .connection_lost = false,
-                                 .error = msg};
+  struct GroupedRowUpdate {
+    std::size_t row_index = 0;
+    std::vector<std::pair<std::size_t, std::string>> columns;
+  };
+  std::vector<GroupedRowUpdate> grouped_updates;
+  for (const PendingCellEdit& edit : edits) {
+    if (std::ranges::find(unique_deletes, edit.row_index) != unique_deletes.end()) {
+      continue;
+    }
+    auto row_it = std::ranges::find_if(
+        grouped_updates, [&](const GroupedRowUpdate& g) { return g.row_index == edit.row_index; });
+    if (row_it == grouped_updates.end()) {
+      grouped_updates.push_back(GroupedRowUpdate{
+          .row_index = edit.row_index,
+          .columns = {{edit.column_index, edit.raw_text}},
+      });
+      continue;
+    }
+    auto col_it = std::ranges::find_if(
+        row_it->columns, [&](const auto& c) { return c.first == edit.column_index; });
+    if (col_it != row_it->columns.end()) {
+      col_it->second = edit.raw_text;
+    } else {
+      row_it->columns.emplace_back(edit.column_index, edit.raw_text);
+    }
+  }
+
+  ScopedTransaction tx(session);
+  auto finish_error = [&](std::size_t updated_so_far, std::size_t deleted_so_far,
+                          std::size_t inserted_so_far, bool connection_lost,
+                          const std::string& msg) -> BatchCommitResult {
+    const bool rolled = tx.Rollback(connection_lost);
+    return BatchCommitResult{
+        .updated_rows = rolled ? 0 : updated_so_far,
+        .deleted_rows = rolled ? 0 : deleted_so_far,
+        .inserted_rows = rolled ? 0 : inserted_so_far,
+        .rolled_back = rolled,
+        .connection_lost = connection_lost,
+        .error = msg,
+    };
+  };
+
+  std::size_t updated_count = 0;
+  for (const GroupedRowUpdate& upd : grouped_updates) {
+    const AdbcQueryResult res = UpdateRowBlocking(session, model, upd.row_index, upd.columns);
+    if (!res.error.empty()) {
+      return finish_error(updated_count, 0, 0, res.connection_lost, res.error);
+    }
+    ++updated_count;
+  }
+
+  std::size_t deleted_count = 0;
+  for (const std::size_t del_idx : unique_deletes) {
+    const AdbcQueryResult res = DeleteRowBlocking(session, model, del_idx);
+    if (!res.error.empty()) {
+      return finish_error(updated_count, deleted_count, 0, res.connection_lost, res.error);
+    }
+    ++deleted_count;
+  }
+
+  std::size_t inserted_count = 0;
+  if (!inserts.empty()) {
+    if (session.dialect == Dialect::Redis && session.redis) {
+      const BatchInsertResult redis_res = InsertRedisRowsBlocking(*session.redis, model, inserts);
+      if (!redis_res.error.empty()) {
+        return finish_error(updated_count, deleted_count, redis_res.inserted,
+                            redis_res.connection_lost, redis_res.error);
       }
-      return BatchInsertResult{.inserted = result.connection_lost && managed_tx ? 0 : i,
-                               .rolled_back = result.connection_lost && managed_tx,
-                               .connection_lost = result.connection_lost,
-                               .error = msg};
+      inserted_count = redis_res.inserted;
+    } else {
+      for (std::size_t i = 0; i < inserts.size(); ++i) {
+        const AdbcQueryResult res = InsertRowBlocking(session, model, inserts[i].values);
+        if (!res.error.empty()) {
+          const std::string msg = TrFmt("Row {0} insert failed: {1}", "第 {0} 行插入失败: {1}",
+                                        {std::to_string(i + 1), res.error});
+          return finish_error(updated_count, deleted_count, inserted_count, res.connection_lost,
+                              msg);
+        }
+        ++inserted_count;
+      }
     }
   }
 
-  if (managed_tx) {
-    std::string commit_err;
-    if (!CommitTransactionBlocking(session, commit_err)) {
-      std::string rb_err;
-      (void)RollbackTransactionBlocking(session, rb_err);
-      (void)SetAutocommitBlocking(session, true, rb_err);
-      return BatchInsertResult{
-          .inserted = 0,
-          .rolled_back = true,
-          .connection_lost = IsConnectionLostError(0, commit_err),
-          .error = TrFmt("Failed to commit transaction: {0}", "提交事务失败: {0}",
-                         {commit_err})};
-    }
-    std::string ac_err;
-    (void)SetAutocommitBlocking(session, true, ac_err);
+  std::string commit_err;
+  if (!tx.Commit(commit_err)) {
+    return BatchCommitResult{
+        .updated_rows = 0,
+        .deleted_rows = 0,
+        .inserted_rows = 0,
+        .rolled_back = true,
+        .connection_lost = IsConnectionLostError(0, commit_err),
+        .error = TrFmt("Failed to commit transaction: {0}", "提交事务失败: {0}", {commit_err}),
+    };
   }
 
-  return BatchInsertResult{.inserted = rows.size(), .rolled_back = false, .error = {}};
+  return BatchCommitResult{
+      .updated_rows = updated_count,
+      .deleted_rows = deleted_count,
+      .inserted_rows = inserted_count,
+      .rolled_back = false,
+      .connection_lost = false,
+      .error = {},
+  };
 }
 
 AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model,
@@ -413,36 +541,20 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
   std::vector<PreparedParamValue> params;
   std::vector<std::string> param_types;
   std::string param_where;
-  if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
-                              next_idx) &&
-      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
-    const std::string param_sql =
-        "DELETE FROM " + model.qualified_name + " WHERE " + param_where + limit_suffix;
-    int prep_status = 0;
-    AdbcQueryResult prep_res;
-    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
-      if (prep_res.error.empty() || ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
-        if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-          prep_res.connection_lost = true;
+  const bool can_prepare = BuildParameterizedWhere(session.dialect, model, row, param_where, params,
+                                                   param_types, next_idx);
+  const std::string param_sql =
+      can_prepare
+          ? ("DELETE FROM " + model.qualified_name + " WHERE " + param_where + limit_suffix)
+          : std::string{};
+  return ExecuteWriteWithFallback(
+      session, can_prepare, param_sql, params, param_types, [&]() -> std::string {
+        const std::string where = detail::DbBuildWhere(session.dialect, model, row);
+        if (where.empty()) {
+          return {};
         }
-        return prep_res;
-      }
-    } else if (!prep_res.error.empty() && prep_status != ADBC_STATUS_NOT_IMPLEMENTED &&
-               ShouldReportPreparedErrorDirectly(prep_status, prep_res)) {
-      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-        prep_res.connection_lost = true;
-      }
-      return prep_res;
-    }
-  }
-
-  const std::string where = detail::DbBuildWhere(session.dialect, model, row);
-  if (where.empty()) {
-    result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
-    return result;
-  }
-  return ExecuteBlocking(
-      session, "DELETE FROM " + model.qualified_name + " WHERE " + where + limit_suffix, false, 0);
+        return "DELETE FROM " + model.qualified_name + " WHERE " + where + limit_suffix;
+      });
 }
 
 namespace detail {

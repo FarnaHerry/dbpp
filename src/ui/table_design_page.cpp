@@ -229,7 +229,7 @@ using namespace dbpp::ui;
           if (wtab.kind == WorkspaceTabKind::Table && wtab.session_id == session_id &&
               wtab.object_name == cur_obj.name &&
               (wtab.object_schema == cur_obj.db_schema || wtab.object_schema == cur_schema) &&
-              !wtab.is_view && wtab.table.pending_inserts.empty()) {
+              !wtab.is_view && !wtab.table.HasPendingChanges()) {
             tabs_info.emplace_back(wtab.id, wtab.table.page, wtab.table.sort, wtab.table.filter);
           }
         }
@@ -250,25 +250,23 @@ using namespace dbpp::ui;
     if (sql.empty() || busy.Get()) {
       return;
     }
-    if (read_only) {
-      if (notify) {
-        notify(loc.Get(app::strings::toast_readonly_blocked));
-      }
-      return;
-    }
-    if (is_production) {
-      dialogs.Show([prod_conn_name, sql, renamed_table, perform_ddl, theme_config, language_mode,
-                    system_dark](DialogContext dialog) {
-        return WithDialogTheme(
-            theme_config, language_mode, system_dark,
-            ProductionWriteConfirmDialog(dialog, prod_conn_name, sql,
-                                         [perform_ddl, sql, renamed_table] {
-                                           perform_ddl(sql, renamed_table);
-                                         }));
-      });
-      return;
-    }
-    perform_ddl(std::move(sql), std::move(renamed_table));
+    const std::string summary = sql;
+    RunGuardedWrite(
+        WriteGuardContext{
+            .read_only = read_only,
+            .production_mode = is_production,
+            .connection_name = prod_conn_name,
+            .dialogs = dialogs,
+            .notify = notify,
+            .loc = loc,
+            .theme_config = theme_config,
+            .language_mode = language_mode,
+            .system_dark = system_dark,
+        },
+        summary,
+        [perform_ddl, sql = std::move(sql), renamed_table = std::move(renamed_table)]() mutable {
+          perform_ddl(std::move(sql), std::move(renamed_table));
+        });
   };
 
   const TableDesignSnapshot& snap = design_data.Get();

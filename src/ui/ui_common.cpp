@@ -414,53 +414,6 @@ std::string FormatGlobalRowNumber(std::int64_t base_offset, std::size_t row_inde
   return std::to_string(base + idx + 1ULL);
 }
 
-DataTableColumn MakeRowNumberColumn(std::int64_t base_offset, std::size_t row_count,
-                                    const std::unordered_map<std::string, float>& column_widths,
-                                    Color muted_color, Color draft_color) {
-  DataTableColumn column;
-  column.id = std::string(kRowNumberColumnId);
-  column.header = "#";
-  column.sortable = false;
-
-  const std::string max_label =
-      FormatGlobalRowNumber(base_offset, row_count > 0 ? row_count - 1 : 0);
-  const float digits = static_cast<float>(std::max<std::size_t>(2, max_label.size()));
-  float initial_width = std::clamp(26.0F + digits * 8.0F, 44.0F, 96.0F);
-  if (const auto width_it = column_widths.find(column.id); width_it != column_widths.end()) {
-    initial_width = std::clamp(width_it->second, 40.0F, 120.0F);
-  }
-  column.width = DataTableColumnWidth{
-      .initial = initial_width,
-      .min = 40.0F,
-      .max = 120.0F,
-  };
-  column.render_cell = [base_offset, muted_color,
-                        draft_color](const DataTableCellContext& cell) -> DataTableCellContent {
-    if (IsDraftRowId(cell.id.row_id)) {
-      return DataTableCellContent{
-          .view = Text("+")
-                      .Style(TextStyle{Font::Monospace(12.0F).WithWeight(FontWeight::SemiBold),
-                                       draft_color})
-                      .LineLimit(1),
-          .label = "+",
-      };
-    }
-    const std::size_t row_idx = RowIndexFromId(cell.id.row_id);
-    if (row_idx == static_cast<std::size_t>(-1)) {
-      return DataTableCellContent{.view = View{}, .label = {}};
-    }
-    std::string num_text = FormatGlobalRowNumber(base_offset, row_idx);
-    return DataTableCellContent{
-        .view = Text(num_text)
-                    .Style(TextStyle{Font::Monospace(12.0F), muted_color})
-                    .LineLimit(1)
-                    .Overflow(TextOverflow::Ellipsis),
-        .label = std::move(num_text),
-    };
-  };
-  return column;
-}
-
 std::vector<DataTableColumn> BuildReadOnlyColumns(
     const std::vector<std::string>& names, const std::shared_ptr<const GridSnapshot>& snapshot,
     const std::unordered_map<std::string, float>& column_widths, Color text_color,

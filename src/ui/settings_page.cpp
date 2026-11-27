@@ -83,7 +83,7 @@ using namespace dbpp::ui;
         t.kind == WorkspaceTabKind::Settings
             ? std::string{}
             : (app_model.sessions.size() > 1 ? t.session_name : std::string{});
-    const bool dirty = t.kind == WorkspaceTabKind::Table && !t.table.pending_inserts.empty();
+    const bool dirty = t.kind == WorkspaceTabKind::Table && t.table.HasPendingChanges();
     const std::string label = dirty ? ("● " + t.title) : t.title;
 
     View close_btn =

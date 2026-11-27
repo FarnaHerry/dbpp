@@ -16,7 +16,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.3"
+#define DBPP_VERSION "0.4.4"
 #endif
 
 #include "ui/theme_palette.h"
@@ -152,7 +152,8 @@ std::string FormatGlobalRowNumber(std::int64_t base_offset, std::size_t row_inde
 huxerui::DataTableColumn MakeRowNumberColumn(
     std::int64_t base_offset, std::size_t row_count,
     const std::unordered_map<std::string, float>& column_widths, huxerui::Color muted_color,
-    huxerui::Color draft_color);
+    huxerui::Color draft_color, std::vector<std::size_t> pending_deletes = {},
+    huxerui::Color delete_color = huxerui::Color::Transparent());
 std::vector<huxerui::DataTableColumn> BuildReadOnlyColumns(
     const std::vector<std::string>& names, const std::shared_ptr<const GridSnapshot>& snapshot,
     const std::unordered_map<std::string, float>& column_widths, huxerui::Color text_color,
@@ -225,9 +226,21 @@ huxerui::View ConfirmCloseTabsDialog(huxerui::DialogContext dialog, huxerui::Sta
 huxerui::View CloseConfirmDialog(huxerui::DialogContext dialog,
                                  std::shared_ptr<TrayRuntime> tray_runtime,
                                  huxerui::State<bool> close_dialog_open);
-huxerui::View DeleteRowDialog(huxerui::DialogContext dialog, huxerui::State<AppModel> app,
-                              huxerui::State<WorkspaceModel> workspace, std::uint64_t tab_id,
-                              huxerui::TaskScope tasks, NotifyFn notify, bool is_redis);
+
+struct WriteGuardContext {
+  bool read_only = false;
+  bool production_mode = false;
+  std::string connection_name;
+  huxerui::DialogHandle dialogs;
+  NotifyFn notify;
+  LocalizedCatalog loc;
+  AppThemeConfig theme_config;
+  LanguageMode language_mode = LanguageMode::System;
+  bool system_dark = false;
+};
+
+void RunGuardedWrite(const WriteGuardContext& guard, std::string action_summary,
+                     std::function<void()> on_proceed);
 
 [[nodiscard]] bool HasLikelySqlParameters(std::string_view sql);
 
@@ -268,6 +281,13 @@ void AppendTableIoMenuEntries(
     const huxerui::DialogHandle& dialogs, const huxerui::TaskScope& tasks, NotifyFn notify,
     LocalizedCatalog loc, std::function<void()> on_done, AppThemeConfig theme_config,
     LanguageMode language_mode, bool system_dark);
+void ApplyDraftCellValue(const huxerui::State<WorkspaceModel>& workspace, std::uint64_t tab_id,
+                         std::string_view row_id, std::string_view col_id,
+                         const std::string& value);
+void FlushLiveTableEdits(
+    const huxerui::State<AppModel>& app, const huxerui::State<WorkspaceModel>& workspace,
+    std::uint64_t tab_id,
+    const std::shared_ptr<std::unordered_map<std::string, std::string>>& live);
 void HandleTableEditSubmitted(
     const huxerui::DialogHandle& dialogs, const huxerui::State<AppModel>& app,
     const huxerui::State<WorkspaceModel>& workspace, const huxerui::TaskScope& tasks,
@@ -278,7 +298,7 @@ huxerui::View EditCellDialog(huxerui::DialogContext dialog, huxerui::State<AppMo
                              huxerui::State<WorkspaceModel> workspace, std::uint64_t tab_id,
                              std::size_t row_index, std::size_t column_index,
                              huxerui::TaskScope tasks, NotifyFn notify);
-huxerui::View NullValueBadge(huxerui::Color null_color);
+huxerui::View NullValueBadge(huxerui::Color null_color, bool strikethrough = false);
 huxerui::View CompactTableCellEditor(huxerui::View field);
 void ShowReadOnlyCellContextMenu(
     huxerui::Point position, const huxerui::MenuHandle& menu,
@@ -290,12 +310,13 @@ void ShowTableCellContextMenu(
     const std::shared_ptr<huxerui::Clipboard>& clipboard,
     const huxerui::State<AppModel>& app, const huxerui::State<WorkspaceModel>& workspace,
     std::uint64_t tab_id, std::size_t row_index, std::size_t col_index, Dialect dialect,
-    bool is_redis, bool can_edit, bool can_set_null, bool is_production,
-    const std::string& prod_conn_name, const std::string& cell_display,
-    const std::string& row_tsv, const ColumnMeta& col_meta, const CellValue& raw_cell,
-    const huxerui::TaskScope& tasks, const NotifyFn& notify, const AppThemeConfig& theme_config,
-    LanguageMode language_mode, bool system_dark, const huxerui::Color& danger_tint,
-    const LocalizedCatalog& loc, const std::function<void()>& add_draft_row,
+    bool is_redis, bool can_edit_cell, bool can_modify_row, bool is_pending_delete,
+    bool can_set_null, bool is_production, const std::string& prod_conn_name,
+    const std::string& cell_display, const std::string& row_tsv, const ColumnMeta& col_meta,
+    const CellValue& raw_cell, const huxerui::TaskScope& tasks, const NotifyFn& notify,
+    const AppThemeConfig& theme_config, LanguageMode language_mode, bool system_dark,
+    const huxerui::Color& danger_tint, const LocalizedCatalog& loc,
+    const std::function<void()>& add_draft_row,
     const std::function<void(std::string)>& apply_filter_sql);
 
 // Schema / DDL dialogs (src/ui/schema_dialogs.cpp & src/ui/schema_tables.cpp)

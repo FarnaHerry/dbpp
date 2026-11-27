@@ -252,7 +252,7 @@ using namespace dbpp::ui;
     for (const std::uint64_t id : ids) {
       if (const WorkspaceTab* target = ws_snapshot.FindTab(id);
           target != nullptr && target->kind == WorkspaceTabKind::Table) {
-        draft_count += target->table.pending_inserts.size();
+        draft_count += target->table.PendingChangeCount();
       }
     }
     if (draft_count == 0) {
@@ -315,7 +315,7 @@ using namespace dbpp::ui;
     tab_items.Reserve(ws.tabs.size());
     for (const WorkspaceTab& t : ws.tabs) {
       const std::uint64_t tid = t.id;
-      const bool dirty = t.kind == WorkspaceTabKind::Table && !t.table.pending_inserts.empty();
+      const bool dirty = t.kind == WorkspaceTabKind::Table && t.table.HasPendingChanges();
       const std::string sublabel =
           (t.kind != WorkspaceTabKind::Settings && model.sessions.size() > 1)
               ? t.session_name
@@ -470,7 +470,7 @@ using namespace dbpp::ui;
         workspace.Update([clamped, &table_reloads, &sql_reloads](WorkspaceModel& w) {
           for (WorkspaceTab& tab : w.tabs) {
             if (tab.kind == WorkspaceTabKind::Table) {
-              if (tab.table.pending_inserts.empty()) {
+              if (!tab.table.HasPendingChanges()) {
                 table_reloads.push_back(PendingTableReload{
                     .tab_id = tab.id,
                     .sort = tab.table.sort,

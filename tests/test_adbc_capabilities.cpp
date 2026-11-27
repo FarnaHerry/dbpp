@@ -815,6 +815,81 @@ void RunAdbcCapabilitiesTests(const fs::path& dir, const std::string& driver_pat
                "'2024-01-02'",
            "PostgreSQL DATE SqlLiteral mismatch");
   }
+
+  // 20. Transactional batch commit (updates + deletes + inserts) and automatic rollback
+  {
+    const char* tx_sql =
+        "CREATE TABLE tx_items (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, note TEXT);"
+        "INSERT INTO tx_items VALUES (1, 'c1', 'n1'), (2, 'c2', 'n2'), (3, 'c3', 'n3');";
+    for (const std::string& stmt : dbpp::SplitSqlStatements(tx_sql, dbpp::Dialect::Sqlite)) {
+      const auto r = dbpp::ExecuteBlocking(session, stmt, false, 0);
+      Expect(r.error.empty(), "tx_items setup failed: " + r.error);
+    }
+
+    const dbpp::TableModel tx_model = dbpp::LoadTableBlocking(
+        session, 1, dbpp::DbObject{.name = "tx_items"}, 0, 50, std::nullopt, {});
+    Expect(tx_model.error.empty() && tx_model.editable && tx_model.snapshot &&
+               tx_model.snapshot->rows.size() == 3,
+           "tx_items LoadTableBlocking failed: " + tx_model.error);
+
+    // Atomic batch: multi-cell update on row 0, NULL on row 1, edit+delete on row 2 (delete wins),
+    // plus an insert row in one transaction.
+    const std::vector<dbpp::PendingCellEdit> ok_edits{
+        dbpp::PendingCellEdit{.row_index = 0, .column_index = 1, .raw_text = "c1_v1",
+                              .display_text = "c1_v1"},
+        dbpp::PendingCellEdit{.row_index = 0, .column_index = 1, .raw_text = "c1_new",
+                              .display_text = "c1_new"},
+        dbpp::PendingCellEdit{.row_index = 0, .column_index = 2, .raw_text = "n1_new",
+                              .display_text = "n1_new"},
+        dbpp::PendingCellEdit{.row_index = 1, .column_index = 2, .raw_text = "NULL",
+                              .display_text = "", .is_null = true},
+        dbpp::PendingCellEdit{.row_index = 2, .column_index = 1, .raw_text = "c3_ignored",
+                              .display_text = "c3_ignored"},
+    };
+    const std::vector<std::size_t> ok_deletes{2};
+    const std::vector<dbpp::PendingInsertRow> ok_inserts{
+        dbpp::PendingInsertRow{.draft_id = 1, .values = {"4", "c4", "n4"}},
+    };
+    const dbpp::BatchCommitResult ok_res =
+        dbpp::CommitTableChangesBlocking(session, tx_model, ok_edits, ok_deletes, ok_inserts);
+    Expect(ok_res.error.empty() && ok_res.updated_rows == 2 && ok_res.deleted_rows == 1 &&
+               ok_res.inserted_rows == 1 && !ok_res.rolled_back,
+           "CommitTableChangesBlocking atomic commit failed: " + ok_res.error);
+
+    const auto after_ok = dbpp::ExecuteBlocking(
+        session, "SELECT id, code, note FROM tx_items ORDER BY id", true, 10);
+    Expect(after_ok.error.empty() && after_ok.rows.size() == 3 &&
+               after_ok.rows[0].values[1].text == "c1_new" &&
+               after_ok.rows[0].values[2].text == "n1_new" &&
+               after_ok.rows[1].values[2].is_null &&
+               after_ok.rows[2].values[0].text == "4" &&
+               after_ok.rows[2].values[1].text == "c4",
+           "CommitTableChangesBlocking persisted values mismatch");
+
+    // Failed batch mid-way (update + delete succeed, duplicate UNIQUE insert fails -> full rollback)
+    const dbpp::TableModel tx_model2 = dbpp::LoadTableBlocking(
+        session, 1, dbpp::DbObject{.name = "tx_items"}, 0, 50, std::nullopt, {});
+    const std::vector<dbpp::PendingCellEdit> fail_edits{
+        dbpp::PendingCellEdit{.row_index = 0, .column_index = 2, .raw_text = "should_rollback",
+                              .display_text = "should_rollback"},
+    };
+    const std::vector<std::size_t> fail_deletes{1};
+    const std::vector<dbpp::PendingInsertRow> fail_inserts{
+        dbpp::PendingInsertRow{.draft_id = 2, .values = {"5", "c1_new", "dup_unique"}},
+    };
+    const dbpp::BatchCommitResult fail_res =
+        dbpp::CommitTableChangesBlocking(session, tx_model2, fail_edits, fail_deletes,
+                                         fail_inserts);
+    Expect(!fail_res.error.empty() && fail_res.rolled_back,
+           "CommitTableChangesBlocking failure must report error and roll back transaction");
+
+    const auto after_rb = dbpp::ExecuteBlocking(
+        session, "SELECT COUNT(*), MAX(CASE WHEN id = 1 THEN note END) FROM tx_items", true, 4);
+    Expect(after_rb.error.empty() && after_rb.rows.size() == 1 &&
+               after_rb.rows[0].values[0].text == "3" &&
+               after_rb.rows[0].values[1].text == "n1_new",
+           "Transaction rollback failed to restore prior rows");
+  }
 }
 
 } // namespace dbpp_test

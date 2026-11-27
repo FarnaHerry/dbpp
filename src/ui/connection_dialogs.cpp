@@ -606,30 +606,6 @@ ResolvedConnectionUris ResolveOrderedConnectionUris(
                     .With(Frame{.width = 480.0F}));
 }
 
-[[huxerui::composable]] View DeleteRowDialog(DialogContext dialog, State<AppModel> app,
-                                             State<WorkspaceModel> workspace,
-                                             std::uint64_t tab_id, TaskScope tasks,
-                                             NotifyFn notify, bool is_redis) {
-  return DialogCard(Column{
-      Row{
-          Text(is_redis ? app::strings::delete_row_title_redis
-                        : app::strings::delete_row_title_sql,
-               TextRole::Title),
-          Spacer(),
-          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(
-              Button(app::strings::action_delete).OnClick([app, workspace, tab_id, tasks, notify,
-                                                          dialog] {
-                RequestDeleteSelected(app, workspace, tasks, tab_id, notify);
-                dialog.Dismiss();
-              }),
-              ButtonTone::DangerSolid),
-      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      Text(is_redis ? app::strings::delete_row_body_redis : app::strings::delete_row_body_sql),
-  }.With(Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-                    .With(Frame{.width = 520.0F}));
-}
-
 [[huxerui::composable]] View ProductionWriteConfirmDialog(
     DialogContext dialog, std::string connection_name, std::string action_summary,
     std::function<void()> on_confirm) {

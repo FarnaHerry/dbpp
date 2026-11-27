@@ -105,13 +105,6 @@ using namespace dbpp::ui;
       return;
     }
     const bool is_write = !IsPureReadQuery(active_dialect, sql_text);
-    if (session_read_only && is_write) {
-      if (notify) {
-        notify(loc.Get(app::strings::toast_readonly_blocked));
-      }
-      return;
-    }
-
     const auto proceed_execution = [execute_query, is_redis, adbc_ptr, sql_text, tasks, dialogs,
                                     theme_config, language_mode, system_dark] {
       if (!is_redis && HasLikelySqlParameters(sql_text)) {
@@ -140,14 +133,20 @@ using namespace dbpp::ui;
       execute_query(0, true, 0, {});
     };
 
-    if (session_production && is_write) {
-      const std::string preview = CompactSqlPreview(sql_text, 240);
-      dialogs.Show([active_session_name, preview, proceed_execution, theme_config, language_mode,
-                    system_dark](DialogContext dialog) {
-        return WithDialogTheme(
-            theme_config, language_mode, system_dark,
-            ProductionWriteConfirmDialog(dialog, active_session_name, preview, proceed_execution));
-      });
+    if (is_write) {
+      RunGuardedWrite(
+          WriteGuardContext{
+              .read_only = session_read_only,
+              .production_mode = session_production,
+              .connection_name = active_session_name,
+              .dialogs = dialogs,
+              .notify = notify,
+              .loc = loc,
+              .theme_config = theme_config,
+              .language_mode = language_mode,
+              .system_dark = system_dark,
+          },
+          CompactSqlPreview(sql_text, 240), proceed_execution);
       return;
     }
     proceed_execution();
