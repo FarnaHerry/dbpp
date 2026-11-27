@@ -890,6 +890,41 @@ void RunAdbcCapabilitiesTests(const fs::path& dir, const std::string& driver_pat
                after_rb.rows[0].values[1].text == "n1_new",
            "Transaction rollback failed to restore prior rows");
   }
+
+  // 21. Maintenance refresh error classification (IsSchemaStaleError)
+  {
+    Expect(dbpp::IsSchemaStaleError("no such table: missing_tbl"),
+           "SQLite missing table must be classified as schema-stale");
+    Expect(dbpp::IsSchemaStaleError("no such column: missing_col"),
+           "SQLite missing column must be classified as schema-stale");
+    Expect(dbpp::IsSchemaStaleError("ERROR 1146 (42S02): Table 'db.foo' doesn't exist"),
+           "MySQL missing table must be classified as schema-stale");
+    Expect(dbpp::IsSchemaStaleError("Unknown column 'x' in 'where clause'", "42S22"),
+           "MySQL unknown column must be classified as schema-stale");
+    Expect(dbpp::IsSchemaStaleError("ERROR: relation \"public.foo\" does not exist", "42P01"),
+           "PostgreSQL missing relation must be classified as schema-stale");
+    Expect(dbpp::IsSchemaStaleError("Catalog Error: Table with name foo does not exist!"),
+           "DuckDB catalog error must be classified as schema-stale");
+    Expect(dbpp::IsSchemaStaleError("", "42S02"),
+           "SQLSTATE 42S02 alone must be classified as schema-stale");
+
+    Expect(!dbpp::IsSchemaStaleError("near \"FROM\": syntax error"),
+           "Syntax errors must not trigger maintenance refresh");
+    Expect(!dbpp::IsSchemaStaleError("UNIQUE constraint failed: tx_items.code", "23000"),
+           "Constraint violations must not trigger maintenance refresh");
+    Expect(!dbpp::IsSchemaStaleError("NOT NULL constraint failed: tx_items.code"),
+           "NOT NULL failures must not trigger maintenance refresh");
+    Expect(!dbpp::IsSchemaStaleError("MySQL server has gone away", "08S01"),
+           "Connection-lost errors must not trigger maintenance refresh");
+    Expect(!dbpp::IsSchemaStaleError(""), "Empty error must return false");
+
+    const auto dropped_res =
+        dbpp::ExecuteBlocking(session, "SELECT * FROM tbl_that_was_dropped_xyz", true, 4);
+    Expect(!dropped_res.error.empty() &&
+               dbpp::IsSchemaStaleError(dropped_res.error, dropped_res.sqlstate),
+           "Real SQLite missing-table error must trigger IsSchemaStaleError: " +
+               dropped_res.error);
+  }
 }
 
 } // namespace dbpp_test

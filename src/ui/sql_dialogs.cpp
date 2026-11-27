@@ -179,6 +179,9 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
                            message));
           }
         }
+        if (!result.cancelled && IsSchemaStaleError(message, result.sqlstate)) {
+          ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
+        }
         co_return;
       }
       auto query = std::make_shared<QueryResult>();
@@ -270,6 +273,9 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
       });
       if (notify) {
         notify(loc.Fmt(app::strings::sql_query_failed, message));
+      }
+      if (IsSchemaStaleError(message, executed.sqlstate)) {
+        ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
       }
       co_return;
     }

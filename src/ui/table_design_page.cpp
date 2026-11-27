@@ -114,6 +114,9 @@ using namespace dbpp::ui;
       }
       if (!loaded.error.empty() && loaded.object.columns.empty()) {
         error_text = loaded.error;
+        if (IsSchemaStaleError(loaded.error)) {
+          ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
+        }
         co_return;
       }
       error_text = std::string{};
@@ -178,6 +181,9 @@ using namespace dbpp::ui;
         error_text = res.error;
         if (notify) {
           notify(loc.Fmt(app::strings::toast_edit_table_failed, res.error));
+        }
+        if (IsSchemaStaleError(res.error, res.sqlstate)) {
+          ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
         }
         co_return;
       }

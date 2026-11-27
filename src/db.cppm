@@ -209,6 +209,10 @@ void RefreshSessionObjects(const huxerui::State<AppModel>& app,
                            const huxerui::State<WorkspaceModel>& workspace,
                            const huxerui::TaskScope& tasks, std::uint64_t session_id,
                            NotifyFn notify, bool notify_success = true);
+void ScheduleMaintenanceRefresh(const huxerui::State<AppModel>& app,
+                                const huxerui::State<WorkspaceModel>& workspace,
+                                const huxerui::TaskScope& tasks, std::uint64_t session_id,
+                                NotifyFn notify);
 void HandleSessionDisconnected(const huxerui::State<AppModel>& app,
                                 const huxerui::State<WorkspaceModel>& workspace,
                                 const huxerui::TaskScope& tasks, std::uint64_t session_id,

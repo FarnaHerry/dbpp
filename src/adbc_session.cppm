@@ -53,6 +53,8 @@ struct AdbcSession {
   std::atomic<bool> closed{false};
   std::atomic<bool> alive{true};
   std::atomic<bool> ping_in_flight{false};
+  std::atomic<bool> refresh_in_flight{false};
+  std::atomic<std::int64_t> last_maintenance_refresh_ms{0};
   std::atomic<bool> cancel_requested{false};
   std::mutex cancel_mutex;
   AdbcStatement* active_statement = nullptr;
@@ -135,6 +137,8 @@ struct AdbcOpenResult {
 [[nodiscard]] bool IsConnectionLostError(int adbc_status, std::string_view message);
 [[nodiscard]] bool IsConnectionLostError(int adbc_status, std::string_view message,
                                          std::string_view sqlstate);
+[[nodiscard]] bool IsSchemaStaleError(std::string_view message,
+                                      std::string_view sqlstate = {});
 [[nodiscard]] bool ShouldHealthCheckSession(Dialect dialect, std::string_view uri);
 bool ReconnectBlocking(AdbcSession& session, std::string& error_out);
 AdbcQueryResult PingSessionBlocking(AdbcSession& session);

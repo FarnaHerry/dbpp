@@ -244,6 +244,9 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
       co_return;
     }
     if (!load_error.empty() && !has_snapshot) {
+      if (IsSchemaStaleError(load_error) || filter.empty()) {
+        ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
+      }
       if (notify) {
         notify(TrFmt("Failed to load: {0}", "加载失败: {0}", {load_error}));
       }
@@ -467,6 +470,9 @@ void RequestCommitTableChanges(const State<AppModel>& app,
                    ? TrFmt("Commit failed, transaction rolled back (staged changes kept): {0}",
                            "提交失败，事务已回滚（暂存修改已保留）: {0}", {res.error})
                    : TrFmt("Commit failed: {0}", "提交失败: {0}", {res.error}));
+      }
+      if (IsSchemaStaleError(res.error)) {
+        ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
       }
       if (partial_reload) {
         RequestLoadTable(app, workspace, tasks, tab_id, reload_page, reload_sort,
@@ -746,9 +752,11 @@ void ScheduleSessionHealthCheck(const State<AppModel>& app,
   }
 }
 
-void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                           const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify,
-                           bool notify_success) {
+namespace {
+
+void RefreshSessionObjectsImpl(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                               const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify,
+                               bool notify_success, bool maintenance_mode) {
   const AppModel& snapshot = app.Get();
   const DbSession* session = detail::DbFindSession(snapshot, session_id);
   if (session == nullptr || !session->session || session->session->IsClosed()) {
@@ -759,9 +767,35 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
   }
 
   auto adbc = session->session;
+  if (maintenance_mode) {
+    const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+    const std::int64_t prev_ms = adbc->last_maintenance_refresh_ms.load(std::memory_order_acquire);
+    if (prev_ms > 0 && now_ms >= prev_ms && (now_ms - prev_ms) < 3000) {
+      return;
+    }
+    if (adbc->refresh_in_flight.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    adbc->last_maintenance_refresh_ms.store(now_ms, std::memory_order_release);
+  } else if (adbc->refresh_in_flight.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
   std::string session_name = session->name;
   tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc, session_id,
-                session_name = std::move(session_name), notify_success]() mutable -> Task<void> {
+                session_name = std::move(session_name), notify_success,
+                maintenance_mode]() mutable -> Task<void> {
+    struct RefreshGuard {
+      AdbcSession* ptr = nullptr;
+      ~RefreshGuard() {
+        if (ptr != nullptr) {
+          ptr->refresh_in_flight.store(false, std::memory_order_release);
+        }
+      }
+    } guard{adbc.get()};
+
     AdbcObjectsResult objects = co_await adbc->sequence.Run(
         [adbc](std::stop_token) { return LoadObjectsBlocking(*adbc); });
     if (objects.connection_lost) {
@@ -769,7 +803,7 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
       co_return;
     }
     if (!objects.error.empty()) {
-      if (notify) {
+      if (!maintenance_mode && notify) {
         notify(TrFmt("Refresh failed: {0}", "刷新失败: {0}", {objects.error}));
       }
       co_return;
@@ -801,7 +835,8 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
     std::vector<std::uint64_t> stale_tabs;
     if (refreshed != nullptr) {
       for (const WorkspaceTab& tab : workspace.Get().tabs) {
-        if (tab.session_id == session_id && tab.kind == WorkspaceTabKind::Table &&
+        if (tab.session_id == session_id &&
+            (tab.kind == WorkspaceTabKind::Table || tab.kind == WorkspaceTabKind::TableDesign) &&
             detail::DbFindObject(*refreshed, tab.object_name, tab.object_schema) == nullptr) {
           stale_tabs.push_back(tab.id);
         }
@@ -809,6 +844,15 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
     }
     if (!stale_tabs.empty()) {
       CloseWorkspaceTabs(app, workspace, stale_tabs);
+    }
+
+    if (maintenance_mode) {
+      if (!stale_tabs.empty() && notify) {
+        notify(TrFmt("Synced {0} metadata and closed {1} removed tab(s)",
+                     "已自动刷新 {0} 目录并关闭 {1} 个已失效标签页",
+                     {session_name, std::to_string(stale_tabs.size())}));
+      }
+      co_return;
     }
 
     const WorkspaceTab* active_tab = workspace.Get().ActiveTab();
@@ -822,6 +866,20 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
                    {session_name, std::to_string(object_count)}));
     }
   });
+}
+
+} // namespace
+
+void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                           const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify,
+                           bool notify_success) {
+  RefreshSessionObjectsImpl(app, workspace, tasks, session_id, std::move(notify), notify_success,
+                            false);
+}
+
+void ScheduleMaintenanceRefresh(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                                const TaskScope& tasks, std::uint64_t session_id, NotifyFn notify) {
+  RefreshSessionObjectsImpl(app, workspace, tasks, session_id, std::move(notify), false, true);
 }
 
 } // namespace dbpp

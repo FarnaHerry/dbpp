@@ -673,6 +673,65 @@ bool IsConnectionLostError(int adbc_status, std::string_view message,
          message.find("连接超时") != std::string_view::npos;
 }
 
+bool IsSchemaStaleError(std::string_view message, std::string_view sqlstate) {
+  if (IsConnectionLostError(0, message, sqlstate)) {
+    return false;
+  }
+  const std::string state = LowerAscii(TrimAscii(sqlstate));
+  if (state == "42s02" || state == "42s22" || state == "42p01" || state == "42703" ||
+      state == "3d000" || state == "3f000" || state == "42s01") {
+    return true;
+  }
+  const std::string lower = LowerAscii(TrimAscii(message));
+  if (lower.empty()) {
+    return false;
+  }
+  static constexpr std::string_view kSqlStates[] = {
+      "42s02", "42s22", "42p01", "42703", "3d000", "3f000", "42s01",
+  };
+  for (const std::string_view code : kSqlStates) {
+    if (lower.find(code) != std::string_view::npos) {
+      return true;
+    }
+  }
+  static constexpr std::string_view kPatterns[] = {
+      "no such table",
+      "no such column",
+      "no such view",
+      "no such trigger",
+      "no such index",
+      "has no column named",
+      "doesn't exist",
+      "does not exist",
+      "unknown column",
+      "unknown table",
+      "unknown database",
+      "error 1146",
+      "error 1054",
+      "error 1049",
+      "error 1051",
+      "catalog error",
+      "binder error",
+      "does not have a column",
+      "invalid object name",
+      "invalid column name",
+      "table or view does not exist",
+      "table not found",
+      "view not found",
+      "column not found",
+      "schema not found",
+      "database not found",
+      "relation not found",
+      "object not found",
+  };
+  for (const std::string_view pattern : kPatterns) {
+    if (lower.find(pattern) != std::string_view::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ShouldHealthCheckSession(Dialect dialect, std::string_view uri) {
   if (dialect == Dialect::Sqlite || dialect == Dialect::Duckdb) {
     return false;
