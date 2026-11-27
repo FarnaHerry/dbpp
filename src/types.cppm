@@ -265,6 +265,7 @@ struct GridRow {
   std::vector<CellValue> values;
   std::vector<CellValue> key_values;
   std::optional<std::int64_t> rowid;
+  std::string row_locator_token;
 };
 
 struct GridSnapshot {
@@ -285,6 +286,14 @@ struct BatchInsertResult {
   std::string error;
 };
 
+enum class RowLocatorKind {
+  None,
+  PrimaryKey,
+  UniqueKey,
+  HiddenRowId,
+  AllColumns,
+};
+
 struct TableModel {
   std::uint64_t session_id = 0;
   std::string object;
@@ -293,6 +302,11 @@ struct TableModel {
   bool editable = false;
   bool read_only = false;
   bool uses_rowid = false;
+  RowLocatorKind row_locator = RowLocatorKind::None;
+  std::string hidden_rowid_expr;
+  std::string hidden_rowid_where_col;
+  std::string hidden_rowid_cast;
+  bool hidden_rowid_is_numeric = true;
   std::vector<ColumnMeta> columns;
   std::vector<std::size_t> key_columns;
   std::shared_ptr<const GridSnapshot> snapshot;

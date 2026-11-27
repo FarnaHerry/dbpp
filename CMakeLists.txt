@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.4.1 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.4.2 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -213,6 +213,7 @@ add_library(dbpp_core STATIC
         src/adbc_arrow.cpp
         src/adbc_metadata.cpp
         src/adbc_catalog_extras.cpp
+        src/adbc_table_identity.cpp
         src/adbc_prepared.cpp
         src/adbc_ingest.cpp
         src/adbc_dump.cpp

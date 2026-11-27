@@ -235,6 +235,15 @@ struct TableDesignSnapshot {
   std::string error;
 };
 
+struct ResolvedRowIdentity {
+  RowLocatorKind kind = RowLocatorKind::None;
+  std::vector<std::size_t> key_columns;
+  std::string hidden_rowid_expr;
+  std::string hidden_rowid_where_col;
+  std::string hidden_rowid_cast;
+  bool hidden_rowid_is_numeric = true;
+};
+
 [[nodiscard]] std::vector<std::string> SplitSqlStatements(std::string_view script,
                                                           Dialect dialect);
 [[nodiscard]] std::string FormatSqlStatement(std::string_view sql,
@@ -243,6 +252,8 @@ struct TableDesignSnapshot {
                                           Dialect dialect = Dialect::Generic);
 [[nodiscard]] std::string MakeTempSqlExportPath();
 TableDesignSnapshot LoadTableDesignBlocking(AdbcSession& session, const DbObject& object);
+ResolvedRowIdentity ResolveTableIdentityBlocking(AdbcSession& session, const DbObject& object,
+                                                 std::vector<ColumnMeta>& columns);
 SqlDumpResult ExportDatabaseSqlToFileBlocking(AdbcSession& session,
                                               const SqlDumpOptions& options,
                                               const std::filesystem::path& path);

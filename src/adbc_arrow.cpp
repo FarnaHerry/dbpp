@@ -636,9 +636,13 @@ void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObjec
 
     if (hint_object != nullptr) {
       for (const ColumnMeta& known : hint_object->columns) {
-        if (known.name == column.name) {
+        if (known.name == column.name ||
+            detail::AdbcEqualsIgnoreCase(known.name, column.name)) {
           if (!known.type.empty()) {
             column.type = known.type;
+          }
+          if (!known.nullable) {
+            column.nullable = false;
           }
           if (column.default_expr.empty()) {
             column.default_expr = known.default_expr;
@@ -655,6 +659,12 @@ void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObjec
           column.unique = column.unique || known.unique;
           column.autoincrement = column.autoincrement || known.autoincrement;
           column.generated = column.generated || known.generated;
+          if (known.primary_key) {
+            column.primary_key = true;
+            if (column.primary_key_order == 0) {
+              column.primary_key_order = known.primary_key_order;
+            }
+          }
           break;
         }
       }
@@ -663,7 +673,27 @@ void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObjec
             detail::AdbcEqualsIgnoreCase(hint_object->primary_key[key_index], column.name)) {
           column.primary_key = true;
           column.primary_key_order = static_cast<int>(key_index + 1);
+          column.nullable = false;
           break;
+        }
+      }
+      if (!column.primary_key) {
+        for (const IndexMeta& idx : hint_object->indexes) {
+          if (!idx.primary) {
+            continue;
+          }
+          for (std::size_t key_index = 0; key_index < idx.columns.size(); ++key_index) {
+            if (idx.columns[key_index] == column.name ||
+                detail::AdbcEqualsIgnoreCase(idx.columns[key_index], column.name)) {
+              column.primary_key = true;
+              column.primary_key_order = static_cast<int>(key_index + 1);
+              column.nullable = false;
+              break;
+            }
+          }
+          if (column.primary_key) {
+            break;
+          }
         }
       }
     }

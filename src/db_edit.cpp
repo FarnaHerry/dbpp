@@ -66,10 +66,15 @@ bool BuildParameterizedWhere(Dialect dialect, const TableModel& model, const Gri
                              std::string& where_out, std::vector<PreparedParamValue>& params_out,
                              std::vector<std::string>& types_out, std::size_t& next_param_idx) {
   where_out.clear();
-  if (model.uses_rowid && row.rowid.has_value()) {
-    where_out = "rowid = " + SqlPlaceholder(dialect, next_param_idx++);
-    params_out.push_back(PreparedParamValue{.text = std::to_string(*row.rowid), .is_null = false});
-    types_out.emplace_back("INTEGER");
+  if ((model.row_locator == RowLocatorKind::HiddenRowId || model.uses_rowid) &&
+      (!row.row_locator_token.empty() || row.rowid.has_value())) {
+    const std::string& col =
+        model.hidden_rowid_where_col.empty() ? std::string{"rowid"} : model.hidden_rowid_where_col;
+    const std::string token = !row.row_locator_token.empty() ? row.row_locator_token
+                                                             : std::to_string(*row.rowid);
+    where_out = col + " = " + SqlPlaceholder(dialect, next_param_idx++) + model.hidden_rowid_cast;
+    params_out.push_back(PreparedParamValue{.text = token, .is_null = false});
+    types_out.emplace_back(model.hidden_rowid_is_numeric ? "INTEGER" : "TEXT");
     return true;
   }
   for (std::size_t key_index = 0; key_index < model.key_columns.size(); ++key_index) {
@@ -155,11 +160,16 @@ AdbcQueryResult UpdateRowInternal(AdbcSession& session, const TableModel& model,
     literal_set += col_ident + " = " + SqlLiteral(session.dialect, raw_text, column.type, is_null);
   }
 
+  const std::string limit_suffix =
+      (model.row_locator == RowLocatorKind::AllColumns && session.dialect == Dialect::Mysql)
+          ? std::string{" LIMIT 1"}
+          : std::string{};
+
   std::string param_where;
   if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
                               next_idx)) {
-    const std::string param_sql =
-        "UPDATE " + model.qualified_name + " SET " + param_set + " WHERE " + param_where;
+    const std::string param_sql = "UPDATE " + model.qualified_name + " SET " + param_set +
+                                  " WHERE " + param_where + limit_suffix;
     int prep_status = 0;
     AdbcQueryResult prep_res;
     if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
@@ -184,7 +194,7 @@ AdbcQueryResult UpdateRowInternal(AdbcSession& session, const TableModel& model,
     return result;
   }
   const std::string sql =
-      "UPDATE " + model.qualified_name + " SET " + literal_set + " WHERE " + where;
+      "UPDATE " + model.qualified_name + " SET " + literal_set + " WHERE " + where + limit_suffix;
   return ExecuteBlocking(session, sql, false, 0);
 }
 
@@ -367,13 +377,19 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
   }
   const GridRow& row = model.snapshot->rows[row_index];
 
+  const std::string limit_suffix =
+      (model.row_locator == RowLocatorKind::AllColumns && session.dialect == Dialect::Mysql)
+          ? std::string{" LIMIT 1"}
+          : std::string{};
+
   std::size_t next_idx = 1;
   std::vector<PreparedParamValue> params;
   std::vector<std::string> param_types;
   std::string param_where;
   if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
                               next_idx)) {
-    const std::string param_sql = "DELETE FROM " + model.qualified_name + " WHERE " + param_where;
+    const std::string param_sql =
+        "DELETE FROM " + model.qualified_name + " WHERE " + param_where + limit_suffix;
     int prep_status = 0;
     AdbcQueryResult prep_res;
     if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
@@ -397,8 +413,8 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
     result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
     return result;
   }
-  return ExecuteBlocking(session,
-                         "DELETE FROM " + model.qualified_name + " WHERE " + where, false, 0);
+  return ExecuteBlocking(
+      session, "DELETE FROM " + model.qualified_name + " WHERE " + where + limit_suffix, false, 0);
 }
 
 namespace detail {

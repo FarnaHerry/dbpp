@@ -642,6 +642,91 @@ void RunAdbcCapabilitiesTests(const fs::path& dir, const std::string& driver_pat
     Expect(fmt_script.find("WITHOUT ROWID;\n\nCREATE VIEW v_fmt AS\n") != std::string::npos,
            "FormatSqlScript multi-statement formatting mismatch: " + fmt_script);
   }
+
+  // 18. Universal Row-Identity & Multi-Dialect Editability Abstraction
+  {
+    const char* sql_setup =
+        "CREATE TABLE id_pk (id INTEGER PRIMARY KEY, name TEXT);"
+        "INSERT INTO id_pk VALUES (1, 'alpha');"
+        "CREATE TABLE id_uniq (code TEXT NOT NULL, val TEXT);"
+        "CREATE UNIQUE INDEX idx_id_uniq_code ON id_uniq(code);"
+        "INSERT INTO id_uniq VALUES ('k1', 'v1');"
+        "CREATE TABLE id_plain (a TEXT, b INTEGER);"
+        "INSERT INTO id_plain VALUES ('raw_a', 42);";
+    for (const std::string& stmt : dbpp::SplitSqlStatements(sql_setup, dbpp::Dialect::Sqlite)) {
+      const auto r = dbpp::ExecuteBlocking(session, stmt, false, 0);
+      Expect(r.error.empty(), "Row-identity setup failed: " + r.error);
+    }
+
+    const dbpp::TableModel m_pk =
+        dbpp::LoadTableBlocking(session, 1, dbpp::DbObject{.name = "id_pk"}, 0, 50,
+                                std::nullopt, {});
+    Expect(m_pk.editable && m_pk.row_locator == dbpp::RowLocatorKind::PrimaryKey,
+           "id_pk should resolve RowLocatorKind::PrimaryKey");
+
+    const dbpp::TableModel m_uniq =
+        dbpp::LoadTableBlocking(session, 1, dbpp::DbObject{.name = "id_uniq"}, 0, 50,
+                                std::nullopt, {});
+    Expect(m_uniq.editable && m_uniq.row_locator == dbpp::RowLocatorKind::UniqueKey &&
+               m_uniq.key_columns.size() == 1 && m_uniq.key_columns[0] == 0,
+           "id_uniq should resolve RowLocatorKind::UniqueKey from UNIQUE index");
+    const auto upd_uniq = dbpp::UpdateCellBlocking(session, m_uniq, 0, 1, "v2");
+    Expect(upd_uniq.error.empty(), "UniqueKey UpdateCellBlocking failed: " + upd_uniq.error);
+
+    const dbpp::TableModel m_plain =
+        dbpp::LoadTableBlocking(session, 1, dbpp::DbObject{.name = "id_plain"}, 0, 50,
+                                std::nullopt, {});
+    Expect(m_plain.editable && m_plain.row_locator == dbpp::RowLocatorKind::HiddenRowId &&
+               m_plain.uses_rowid,
+           "id_plain should resolve RowLocatorKind::HiddenRowId");
+
+    // Verify AllColumns keyless fallback execution path against SQLite table
+    dbpp::TableModel all_cols = m_plain;
+    all_cols.row_locator = dbpp::RowLocatorKind::AllColumns;
+    all_cols.uses_rowid = false;
+    all_cols.key_columns = {0, 1};
+    std::vector<dbpp::GridRow> rows = all_cols.snapshot->rows;
+    rows[0].rowid.reset();
+    rows[0].row_locator_token.clear();
+    rows[0].key_values = rows[0].values;
+    all_cols.snapshot =
+        std::make_shared<const dbpp::GridSnapshot>(dbpp::GridSnapshot{.rows = rows});
+    const auto upd_all = dbpp::UpdateCellBlocking(session, all_cols, 0, 0, "updated_a");
+    Expect(upd_all.error.empty(), "AllColumns UpdateCellBlocking failed: " + upd_all.error);
+    const auto check_all = dbpp::ExecuteBlocking(session, "SELECT a FROM id_plain", true, 4);
+    Expect(check_all.error.empty() && check_all.rows.size() == 1 &&
+               check_all.rows[0].values[0].text == "updated_a",
+           "AllColumns update must persist value");
+
+    // Verify index-based PRIMARY KEY hint resolution (e.g. MySQL ADBC objects)
+    dbpp::DbObject mysql_hint;
+    mysql_hint.name = "users";
+    mysql_hint.columns = {
+        dbpp::ColumnMeta{.name = "id", .type = "INT", .nullable = false},
+        dbpp::ColumnMeta{.name = "email", .type = "VARCHAR(255)", .nullable = false},
+    };
+    mysql_hint.indexes = {
+        dbpp::IndexMeta{.name = "PRIMARY", .unique = true, .primary = true, .columns = {"id"}},
+    };
+    dbpp::AdbcSession mysql_dummy;
+    mysql_dummy.dialect = dbpp::Dialect::Mysql;
+    std::vector<dbpp::ColumnMeta> resolved_cols = mysql_hint.columns;
+    const dbpp::ResolvedRowIdentity mysql_id =
+        dbpp::ResolveTableIdentityBlocking(mysql_dummy, mysql_hint, resolved_cols);
+    Expect(mysql_id.kind == dbpp::RowLocatorKind::PrimaryKey &&
+               mysql_id.key_columns.size() == 1 && mysql_id.key_columns[0] == 0 &&
+               resolved_cols[0].primary_key,
+           "MySQL index-based PRIMARY KEY hint must resolve RowLocatorKind::PrimaryKey");
+
+    dbpp::DbObject view_obj{.name = "v_events", .is_view = true};
+    std::vector<dbpp::ColumnMeta> view_cols = {
+        dbpp::ColumnMeta{.name = "id", .type = "INTEGER"},
+    };
+    const dbpp::ResolvedRowIdentity view_id =
+        dbpp::ResolveTableIdentityBlocking(session, view_obj, view_cols);
+    Expect(view_id.kind == dbpp::RowLocatorKind::None,
+           "View must resolve RowLocatorKind::None");
+  }
 }
 
 } // namespace dbpp_test

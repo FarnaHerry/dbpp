@@ -16,7 +16,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.1"
+#define DBPP_VERSION "0.4.2"
 #endif
 
 #include "ui/theme_palette.h"

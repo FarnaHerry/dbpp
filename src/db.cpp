@@ -239,8 +239,17 @@ bool EqualsIgnoreCaseAscii(std::string_view left, std::string_view right) {
 }
 
 std::string BuildWhere(const Dialect dialect, const TableModel& model, const GridRow& row) {
-  if (model.uses_rowid && row.rowid.has_value()) {
-    return "rowid = " + std::to_string(*row.rowid);
+  if ((model.row_locator == RowLocatorKind::HiddenRowId || model.uses_rowid) &&
+      (!row.row_locator_token.empty() || row.rowid.has_value())) {
+    const std::string& col =
+        model.hidden_rowid_where_col.empty() ? std::string{"rowid"} : model.hidden_rowid_where_col;
+    if (!model.hidden_rowid_is_numeric && !row.row_locator_token.empty()) {
+      return col + " = " + SqlLiteral(dialect, row.row_locator_token, "TEXT", false) +
+             model.hidden_rowid_cast;
+    }
+    const std::string token = !row.row_locator_token.empty() ? row.row_locator_token
+                                                             : std::to_string(*row.rowid);
+    return col + " = " + token + model.hidden_rowid_cast;
   }
   std::string where;
   for (std::size_t key_index = 0; key_index < model.key_columns.size(); ++key_index) {
@@ -330,64 +339,15 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     }
   }
 
-  for (std::size_t index = 0; index < model.columns.size(); ++index) {
-    if (model.columns[index].primary_key) {
-      model.key_columns.push_back(index);
-    }
-  }
-  std::ranges::sort(model.key_columns, [&model](std::size_t left, std::size_t right) {
-    return model.columns[left].primary_key_order < model.columns[right].primary_key_order;
-  });
-
-  if (session.dialect == Dialect::Sqlite && !object.is_view) {
-    const std::string pragma_target =
-        object.db_schema.empty()
-            ? ("PRAGMA table_info(" + QuoteIdentifier(Dialect::Sqlite, object.name) + ")")
-            : ("PRAGMA " + QuoteIdentifier(Dialect::Sqlite, object.db_schema) + ".table_info(" +
-               QuoteIdentifier(Dialect::Sqlite, object.name) + ")");
-    const AdbcQueryResult info = ExecuteBlocking(session, pragma_target, true, 0);
-    if (info.error.empty()) {
-      std::vector<std::pair<int, std::size_t>> pk_hits;
-      for (const GridRow& r : info.rows) {
-        if (r.values.size() >= 6) {
-          const std::string& col_name = r.values[1].text;
-          const std::string& col_type = r.values[2].text;
-          const int notnull_flag = static_cast<int>(ParseInt64(r.values[3].text));
-          const int pk_ord = static_cast<int>(ParseInt64(r.values[5].text));
-          for (std::size_t ci = 0; ci < model.columns.size(); ++ci) {
-            if (EqualsIgnoreCaseAscii(model.columns[ci].name, col_name)) {
-              if (!col_type.empty() &&
-                  (model.columns[ci].type.empty() || model.columns[ci].type == "ANY")) {
-                model.columns[ci].type = col_type;
-              }
-              if (notnull_flag != 0) {
-                model.columns[ci].nullable = false;
-              }
-              if (pk_ord > 0) {
-                model.columns[ci].primary_key = true;
-                model.columns[ci].primary_key_order = pk_ord;
-                pk_hits.emplace_back(pk_ord, ci);
-              }
-              break;
-            }
-          }
-        }
-      }
-      if (model.key_columns.empty() && !pk_hits.empty()) {
-        std::ranges::sort(pk_hits);
-        for (const auto& [ord, ci] : pk_hits) {
-          (void)ord;
-          model.key_columns.push_back(ci);
-        }
-      }
-    }
-    if (model.key_columns.empty()) {
-      const AdbcQueryResult probe = ExecuteBlocking(
-          session, "SELECT rowid FROM " + model.qualified_name + " LIMIT 0", true, 0);
-      model.uses_rowid = probe.error.empty();
-    }
-  }
-  model.editable = !object.is_view && (model.uses_rowid || !model.key_columns.empty());
+  const ResolvedRowIdentity identity = ResolveTableIdentityBlocking(session, object, model.columns);
+  model.row_locator = identity.kind;
+  model.key_columns = identity.key_columns;
+  model.hidden_rowid_expr = identity.hidden_rowid_expr;
+  model.hidden_rowid_where_col = identity.hidden_rowid_where_col;
+  model.hidden_rowid_cast = identity.hidden_rowid_cast;
+  model.hidden_rowid_is_numeric = identity.hidden_rowid_is_numeric;
+  model.uses_rowid = (identity.kind == RowLocatorKind::HiddenRowId);
+  model.editable = !object.is_view && (identity.kind != RowLocatorKind::None);
 
   std::string where;
   if (!model.filter.empty()) {
@@ -414,7 +374,10 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
           : model.page * model.page_size;
 
   const std::string select_list =
-      model.uses_rowid ? std::string{"rowid AS \"__dbpp_rowid\", *"} : std::string{"*"};
+      model.row_locator == RowLocatorKind::HiddenRowId
+          ? ((model.hidden_rowid_expr.empty() ? std::string{"rowid"} : model.hidden_rowid_expr) +
+             " AS " + QuoteIdentifier(session.dialect, "__dbpp_rowid") + ", *")
+          : std::string{"*"};
 
   std::string order;
   if (model.sort.has_value() && !model.sort->column_id.empty()) {
@@ -427,9 +390,12 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     }
   }
   std::string tie_breaker;
-  if (model.uses_rowid) {
-    tie_breaker = "rowid";
-  } else if (!model.key_columns.empty()) {
+  if (model.row_locator == RowLocatorKind::HiddenRowId) {
+    tie_breaker =
+        model.hidden_rowid_where_col.empty() ? std::string{"rowid"} : model.hidden_rowid_where_col;
+  } else if ((model.row_locator == RowLocatorKind::PrimaryKey ||
+              model.row_locator == RowLocatorKind::UniqueKey) &&
+             !model.key_columns.empty()) {
     for (const std::size_t index : model.key_columns) {
       if (!tie_breaker.empty()) {
         tie_breaker += ", ";
@@ -459,8 +425,12 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
   std::vector<GridRow> rows;
   rows.reserve(data.rows.size());
   for (GridRow& row : data.rows) {
-    if (model.uses_rowid && !row.values.empty()) {
-      row.rowid = ParseInt64(row.values.front().text);
+    if ((model.row_locator == RowLocatorKind::HiddenRowId || model.uses_rowid) &&
+        !row.values.empty()) {
+      row.row_locator_token = row.values.front().text;
+      if (model.hidden_rowid_is_numeric) {
+        row.rowid = ParseInt64(row.row_locator_token);
+      }
       row.values.erase(row.values.begin());
     }
     if (row.values.size() < model.columns.size()) {

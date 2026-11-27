@@ -540,6 +540,30 @@ void AdbcEnrichCatalogObjects(AdbcSession& session, AdbcObjectsResult& result) {
     case Dialect::Redis:
     case Dialect::Generic: break;
   }
+
+  for (DbObject& obj : result.objects) {
+    if (!obj.primary_key.empty()) {
+      continue;
+    }
+    for (const IndexMeta& idx : obj.indexes) {
+      if (idx.primary && !idx.columns.empty()) {
+        obj.primary_key = idx.columns;
+        for (std::size_t ki = 0; ki < obj.primary_key.size(); ++ki) {
+          for (ColumnMeta& col : obj.columns) {
+            if (col.name == obj.primary_key[ki] ||
+                AdbcEqualsIgnoreCase(col.name, obj.primary_key[ki])) {
+              col.primary_key = true;
+              if (col.primary_key_order == 0) {
+                col.primary_key_order = static_cast<int>(ki + 1);
+              }
+              col.nullable = false;
+            }
+          }
+        }
+        break;
+      }
+    }
+  }
 }
 
 } // namespace dbpp::detail
