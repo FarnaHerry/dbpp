@@ -44,13 +44,16 @@ using namespace dbpp::ui;
   const std::string profiles_path = profile_dir.Child("dbpp.sqlite3").Path();
   const File default_file = application.Directories().data_directory.Child("untitled.sqlite");
   auto profiles = UseState(std::vector<ConnectionProfile>{});
-  Lifecycle([profiles, profiles_path, config_db, tasks] {
+  auto saved_queries = UseState(std::vector<SavedQuery>{});
+  Lifecycle([profiles, saved_queries, profiles_path, config_db, tasks] {
     if (config_db) {
-      tasks.Launch([profiles, config_db]() -> Task<void> {
+      tasks.Launch([profiles, saved_queries, config_db]() -> Task<void> {
         profiles = co_await config_db->LoadConnectionsAsync();
+        saved_queries = co_await config_db->LoadSavedQueriesAsync();
       });
     } else {
       profiles = LoadConnectionProfiles(profiles_path);
+      saved_queries = LoadSavedQueries(profiles_path);
     }
     return [] {};
   });
@@ -231,6 +234,10 @@ using namespace dbpp::ui;
         .username = profile.username.empty() ? sanitized.username : profile.username,
         .password = profile.password.empty() ? sanitized.password : profile.password,
         .title = profile.name.empty() ? UriDisplayName(sanitized.uri) : profile.name,
+        .remark = profile.remark,
+        .read_only = profile.read_only,
+        .production_mode = profile.production_mode,
+        .show_system_databases = profile.show_system_databases,
     };
     OpenConnection(app, workspace, tasks, std::move(request), notify);
   };
@@ -338,9 +345,11 @@ using namespace dbpp::ui;
               ? spec.colors.primary
               : (t.kind == WorkspaceTabKind::Sql
                      ? semantic.accent_sql
-                     : (is_redis_tab
-                            ? semantic.accent_database
-                            : (t.is_view ? semantic.accent_view : semantic.accent_table)));
+                     : (t.kind == WorkspaceTabKind::TableDesign
+                            ? semantic.accent_table
+                            : (is_redis_tab
+                                   ? semantic.accent_database
+                                   : (t.is_view ? semantic.accent_view : semantic.accent_table))));
       const bool is_active = tid == ws.active_tab_id;
       View tab_icon;
       if (t.kind == WorkspaceTabKind::Settings) {
@@ -349,6 +358,8 @@ using namespace dbpp::ui;
                               14.0F);
       } else if (t.kind == WorkspaceTabKind::Sql) {
         tab_icon = TintedIcon(app::images::sql_console, semantic.accent_sql, 14.0F);
+      } else if (t.kind == WorkspaceTabKind::TableDesign) {
+        tab_icon = TintedIcon(app::images::edit, tab_accent, 14.0F);
       } else {
         const ImageResource& obj_res =
             is_redis_tab ? app::images::database
@@ -371,24 +382,26 @@ using namespace dbpp::ui;
               [app, workspace, tid] { ActivateWorkspaceTab(app, workspace, tid); },
               [request_close_tabs, tid] { request_close_tabs({tid}); })
               .On<ViewEvents::ContextMenuRequested>(
-                  [menu, loc, request_close_tabs, tid, other_ids, all_ids](Point position) {
+                  [menu, loc, request_close_tabs, tid, other_ids, all_ids,
+                   danger = semantic.status_failed](Point position) {
                     std::vector<MenuEntry> entries;
                     entries.emplace_back(
-                        MenuItem(loc.Get(app::strings::tab_ctx_close),
+                        MenuItem(app::images::close, loc.Get(app::strings::tab_ctx_close),
                                  [request_close_tabs, tid] { request_close_tabs({tid}); }));
                     if (!other_ids.empty()) {
                       entries.emplace_back(
-                          MenuItem(loc.Get(app::strings::tab_ctx_close_others),
+                          MenuItem(app::images::close, loc.Get(app::strings::tab_ctx_close_others),
                                    [request_close_tabs, other_ids] {
                                      request_close_tabs(other_ids);
                                    }));
                     }
                     entries.emplace_back(MenuSection{});
                     entries.emplace_back(
-                        MenuItem(loc.Get(app::strings::tab_ctx_close_all),
+                        MenuItem(app::images::trash, loc.Get(app::strings::tab_ctx_close_all),
                                  [request_close_tabs, all_ids] {
                                    request_close_tabs(all_ids);
-                                 }));
+                                 })
+                            .IconTint(danger));
                     menu.ShowAt(position, std::move(entries));
                   })
               .Key("ws-tab-" + std::to_string(tid)));
@@ -486,9 +499,13 @@ using namespace dbpp::ui;
       active_body = TableBrowserPage(app, workspace, active_tab->id, tasks, notify,
                                      theme_config, language_mode, system_dark)
                         .Key("tab-body-" + std::to_string(active_tab->id));
+    } else if (active_tab->kind == WorkspaceTabKind::TableDesign) {
+      active_body = TableDesignPage(app, workspace, active_tab->id, tasks, notify,
+                                    theme_config, language_mode, system_dark)
+                        .Key("tab-body-" + std::to_string(active_tab->id));
     } else {
-      active_body = SqlPage(app, workspace, profiles, active_tab->id, tasks, notify,
-                            theme_config, language_mode, system_dark)
+      active_body = SqlPage(app, workspace, profiles, saved_queries, profiles_path, active_tab->id,
+                            tasks, notify, theme_config, language_mode, system_dark)
                         .Key("tab-body-" + std::to_string(active_tab->id));
     }
 
@@ -503,8 +520,8 @@ using namespace dbpp::ui;
   const std::array<Grow, 2> cur_split_grows = split_grows.Get();
   View page_content =
       SplitLayout{
-          Sidebar(app, workspace, profiles, profiles_path, tasks, notify, theme_config,
-                  language_mode, system_dark, connect_profile)
+          Sidebar(app, workspace, profiles, saved_queries, profiles_path, tasks, notify,
+                  theme_config, language_mode, system_dark, connect_profile)
               .With(cur_split_frames[0], cur_split_grows[0])
               .Key("workspace-sidebar-pane"),
           LoadingOverlay(std::move(main_content), !model.status.empty(), model.status)

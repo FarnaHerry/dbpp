@@ -36,14 +36,67 @@ const sqlite::Table<ConnectionRow>& BuildConnectionsTable() {
       sqlite::Column<&ConnectionRow::uri>{"uri"},
       sqlite::Column<&ConnectionRow::username>{"username"},
       sqlite::Column<&ConnectionRow::password>{"password"},
+      sqlite::Column<&ConnectionRow::remark>{"remark"},
+      sqlite::Column<&ConnectionRow::read_only>{"read_only"},
+      sqlite::Column<&ConnectionRow::production_mode>{"production_mode"},
+      sqlite::Column<&ConnectionRow::show_system_databases>{"show_system_databases"},
       sqlite::Index<&ConnectionRow::sort_order, &ConnectionRow::id>{"idx_connections_sort_order"},
   };
   return table;
 }
 
+const sqlite::Table<SavedQueryRow>& BuildSavedQueriesTable() {
+  static const sqlite::Table<SavedQueryRow> table{
+      "saved_queries",
+      sqlite::Column<&SavedQueryRow::id>{"id", sqlite::PrimaryKey{}, sqlite::AutoIncrement{}},
+      sqlite::Column<&SavedQueryRow::sort_order>{"sort_order"},
+      sqlite::Column<&SavedQueryRow::connection_key>{"connection_key"},
+      sqlite::Column<&SavedQueryRow::database_name>{"database_name"},
+      sqlite::Column<&SavedQueryRow::name>{"name"},
+      sqlite::Column<&SavedQueryRow::sql_text>{"sql_text"},
+      sqlite::Index<&SavedQueryRow::sort_order, &SavedQueryRow::id>{
+          "idx_saved_queries_sort_order"},
+  };
+  return table;
+}
+
 const sqlite::Schema& BuildConfigSchema() {
-  static const sqlite::Schema schema{1, BuildSettingsTable(), BuildConnectionsTable()};
+  static const sqlite::Schema schema{
+      2, BuildSettingsTable(), BuildConnectionsTable(), BuildSavedQueriesTable()};
   return schema;
+}
+
+const sqlite::Migrations& BuildConfigMigrations() {
+  static const sqlite::Migrations migrations{
+      sqlite::Migration{
+          1,
+          2,
+          [](sqlite::MigrationContext& migration) -> sqlite::Result<void> {
+            for (const char* stmt : {
+                     "ALTER TABLE connections ADD COLUMN remark TEXT NOT NULL DEFAULT '';",
+                     "ALTER TABLE connections ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;",
+                     "ALTER TABLE connections ADD COLUMN production_mode INTEGER NOT NULL DEFAULT 0;",
+                     "ALTER TABLE connections ADD COLUMN show_system_databases INTEGER NOT NULL DEFAULT 0;",
+                     "CREATE TABLE IF NOT EXISTS saved_queries ("
+                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                     "sort_order INTEGER NOT NULL DEFAULT 0, "
+                     "connection_key TEXT NOT NULL DEFAULT '', "
+                     "database_name TEXT NOT NULL DEFAULT '', "
+                     "name TEXT NOT NULL DEFAULT '', "
+                     "sql_text TEXT NOT NULL DEFAULT ''"
+                     ");",
+                     "CREATE INDEX IF NOT EXISTS idx_saved_queries_sort_order "
+                     "ON saved_queries (sort_order, id);",
+                 }) {
+              auto res = migration.Execute(stmt);
+              if (!res) {
+                return res.Error();
+              }
+            }
+            return {};
+          }},
+  };
+  return migrations;
 }
 
 void ApplySettingPair(std::string_view key, std::string_view value, TraySettings& out) {
@@ -80,8 +133,16 @@ const sqlite::Table<ConnectionRow>& ConnectionsTable() {
   return BuildConnectionsTable();
 }
 
+const sqlite::Table<SavedQueryRow>& SavedQueriesTable() {
+  return BuildSavedQueriesTable();
+}
+
 const sqlite::Schema& ConfigSchema() {
   return BuildConfigSchema();
+}
+
+const sqlite::Migrations& ConfigMigrations() {
+  return BuildConfigMigrations();
 }
 
 sqlite::OpenOptions ConfigOpenOptions() {
@@ -162,7 +223,7 @@ huxerui::Task<bool> ConfigDbService::OpenAndMigrateAsync(std::string db_path,
   }
   opening_ = true;
   auto opened = co_await sqlite::Database::OpenAsync(
-      huxerui::File{db_path_}, ConfigSchema(), {}, ConfigOpenOptions());
+      huxerui::File{db_path_}, ConfigSchema(), ConfigMigrations(), ConfigOpenOptions());
   opening_ = false;
   if (!opened) {
     std::fprintf(stderr, "db++: 打开 SQLite 配置库失败：%s\n",
@@ -261,6 +322,11 @@ huxerui::Task<bool> ConfigDbService::OpenAndMigrateAsync(std::string db_path,
     pending_connections_.reset();
     ScheduleConnectionsWrite(std::move(queued));
   }
+  if (pending_saved_queries_.has_value()) {
+    std::vector<SavedQuery> queued = std::move(*pending_saved_queries_);
+    pending_saved_queries_.reset();
+    ScheduleSavedQueriesWrite(std::move(queued));
+  }
 
   (void)self;
   co_return true;
@@ -291,9 +357,41 @@ huxerui::Task<std::vector<ConnectionProfile>> ConfigDbService::LoadConnectionsAs
         .uri = std::move(row.uri),
         .username = std::move(row.username),
         .password = std::move(row.password),
+        .remark = std::move(row.remark),
+        .read_only = row.read_only,
+        .production_mode = row.production_mode,
+        .show_system_databases = row.show_system_databases,
     });
   }
   co_return profiles;
+}
+
+huxerui::Task<std::vector<SavedQuery>> ConfigDbService::LoadSavedQueriesAsync() const {
+  if (!database_.has_value()) {
+    co_return LoadSavedQueries(db_path_);
+  }
+  const auto& tbl = SavedQueriesTable();
+  auto rows = co_await database_->Select(tbl)
+                  .OrderBy(tbl.Column<&SavedQueryRow::sort_order>(),
+                           sqlite::SortDirection::Ascending)
+                  .OrderBy(tbl.Column<&SavedQueryRow::id>(), sqlite::SortDirection::Ascending)
+                  .AllAsync();
+  if (!rows) {
+    std::fprintf(stderr, "db++: 读取已保存查询失败：%s\n", rows.Error().Message().c_str());
+    co_return LoadSavedQueries(db_path_);
+  }
+  std::vector<SavedQuery> queries;
+  queries.reserve(rows->size());
+  for (SavedQueryRow& row : *rows) {
+    queries.push_back(SavedQuery{
+        .id = row.id,
+        .connection_key = std::move(row.connection_key),
+        .database_name = std::move(row.database_name),
+        .name = std::move(row.name),
+        .sql_text = std::move(row.sql_text),
+    });
+  }
+  co_return queries;
 }
 
 void ConfigDbService::PersistSetting(std::string key, std::string value) {
@@ -316,6 +414,18 @@ void ConfigDbService::PersistConnections(std::vector<ConnectionProfile> profiles
     return;
   }
   ScheduleConnectionsWrite(std::move(profiles));
+}
+
+void ConfigDbService::PersistSavedQueries(std::vector<SavedQuery> queries) {
+  if (!database_.has_value()) {
+    if (has_tasks_) {
+      pending_saved_queries_ = std::move(queries);
+    } else if (!db_path_.empty()) {
+      (void)SaveSavedQueries(db_path_, queries);
+    }
+    return;
+  }
+  ScheduleSavedQueriesWrite(std::move(queries));
 }
 
 void ConfigDbService::ScheduleSettingWrite(std::string key, std::string value) {
@@ -367,6 +477,10 @@ void ConfigDbService::ScheduleConnectionsWrite(std::vector<ConnectionProfile> pr
                 .uri = profiles[i].uri,
                 .username = profiles[i].username,
                 .password = profiles[i].password,
+                .remark = profiles[i].remark,
+                .read_only = profiles[i].read_only,
+                .production_mode = profiles[i].production_mode,
+                .show_system_databases = profiles[i].show_system_databases,
             });
           }
           auto inserted = tx.InsertMany(ConnectionsTable(), rows);
@@ -377,6 +491,49 @@ void ConfigDbService::ScheduleConnectionsWrite(std::vector<ConnectionProfile> pr
         });
     if (!res) {
       std::fprintf(stderr, "db++: 保存连接配置失败：%s\n", res.Error().Message().c_str());
+    }
+    if (const auto locked = weak.lock()) {
+      locked->ApplyRestrictedFilePermissions();
+    }
+  });
+}
+
+void ConfigDbService::ScheduleSavedQueriesWrite(std::vector<SavedQuery> queries) {
+  if (!database_.has_value() || !has_tasks_) {
+    return;
+  }
+  auto db = *database_;
+  auto weak = weak_from_this();
+  tasks_.Launch([db, weak, queries = std::move(queries)]() mutable -> huxerui::Task<void> {
+    auto res = co_await db.TransactionAsync(
+        [&queries](sqlite::Transaction& tx) -> sqlite::Result<void> {
+          auto cleared = tx.Execute("DELETE FROM saved_queries");
+          if (!cleared) {
+            return cleared.Error();
+          }
+          if (queries.empty()) {
+            return {};
+          }
+          std::vector<SavedQueryRow> rows;
+          rows.reserve(queries.size());
+          for (std::size_t i = 0; i < queries.size(); ++i) {
+            rows.push_back(SavedQueryRow{
+                .id = 0,
+                .sort_order = static_cast<std::int64_t>(i),
+                .connection_key = queries[i].connection_key,
+                .database_name = queries[i].database_name,
+                .name = queries[i].name,
+                .sql_text = queries[i].sql_text,
+            });
+          }
+          auto inserted = tx.InsertMany(SavedQueriesTable(), rows);
+          if (!inserted) {
+            return inserted.Error();
+          }
+          return {};
+        });
+    if (!res) {
+      std::fprintf(stderr, "db++: 保存查询列表失败：%s\n", res.Error().Message().c_str());
     }
     if (const auto locked = weak.lock()) {
       locked->ApplyRestrictedFilePermissions();

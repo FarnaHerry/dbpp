@@ -54,11 +54,11 @@ std::map<int, std::int64_t> ParseInfoKeyspace(std::string_view info_text) {
 }
 
 CellValue TextCell(std::string text) {
-  return CellValue{.text = std::move(text), .is_null = false};
+  return CellValue{.text = std::move(text), .is_null = false, .display_text = {}};
 }
 
 CellValue NullCell() {
-  return CellValue{.text = "NULL", .is_null = true};
+  return CellValue{.text = "NULL", .is_null = true, .display_text = {}};
 }
 
 CellValue ReplyToCell(const RedisValue& val) {

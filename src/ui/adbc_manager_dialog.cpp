@@ -175,12 +175,22 @@ using namespace dbpp::ui;
         username.Get().text.empty() ? sanitized.username : username.Get().text;
     const std::string effective_password =
         password.Get().text.empty() ? sanitized.password : password.Get().text;
+    const std::vector<ConnectionProfile>& existing_list = profiles.Get();
+    const int idx_now = selected.Get();
+    const ConnectionProfile prev_flags =
+        (idx_now >= 0 && static_cast<std::size_t>(idx_now) < existing_list.size())
+            ? existing_list[static_cast<std::size_t>(idx_now)]
+            : ConnectionProfile{};
     ConnectionProfile profile{
         .name = name.Get().text.empty() ? UriDisplayName(sanitized.uri) : name.Get().text,
         .driver_path = driver_path,
         .uri = sanitized.uri,
         .username = effective_user,
         .password = effective_password,
+        .remark = prev_flags.remark,
+        .read_only = prev_flags.read_only,
+        .production_mode = prev_flags.production_mode,
+        .show_system_databases = prev_flags.show_system_databases,
     };
     std::vector<ConnectionProfile> list = profiles.Get();
     int index = selected.Get();
@@ -228,10 +238,17 @@ using namespace dbpp::ui;
     }
   };
 
-  const auto connect = [context, dialog, save_profile, driver, uri, username, password, name] {
+  const auto connect = [context, dialog, profiles, selected, save_profile, driver, uri, username,
+                        password, name] {
     if (!save_profile()) {
       return;
     }
+    const std::vector<ConnectionProfile>& list_now = profiles.Get();
+    const int sel_idx = selected.Get();
+    const ConnectionProfile sel_prof =
+        (sel_idx >= 0 && static_cast<std::size_t>(sel_idx) < list_now.size())
+            ? list_now[static_cast<std::size_t>(sel_idx)]
+            : ConnectionProfile{};
     const SanitizedUriResult sanitized = SanitizeUriCredentials(uri.Get().text);
     ConnectionRequest request{
         .driver_path = driver.Get().text,
@@ -239,6 +256,10 @@ using namespace dbpp::ui;
         .username = username.Get().text.empty() ? sanitized.username : username.Get().text,
         .password = password.Get().text.empty() ? sanitized.password : password.Get().text,
         .title = name.Get().text.empty() ? UriDisplayName(sanitized.uri) : name.Get().text,
+        .remark = sel_prof.remark,
+        .read_only = sel_prof.read_only,
+        .production_mode = sel_prof.production_mode,
+        .show_system_databases = sel_prof.show_system_databases,
     };
     OpenConnection(context.app, context.workspace, context.tasks, std::move(request),
                    context.notify);

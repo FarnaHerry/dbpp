@@ -3,7 +3,7 @@ module;
 #include <huxerui/datatable.h>
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.0"
+#define DBPP_VERSION "0.4.1"
 #endif
 
 module dbpp.cli;

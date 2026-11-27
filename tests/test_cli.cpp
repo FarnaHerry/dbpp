@@ -411,8 +411,8 @@ void TestProfilesLifecycle(const fs::path& dir) {
           user_version = *v;
           return {};
         });
-    Expect(static_cast<bool>(version_res) && user_version == 1,
-           "dbpp.sqlite3 user_version must be 1");
+    Expect(static_cast<bool>(version_res) && user_version == 2,
+           "dbpp.sqlite3 user_version must be 2");
   }
 
   {

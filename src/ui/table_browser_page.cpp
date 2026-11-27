@@ -26,6 +26,7 @@ using namespace dbpp::ui;
   const auto dialogs = UseDialog();
   const auto menu = UseMenu();
   const auto picker = UseService<FilePicker>();
+  const auto clipboard = UseApplication().Clipboard();
   const auto sort_anchor = UseViewHandle();
   const auto import_anchor = UseViewHandle();
   const auto export_anchor = UseViewHandle();
@@ -33,6 +34,7 @@ using namespace dbpp::ui;
   const auto page_size_popup = UsePopup();
   const auto settings = UseService<SettingsModel>();
   auto live_drafts = UseState(std::make_shared<std::unordered_map<std::string, std::string>>());
+  const auto inline_editor_focused = UseState(std::make_shared<std::atomic<bool>>(false));
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
@@ -97,19 +99,6 @@ using namespace dbpp::ui;
       }
       draft->values[col_idx] = value;
     });
-  };
-
-  const auto flush_draft_cell = [live_drafts, apply_draft_value](const std::string& row_id,
-                                                                 const std::string& col_id) {
-    auto live = live_drafts.Get();
-    const std::string key = DraftCellBufferKey(row_id, col_id);
-    const auto it = live->find(key);
-    if (it == live->end()) {
-      return;
-    }
-    std::string text = std::move(it->second);
-    live->erase(it);
-    apply_draft_value(row_id, col_id, text);
   };
 
   const auto flush_live_drafts = [workspace, tab_id, live_drafts]() {
@@ -237,9 +226,30 @@ using namespace dbpp::ui;
     }
   };
 
-  const auto commit_inserts = [app, workspace, tasks, tab_id, flush_live_drafts, notify] {
+  const bool is_production = session->production_mode;
+  const std::string prod_conn_name = session->name;
+  const auto commit_inserts = [dialogs, app, workspace, tasks, tab_id, flush_live_drafts, notify,
+                               is_production, prod_conn_name, theme_config, language_mode,
+                               system_dark] {
     flush_live_drafts();
-    RequestCommitPendingInserts(app, workspace, tasks, tab_id, notify);
+    const auto do_commit = [app, workspace, tasks, tab_id, notify] {
+      RequestCommitPendingInserts(app, workspace, tasks, tab_id, notify);
+    };
+    if (is_production) {
+      const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+      const std::size_t cnt = cur != nullptr ? cur->table.pending_inserts.size() : 0;
+      const std::string summary =
+          "INSERT INTO " + (cur != nullptr ? cur->table.qualified_name : std::string{}) +
+          " (" + std::to_string(cnt) + " row(s))";
+      dialogs.Show([prod_conn_name, summary, do_commit, theme_config, language_mode,
+                    system_dark](DialogContext dialog) {
+        return WithDialogTheme(
+            theme_config, language_mode, system_dark,
+            ProductionWriteConfirmDialog(dialog, prod_conn_name, summary, do_commit));
+      });
+      return;
+    }
+    do_commit();
   };
 
   const auto rollback_inserts = [workspace, tab_id, live_drafts, notify, loc] {
@@ -441,53 +451,20 @@ using namespace dbpp::ui;
     toolbar_items.Add(
         CompactActionButton(
             Button(app::strings::table_import)
-                .OnClick([menu, import_anchor, picker, tasks, app, workspace, tab_id, notify, loc,
-                          adbc_ptr, target_table_name, target_catalog, target_schema, refresh] {
+                .OnClick([menu, import_anchor, picker, tasks, dialogs, notify, loc, adbc_ptr,
+                          target_table_name, target_catalog, target_schema, is_production,
+                          prod_conn_name, refresh, theme_config, language_mode, system_dark] {
                   if (!picker || !picker->CanOpenFiles()) return;
                   const auto launch_import = [=](bool is_jsonl) {
-                    tasks.Launch([picker, adbc_ptr, target_table_name, target_catalog,
-                                  target_schema, notify, loc, refresh, is_jsonl]() -> Task<void> {
-                      FilePickerFilter filter{
-                          .name = is_jsonl ? "JSONL" : "CSV",
-                          .extensions = is_jsonl ? std::vector<std::string>{"jsonl", "ndjson"}
-                                                 : std::vector<std::string>{"csv", "tsv"},
-                          .content_types = {is_jsonl ? "application/x-ndjson" : "text/csv"},
-                      };
-                      auto selected = co_await picker->OpenFileAsync(std::move(filter));
-                      if (!selected) co_return;
-                      auto file = selected->AsFile();
-                      if (!file) {
-                        if (notify) notify(loc.Get(app::strings::connect_picker_no_local_path));
-                        co_return;
-                      }
-                      const std::string p = file->Path();
-                      const BulkIngestResult res = co_await adbc_ptr->sequence.Run(
-                          [adbc_ptr, p, target_table_name, target_catalog, target_schema,
-                           is_jsonl](std::stop_token) {
-                            return is_jsonl
-                                       ? IngestJsonlPathBlocking(*adbc_ptr, p, target_table_name,
-                                                                 IngestMode::Append, target_catalog,
-                                                                 target_schema)
-                                       : IngestCsvPathBlocking(*adbc_ptr, p, target_table_name,
-                                                               IngestMode::Append, target_catalog,
-                                                               target_schema);
-                          });
-                      if (!res.error.empty()) {
-                        if (notify) notify(loc.Fmt(app::strings::table_import_failed, res.error));
-                        co_return;
-                      }
-                      if (notify) {
-                        notify(loc.Fmt(app::strings::table_import_done,
-                                       res.rows_affected >= 0 ? std::to_string(res.rows_affected)
-                                                              : std::string("?")));
-                      }
-                      refresh();
-                    });
+                    LaunchTableFileImport(is_jsonl, picker, adbc_ptr, target_table_name,
+                                          target_catalog, target_schema, is_production,
+                                          prod_conn_name, dialogs, tasks, notify, loc, refresh,
+                                          theme_config, language_mode, system_dark);
                   };
                   std::vector<MenuEntry> entries;
-                  entries.emplace_back(MenuItem(loc.Get(app::strings::table_import_csv),
+                  entries.emplace_back(MenuItem(app::images::add, loc.Get(app::strings::table_import_csv),
                                                 [launch_import] { launch_import(false); }));
-                  entries.emplace_back(MenuItem(loc.Get(app::strings::table_import_jsonl),
+                  entries.emplace_back(MenuItem(app::images::add, loc.Get(app::strings::table_import_jsonl),
                                                 [launch_import] { launch_import(true); }));
                   menu.Show(import_anchor, std::move(entries),
                             MenuOptions{.placement = {.side = AnchorSide::Below,
@@ -523,13 +500,13 @@ using namespace dbpp::ui;
                           notify, loc] {
                   std::vector<MenuEntry> entries;
                   entries.emplace_back(MenuItem(
-                      loc.Get(app::strings::sql_export_csv),
+                      app::images::external_link, loc.Get(app::strings::sql_export_csv),
                       [adbc_ptr, export_sql, base_name, picker, tasks, notify, loc] {
                         ExportSqlWithPicker(adbc_ptr, export_sql, ExportFormat::Csv,
                                             base_name + ".csv", picker, tasks, notify, loc);
                       }));
                   entries.emplace_back(MenuItem(
-                      loc.Get(app::strings::sql_export_jsonl),
+                      app::images::external_link, loc.Get(app::strings::sql_export_jsonl),
                       [adbc_ptr, export_sql, base_name, picker, tasks, notify, loc] {
                         ExportSqlWithPicker(adbc_ptr, export_sql, ExportFormat::Jsonl,
                                             base_name + ".jsonl", picker, tasks, notify, loc);
@@ -657,6 +634,12 @@ using namespace dbpp::ui;
                     spec.colors.surface_container, Color::Transparent())
             .With(LayoutPriority(1.0F)));
   }
+  if (session->production_mode) {
+    status_items.Add(
+        StatusBadge(loc.Get(app::strings::badge_prod), semantic.danger,
+                    semantic.danger_container, WithAlpha(semantic.danger, 0.35F))
+            .With(LayoutPriority(1.0F)));
+  }
   status_items.Add(Spacer());
   status_items.Add(Text(status_text)
                        .Style(TextStyle{Font::System(font_size::kCaption),
@@ -685,6 +668,9 @@ using namespace dbpp::ui;
     const std::string draft_first_empty = UseString(app::strings::table_draft_first_col_empty);
     const std::string draft_other_empty = UseString(app::strings::table_draft_other_col_empty);
     const std::string draft_acc_empty = UseString(app::strings::table_draft_accessibility_empty);
+    const Dialect session_dialect = session->dialect;
+    const bool table_editable = model.editable;
+    const bool table_read_only = model.read_only;
     std::vector<DataTableColumn> columns;
     columns.reserve(model.columns.size() + 1);
     columns.push_back(MakeRowNumberColumn(
@@ -707,8 +693,11 @@ using namespace dbpp::ui;
       };
       column.sortable = true;
       column.render_cell = [snapshot, drafts, index, spec, semantic, draft_first_empty,
-                            draft_other_empty, draft_acc_empty](
-                               const DataTableCellContext& cell) -> DataTableCellContent {
+                            draft_other_empty, draft_acc_empty, menu, dialogs, clipboard, app,
+                            workspace, tab_id, session_dialect, is_redis, is_production,
+                            prod_conn_name, table_editable, table_read_only, meta, tasks, notify,
+                            theme_config, language_mode, system_dark, loc, add_draft_row,
+                            reload](const DataTableCellContext& cell) -> DataTableCellContent {
         if (const auto draft_id = ParseDraftRowId(cell.id.row_id)) {
           const PendingInsertRow* draft = FindDraftRow(drafts, *draft_id);
           const std::string raw = (draft != nullptr && index < draft->values.size())
@@ -733,17 +722,74 @@ using namespace dbpp::ui;
         }
 
         const bool is_null = CellIsNull(snapshot, cell.id.row_id, index);
-        const std::string text = CellText(snapshot, cell.id.row_id, index);
-        TextStyle style{Font::Monospace(13.0F),
-                        is_null ? semantic.null_text : spec.colors.on_surface};
+        const std::string raw = CellText(snapshot, cell.id.row_id, index);
+        const std::string text = CellDisplayText(snapshot, cell.id.row_id, index);
+        View cell_content;
         if (is_null) {
-          style.font = Font::Monospace(13.0F).WithSlant(FontSlant::Italic);
+          cell_content = NullValueBadge(semantic.null_text);
+        } else {
+          TextStyle style{Font::Monospace(13.0F), spec.colors.on_surface};
+          cell_content = Text(SingleLineCellPreview(text))
+                             .Style(style)
+                             .LineLimit(1)
+                             .Overflow(TextOverflow::Ellipsis);
+          if (text != raw && !raw.empty()) {
+            cell_content = std::move(cell_content).With(Tooltip(StringVariant(raw)));
+          }
         }
+        const std::size_t row_idx = RowIndexFromId(cell.id.row_id);
+        const bool cell_editable =
+            table_editable && !table_read_only && !IsBlobColumn(meta) &&
+            !(is_redis && meta.name == "size") && row_idx != static_cast<std::size_t>(-1);
+        const bool can_set_null = cell_editable && meta.nullable && !is_null;
+        std::string row_tsv;
+        if (const GridRow* gr = RowAt(snapshot, row_idx)) {
+          for (std::size_t ci = 0; ci < gr->values.size(); ++ci) {
+            if (ci > 0) row_tsv.push_back('\t');
+            row_tsv += gr->values[ci].is_null ? std::string{"NULL"} : gr->values[ci].DisplayText();
+          }
+        }
+        const CellValue raw_cell = (RowAt(snapshot, row_idx) != nullptr &&
+                                    index < RowAt(snapshot, row_idx)->values.size())
+                                       ? RowAt(snapshot, row_idx)->values[index]
+                                       : CellValue{};
+        const std::string copy_text_val = is_null ? std::string{"NULL"} : text;
+        const auto apply_val_filter = [workspace, tab_id, reload](std::string f) {
+          workspace.Update([tab_id, &f](WorkspaceModel& ws) {
+            if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+              target->filter_input = TextEditingValue::FromText(f);
+            }
+          });
+          reload(0, std::move(f));
+        };
+        View cell_box =
+            Row{std::move(cell_content)}
+                .With(Frame{.min_height = 26.0F}, CrossAlign{CrossAxisAlignment::Center})
+                .On<ViewEvents::ContextMenuRequested>(
+                    [menu, dialogs, clipboard, app, workspace, tab_id, row_idx, index,
+                     session_dialect, is_redis, cell_editable, can_set_null, is_production,
+                     prod_conn_name, copy_text_val, row_tsv = std::move(row_tsv), meta, raw_cell,
+                     tasks, notify, theme_config, language_mode, system_dark,
+                     danger = semantic.status_failed, loc, add_draft_row,
+                     apply_val_filter](Point pos) {
+                      if (row_idx == static_cast<std::size_t>(-1)) {
+                        return;
+                      }
+                      workspace.Update([tab_id, row_idx, col_name = meta.name](WorkspaceModel& ws) {
+                        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+                          target->selected_cell = DataTableCellId{
+                              .row_id = std::to_string(row_idx), .column_id = col_name};
+                        }
+                      });
+                      ShowTableCellContextMenu(
+                          pos, menu, dialogs, clipboard, app, workspace, tab_id, row_idx, index,
+                          session_dialect, is_redis, cell_editable, can_set_null, is_production,
+                          prod_conn_name, copy_text_val, row_tsv, meta, raw_cell, tasks, notify,
+                          theme_config, language_mode, system_dark, danger, loc, add_draft_row,
+                          apply_val_filter);
+                    });
         return DataTableCellContent{
-            .view = Text(SingleLineCellPreview(text))
-                        .Style(style)
-                        .LineLimit(1)
-                        .Overflow(TextOverflow::Ellipsis),
+            .view = std::move(cell_box),
             .label = text,
         };
       };
@@ -771,35 +817,35 @@ using namespace dbpp::ui;
               }
               return CellIsNull(snapshot, cell.id.row_id, index)
                          ? std::string{"NULL"}
-                         : CellText(snapshot, cell.id.row_id, index);
+                         : CellDisplayText(snapshot, cell.id.row_id, index);
             },
-            .render = [live_drafts, flush_draft_cell](const DataTableEditContext& edit) {
+            .render = [live_drafts, inline_editor_focused](const DataTableEditContext& edit) {
               const std::string row_id = edit.cell.id.row_id;
               const std::string col_id = edit.cell.id.column_id;
-              View field = TextField(edit.draft)
-                               .Variant(TextFieldVariant::Standard)
-                               .LineLimits(TextFieldLineLimits::SingleLine())
-                               .VerticalAlign(TextVerticalAlign::Center)
-                               .InputConfiguration({.action = TextInputAction::Done})
-                               .OnChanged([draft = edit.draft, live_drafts, row_id, col_id](
-                                              const TextEditingValue& value) {
-                                 draft = value;
-                                 if (IsDraftRowId(row_id)) {
-                                   (*live_drafts.Get())[DraftCellBufferKey(row_id, col_id)] =
-                                       value.text;
-                                 }
-                               })
-                               .OnSubmitted(edit.commit)
-                               .With(Padding{EdgeInsets::Symmetric(4.0F, 8.0F)}, edit.focus_target);
-              if (IsDraftRowId(row_id)) {
-                field = std::move(field).On<ViewEvents::FocusChanged>(
-                    [flush_draft_cell, row_id, col_id](bool focused) {
-                      if (!focused) {
-                        flush_draft_cell(row_id, col_id);
-                      }
-                    });
-              }
-              return field;
+              const auto entered_focus = inline_editor_focused.Get();
+              return CompactTableCellEditor(
+                  TextField(edit.draft)
+                      .Variant(TextFieldVariant::Standard)
+                      .LineLimits(TextFieldLineLimits::SingleLine())
+                      .VerticalAlign(TextVerticalAlign::Center)
+                      .InputConfiguration({.action = TextInputAction::Done})
+                      .OnChanged([draft = edit.draft, live_drafts, row_id, col_id](
+                                     const TextEditingValue& value) {
+                        draft = value;
+                        if (IsDraftRowId(row_id)) {
+                          (*live_drafts.Get())[DraftCellBufferKey(row_id, col_id)] = value.text;
+                        }
+                      })
+                      .OnSubmitted(edit.commit)
+                      .On<ViewEvents::FocusChanged>(
+                          [entered_focus, commit = edit.commit](bool focused) {
+                            if (focused) {
+                              entered_focus->store(true, std::memory_order_release);
+                            } else if (entered_focus->exchange(false, std::memory_order_acq_rel)) {
+                              commit();
+                            }
+                          })
+                      .With(edit.focus_target));
             },
         };
       }
@@ -858,7 +904,8 @@ using namespace dbpp::ui;
                   });
                 })
             .On<DataTableEvents::EditSubmitted>(
-                [app, workspace, tasks, tab_id, live_drafts, apply_draft_value,
+                [dialogs, app, workspace, tasks, tab_id, live_drafts, apply_draft_value,
+                 is_production, prod_conn_name, theme_config, language_mode, system_dark,
                  notify](const DataTableEditRequest& edit) {
                   if (IsDraftRowId(edit.cell_id.row_id)) {
                     live_drafts.Get()->erase(
@@ -866,7 +913,9 @@ using namespace dbpp::ui;
                     apply_draft_value(edit.cell_id.row_id, edit.cell_id.column_id, edit.text);
                     return;
                   }
-                  RequestSaveCell(app, workspace, tasks, tab_id, edit, notify);
+                  HandleTableEditSubmitted(dialogs, app, workspace, tasks, tab_id, edit,
+                                           is_production, prod_conn_name, theme_config,
+                                           language_mode, system_dark, notify);
                 })
             .On<DataTableEvents::ColumnResized>(
                 [workspace, tab_id](const DataTableColumnResize& resize) {
@@ -886,13 +935,17 @@ using namespace dbpp::ui;
     table_view = LoadingOverlay(std::move(grid), table_busy, table_busy_label).With(Grow(1.0F));
   }
 
-  return Column{
-      std::move(toolbar),
-      (!model.error.empty() && model.snapshot != nullptr) ? ErrorText(model.error) : View{},
-      std::move(table_view),
-      std::move(pager),
-  }.With(Grow(1.0F), Padding{EdgeInsets{.top = 4.0F}}, Spacing{4.0F},
-         CrossAlign{CrossAxisAlignment::Stretch});
+  Views page_items;
+  page_items.Add(std::move(toolbar).Key("table-toolbar-" + std::to_string(tab_id)));
+  if (!model.error.empty() && model.snapshot != nullptr) {
+    page_items.Add(ErrorText(model.error).Key("table-error-" + std::to_string(tab_id)));
+  }
+  page_items.Add(std::move(table_view).Key("table-view-" + std::to_string(tab_id)));
+  page_items.Add(std::move(pager).Key("table-pager-" + std::to_string(tab_id)));
+
+  return Column{std::move(page_items)}.With(Grow(1.0F), Padding{EdgeInsets{.top = 4.0F}},
+                                            Spacing{4.0F},
+                                            CrossAlign{CrossAxisAlignment::Stretch});
 }
 
 } // namespace dbpp

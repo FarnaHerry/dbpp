@@ -34,7 +34,7 @@ concurrency:
 
 env:
   HUXERUI_REPO: 'https://github.com/FarnaHerry/HuxerUI.git'
-  HUXERUI_COMMIT: 'b581978c9412baf49dedaded38b7e0d55757d579'
+  HUXERUI_COMMIT: 'ee17f64ab47fe9f49ea3e60bffd7aa7ee554e8e2'
   LIB_SQLITE_REPO: 'https://github.com/FarnaHerry/Lib-SQLite.git'
   LIB_SQLITE_COMMIT: '882665a9772cc973b1cbfb7f491913703da1d636'
 

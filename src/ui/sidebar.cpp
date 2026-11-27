@@ -33,7 +33,8 @@ struct SidebarConnectionEntry {
 
 [[huxerui::composable]] View Sidebar(
     State<AppModel> app, State<WorkspaceModel> workspace,
-    State<std::vector<ConnectionProfile>> profiles, std::string profiles_path, TaskScope tasks,
+    State<std::vector<ConnectionProfile>> profiles,
+    State<std::vector<SavedQuery>> saved_queries, std::string profiles_path, TaskScope tasks,
     NotifyFn notify, AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark,
     std::function<void(ConnectionProfile)> connect_profile) {
   const ThemeSpec& spec = UseTheme();
@@ -42,15 +43,33 @@ struct SidebarConnectionEntry {
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto menu = UseMenu();
   const auto dialogs = UseDialog();
+  const auto picker = UseService<FilePicker>();
   const auto clipboard = UseApplication().Clipboard();
   const AppModel& model = app.Get();
   const WorkspaceTab* active_tab = workspace.Get().ActiveTab();
   auto collapsed_sessions = UseState(std::vector<std::uint64_t>{});
   auto collapsed_groups = UseState(std::vector<std::string>{});
   auto db_open_overrides = UseState(std::unordered_map<std::string, bool>{});
+  auto node_open_overrides = UseState(std::unordered_map<std::string, bool>{});
   auto custom_order = UseState(std::vector<std::string>{});
   auto drop_hover_key = UseState(std::string{});
   auto conn_search = UseState(TextEditingValue{});
+
+  const auto make_conn_badge = [&](bool prod, bool ro) -> View {
+    if (!prod && !ro) {
+      return View{};
+    }
+    Views pills;
+    if (prod) {
+      pills.Add(StatusBadge(loc.Get(app::strings::badge_prod), semantic.danger,
+                            semantic.danger_container, WithAlpha(semantic.danger, 0.35F)));
+    }
+    if (ro) {
+      pills.Add(StatusBadge(loc.Get(app::strings::badge_ro), semantic.warning,
+                            semantic.warning_container, WithAlpha(semantic.warning, 0.35F)));
+    }
+    return Row{std::move(pills)}.With(Spacing{3.0F}, CrossAlign{CrossAxisAlignment::Center});
+  };
 
   const auto copy_text = [clipboard, notify, loc](std::string text, StringResource label_res) {
     if (clipboard && clipboard->SupportsSynchronousText() && clipboard->WriteText(text)) {
@@ -65,6 +84,7 @@ struct SidebarConnectionEntry {
   const auto& collapsed_session_ids = collapsed_sessions.Get();
   const auto& collapsed_group_keys = collapsed_groups.Get();
   const auto& db_open_map = db_open_overrides.Get();
+  const auto& node_open_map = node_open_overrides.Get();
   const std::string& hovered_drop_key = drop_hover_key.Get();
 
   // Assemble saved profiles and live sessions in one unified order so
@@ -181,7 +201,9 @@ struct SidebarConnectionEntry {
           entry.session != nullptr ? entry.session->driver_path : entry.profile->driver_path;
       if (!ContainsIgnoreCaseAscii(entry_name, conn_query) &&
           !ContainsIgnoreCaseAscii(entry_uri, conn_query) &&
-          !ContainsIgnoreCaseAscii(entry_driver, conn_query)) {
+          !ContainsIgnoreCaseAscii(entry_driver, conn_query) &&
+          !(entry.profile && ContainsIgnoreCaseAscii(entry.profile->remark, conn_query)) &&
+          !(entry.session && ContainsIgnoreCaseAscii(entry.session->remark, conn_query))) {
         continue;
       }
     }
@@ -235,6 +257,7 @@ struct SidebarConnectionEntry {
                       .leading_icon =
                           DatabaseIcon(DetectDatabaseBrand(profile.driver_path, profile.uri), 15.0F),
                       .expanded = false,
+                      .badge = make_conn_badge(profile.production_mode, profile.read_only),
                   },
                   [connect_profile, profile] { connect_profile(profile); })
               .With(Grow(1.0F),
@@ -247,24 +270,31 @@ struct SidebarConnectionEntry {
                   [drop_hover_key](const DragEvent&) { drop_hover_key = std::string{}; })
               .On<ViewEvents::ContextMenuRequested>(
                   [menu, loc, connect_profile, profile, copy_text, open_edit_profile_dialog,
-                   open_delete_profile_dialog](Point position) {
+                   open_delete_profile_dialog, danger = semantic.status_failed](Point position) {
                     menu.ShowAt(position, {
-                        MenuItem(loc.Get(app::strings::sidebar_ctx_connect),
+                        MenuItem(app::images::connect, loc.Get(app::strings::sidebar_ctx_connect),
                                  [connect_profile, profile] { connect_profile(profile); }),
-                        MenuItem(loc.Get(app::strings::sidebar_ctx_edit_conn),
+                        MenuItem(app::images::edit, loc.Get(app::strings::sidebar_ctx_edit_conn),
                                  open_edit_profile_dialog),
                         MenuSection{},
-                        MenuItem(loc.Get(app::strings::sidebar_ctx_copy_uri),
+                        MenuItem(app::images::copy, loc.Get(app::strings::sidebar_ctx_copy_uri),
                                  [copy_text, uri = profile.uri] {
                                    copy_text(uri, app::strings::sidebar_copy_uri_label);
                                  }),
                         MenuSection{},
-                        MenuItem(loc.Get(app::strings::sidebar_ctx_delete_profile),
-                                 open_delete_profile_dialog),
+                        MenuItem(app::images::trash,
+                                 loc.Get(app::strings::sidebar_ctx_delete_profile),
+                                 open_delete_profile_dialog)
+                            .IconTint(danger),
                     });
                   });
-      if (has_failed && !fail_it->second.empty()) {
-        unopened_row = std::move(unopened_row).With(Tooltip(StringVariant(fail_it->second)));
+      if ((has_failed && !fail_it->second.empty()) || !profile.remark.empty()) {
+        std::string tip = profile.remark;
+        if (has_failed && !fail_it->second.empty()) {
+          if (!tip.empty()) tip += "\n";
+          tip += fail_it->second;
+        }
+        unopened_row = std::move(unopened_row).With(Tooltip(StringVariant(std::move(tip))));
       }
 
       tree_rows.Add(
@@ -327,7 +357,8 @@ struct SidebarConnectionEntry {
     };
 
     const auto disconnect_session = [app, workspace, tasks, notify, session_id,
-                                     collapsed_sessions, collapsed_groups, db_open_overrides] {
+                                     collapsed_sessions, collapsed_groups, db_open_overrides,
+                                     node_open_overrides] {
       collapsed_sessions.Update([session_id](std::vector<std::uint64_t>& ids) {
         std::erase(ids, session_id);
       });
@@ -338,6 +369,11 @@ struct SidebarConnectionEntry {
         });
       });
       db_open_overrides.Update([&group_prefix](std::unordered_map<std::string, bool>& overrides) {
+        std::erase_if(overrides, [&group_prefix](const auto& kv) {
+          return kv.first.starts_with(group_prefix);
+        });
+      });
+      node_open_overrides.Update([&group_prefix](std::unordered_map<std::string, bool>& overrides) {
         std::erase_if(overrides, [&group_prefix](const auto& kv) {
           return kv.first.starts_with(group_prefix);
         });
@@ -366,6 +402,7 @@ struct SidebarConnectionEntry {
                     DetectDatabaseBrand(session.driver_path, session.uri, session.dialect), 15.0F),
                 .expanded = is_expanded,
                 .trailing_action = std::move(close),
+                .badge = make_conn_badge(session.production_mode, session.read_only),
             },
             toggle_session)
             .With(Grow(1.0F),
@@ -376,6 +413,10 @@ struct SidebarConnectionEntry {
                 [drop_hover_key](const DragDropResult&) { drop_hover_key = std::string{}; })
             .On<DragSourceEvents::Canceled>(
                 [drop_hover_key](const DragEvent&) { drop_hover_key = std::string{}; });
+    if (!session.remark.empty()) {
+      connection_row =
+          std::move(connection_row).With(Tooltip(StringVariant(session.remark)));
+    }
 
     const ConnectionProfile edit_initial = entry.profile.value_or(ConnectionProfile{
         .name = session.name,
@@ -383,6 +424,10 @@ struct SidebarConnectionEntry {
         .uri = session.uri,
         .username = {},
         .password = {},
+        .remark = session.remark,
+        .read_only = session.read_only,
+        .production_mode = session.production_mode,
+        .show_system_databases = session.show_system_databases,
     });
     const std::optional<ConnectionProfile> edit_original = entry.profile;
     const auto open_edit_session_dialog = [dialogs, edit_original, edit_initial, session_id, app,
@@ -422,41 +467,52 @@ struct SidebarConnectionEntry {
                   reorder_connections(payload.key, entry_key);
                 })
             .On<ViewEvents::ContextMenuRequested>(
-                [menu, loc, is_expanded, toggle_session, refresh_session, app, workspace,
-                 copy_text, open_edit_session_dialog, disconnect_session, session_id,
-                 uri = session.uri, session_name = session.name,
-                 is_redis = (session.dialect == Dialect::Redis), notify](Point position) {
-                  menu.ShowAt(position, {
-                      MenuItem(loc.Get(is_expanded
-                                           ? (is_redis ? app::strings::sidebar_ctx_collapse_dbs
-                                                       : app::strings::sidebar_ctx_collapse_objects)
-                                           : (is_redis ? app::strings::sidebar_ctx_expand_dbs
-                                                       : app::strings::sidebar_ctx_expand_objects)),
-                               toggle_session),
-                      MenuItem(loc.Get(is_redis ? app::strings::sidebar_ctx_refresh_dbs
-                                                : app::strings::sidebar_ctx_refresh_objects),
-                               refresh_session),
-                      MenuItem(loc.Get(is_redis ? app::strings::sidebar_ctx_new_console
-                                                : app::strings::nav_new_query),
-                               [app, workspace, session_id] {
-                                 (void)OpenSqlTab(app, workspace, session_id);
-                               }),
-                      MenuSection{},
-                      MenuItem(loc.Get(app::strings::sidebar_ctx_edit_conn),
-                               open_edit_session_dialog),
-                      MenuItem(loc.Get(app::strings::sidebar_ctx_copy_uri),
-                               [copy_text, uri] {
-                                 copy_text(uri, app::strings::sidebar_copy_uri_label);
-                               }),
-                      MenuSection{},
-                      MenuItem(loc.Get(app::strings::sidebar_ctx_disconnect),
+                [menu, loc, picker, adbc = session.session, refresh_session, app, workspace,
+                 dialogs, tasks, copy_text, open_edit_session_dialog, disconnect_session,
+                 session_id, uri = session.uri, session_name = session.name,
+                 read_only = session.read_only, is_production = session.production_mode,
+                 is_redis = (session.dialect == Dialect::Redis), notify, theme_config,
+                 language_mode, system_dark, danger = semantic.status_failed](Point position) {
+                  std::vector<MenuEntry> entries;
+                  entries.emplace_back(MenuItem(
+                      app::images::refresh,
+                      loc.Get(is_redis ? app::strings::sidebar_ctx_refresh_dbs
+                                       : app::strings::sidebar_ctx_refresh_objects),
+                      refresh_session));
+                  entries.emplace_back(MenuItem(
+                      app::images::sql_console,
+                      loc.Get(is_redis ? app::strings::sidebar_ctx_new_console
+                                       : app::strings::nav_new_query),
+                      [app, workspace, session_id] {
+                        (void)OpenSqlTab(app, workspace, session_id);
+                      }));
+                  entries.emplace_back(MenuSection{});
+                  entries.emplace_back(MenuItem(app::images::edit,
+                                                loc.Get(app::strings::sidebar_ctx_edit_conn),
+                                                open_edit_session_dialog));
+                  entries.emplace_back(MenuItem(
+                      app::images::copy, loc.Get(app::strings::sidebar_ctx_copy_uri),
+                      [copy_text, uri] {
+                        copy_text(uri, app::strings::sidebar_copy_uri_label);
+                      }));
+                  if (!is_redis) {
+                    AppendDatabaseIoMenuEntries(entries, picker, adbc, {}, session_name, read_only,
+                                                is_production, session_name, dialogs, tasks, notify,
+                                                loc, refresh_session, theme_config, language_mode,
+                                                system_dark);
+                  }
+                  entries.emplace_back(MenuSection{});
+                  entries.emplace_back(
+                      MenuItem(app::images::disconnect,
+                               loc.Get(app::strings::sidebar_ctx_disconnect),
                                [disconnect_session, session_name, notify, loc] {
                                  disconnect_session();
                                  if (notify) {
                                    notify(loc.Fmt(app::strings::toast_disconnected, session_name));
                                  }
-                               }),
-                  });
+                               })
+                          .IconTint(danger));
+                  menu.ShowAt(position, std::move(entries));
                 })
             .Key("conn-" + entry_key));
 
@@ -464,7 +520,10 @@ struct SidebarConnectionEntry {
       continue;
     }
 
-    if (session.objects.empty()) {
+    const bool multi_schema = SessionHasMultipleSchemas(session);
+    const bool use_db_hierarchy = SessionUsesDatabaseHierarchy(session);
+
+    if (!use_db_hierarchy && session.objects.empty()) {
       tree_rows.Add(TreeRow(TreeRowOptions{
                                 .prefix = {},
                                 .label = UseString(session.dialect == Dialect::Redis
@@ -480,9 +539,6 @@ struct SidebarConnectionEntry {
                         .Key("empty-" + std::to_string(session_id)));
       continue;
     }
-
-    const bool multi_schema = SessionHasMultipleSchemas(session);
-    const bool use_db_hierarchy = SessionUsesDatabaseHierarchy(session);
 
     const auto render_object_row = [&](const DbObject& object, const std::string& key_prefix,
                                        std::size_t idx, int indent_level,
@@ -558,27 +614,29 @@ struct SidebarConnectionEntry {
         });
       };
 
-      const auto open_edit_table_dialog = [dialogs, adbc = session.session, session_id,
-                                           dialect = session.dialect, object, display_label,
-                                           app, workspace, tasks, notify, theme_config,
-                                           language_mode, system_dark] {
+      const auto open_edit_table_dialog = [adbc = session.session, session_id, object,
+                                           display_label, app, workspace, tasks, notify] {
         if (!adbc || adbc->IsClosed()) {
           HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
           return;
         }
-        dialogs.Show([adbc, session_id, dialect, object, display_label, app, workspace, tasks,
-                      notify, theme_config, language_mode,
-                      system_dark](DialogContext dialog) {
-          return WithDialogTheme(
-              theme_config, language_mode, system_dark,
-              EditTableDialog(dialog, adbc, session_id, dialect, object, display_label, app,
-                              workspace, tasks, notify));
-        });
+        (void)OpenTableDesignTab(app, workspace, session_id, object, display_label);
       };
 
       const bool is_editable_table =
-          !is_redis && !object.is_view &&
+          !is_redis && !session.read_only && !object.is_view &&
           !ContainsIgnoreCaseAscii(object.table_type, "foreign");
+      const bool obj_expandable =
+          !is_redis && (!object.is_view || !object.columns.empty());
+      const std::string obj_node_key = std::to_string(session_id) + ":obj:" + key_prefix + ":" +
+                                       object_schema + ":" + name + ":" + std::to_string(idx);
+      const auto obj_open_it = node_open_map.find(obj_node_key);
+      const bool obj_open = obj_open_it != node_open_map.end() && obj_open_it->second;
+      const auto toggle_obj_open = [node_open_overrides, obj_node_key, obj_open] {
+        node_open_overrides.Update([&obj_node_key, obj_open](std::unordered_map<std::string, bool>& m) {
+          m[obj_node_key] = !obj_open;
+        });
+      };
       const ImageResource& obj_icon =
           is_redis
               ? app::images::database
@@ -604,18 +662,27 @@ struct SidebarConnectionEntry {
                       .prefix_color = icon_accent,
                       .status_dot = std::nullopt,
                       .leading_icon = TintedIcon(obj_icon, resolved_icon_color, 14.0F),
+                      .expanded = obj_expandable ? std::optional<bool>(obj_open) : std::nullopt,
+                      .on_toggle_expand =
+                          obj_expandable ? toggle_obj_open : std::function<void()>{},
                   },
                   open_object)
               .On<ViewEvents::ContextMenuRequested>(
-                  [menu, loc, open_object, app, workspace, open_schema_dialog,
-                   open_edit_table_dialog, copy_text, refresh_session, open_drop_dialog,
-                   session_id, open_in_sql, select_sql, display_label, kind_res, is_redis,
-                   is_editable_table, redis_db_index](Point position) {
+                  [menu, loc, picker, adbc = session.session, object, open_object, app, workspace,
+                   dialogs, tasks, notify, theme_config, language_mode, system_dark,
+                   open_schema_dialog, open_edit_table_dialog, copy_text, refresh_session,
+                   open_drop_dialog, session_id, open_in_sql, select_sql, display_label, kind_res,
+                   is_redis, session_ro = session.read_only,
+                   is_production = session.production_mode, session_name = session.name,
+                   is_editable_table, redis_db_index, obj_icon, resolved_icon_color,
+                   danger = semantic.status_failed](Point position) {
                     if (is_redis) {
                       menu.ShowAt(position, {
-                          MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse),
-                                   open_object),
-                          MenuItem(loc.Get(app::strings::sidebar_ctx_open_in_console),
+                          MenuItem(app::images::database,
+                                   loc.Get(app::strings::sidebar_ctx_open_browse), open_object)
+                              .IconTint(resolved_icon_color),
+                          MenuItem(app::images::sql_console,
+                                   loc.Get(app::strings::sidebar_ctx_open_in_console),
                                    [app, workspace, session_id, redis_db_index,
                                     display_label] {
                                      (void)OpenSqlTab(app, workspace, session_id,
@@ -623,57 +690,76 @@ struct SidebarConnectionEntry {
                                                       "Redis · " + display_label,
                                                       "db" + redis_db_index);
                                    }),
-                          MenuItem(loc.Get(app::strings::sidebar_ctx_view_fields),
+                          MenuItem(app::images::info,
+                                   loc.Get(app::strings::sidebar_ctx_view_fields),
                                    open_schema_dialog),
                           MenuSection{},
-                          MenuItem(loc.Get(app::strings::sidebar_ctx_copy_name),
+                          MenuItem(app::images::copy, loc.Get(app::strings::sidebar_ctx_copy_name),
                                    [copy_text, display_label] {
                                      copy_text(display_label,
                                                app::strings::sidebar_copy_name_label);
                                    }),
                           MenuSection{},
-                          MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_dbs),
-                                   refresh_session),
+                          MenuItem(app::images::refresh,
+                                   loc.Get(app::strings::sidebar_ctx_refresh_dbs), refresh_session),
                       });
                       return;
                     }
                     std::vector<MenuEntry> entries;
                     entries.emplace_back(
-                        MenuItem(loc.Get(app::strings::sidebar_ctx_open_browse), open_object));
+                        MenuItem(obj_icon, loc.Get(app::strings::sidebar_ctx_open_browse),
+                                 open_object)
+                            .IconTint(resolved_icon_color));
                     entries.emplace_back(MenuItem(
-                        loc.Get(app::strings::sidebar_ctx_open_in_sql),
+                        app::images::sql_console, loc.Get(app::strings::sidebar_ctx_open_in_sql),
                         [app, workspace, session_id, open_in_sql, display_label] {
                           (void)OpenSqlTab(app, workspace, session_id, open_in_sql,
                                            "SQL · " + display_label);
                         }));
                     entries.emplace_back(MenuItem(
-                        loc.Get(app::strings::sidebar_ctx_view_schema), open_schema_dialog));
+                        app::images::info, loc.Get(app::strings::sidebar_ctx_view_schema),
+                        open_schema_dialog));
                     if (is_editable_table) {
                       entries.emplace_back(MenuItem(
-                          loc.Get(app::strings::sidebar_ctx_edit_table),
+                          app::images::edit, loc.Get(app::strings::sidebar_ctx_edit_table),
                           open_edit_table_dialog));
                     }
                     entries.emplace_back(MenuSection{});
                     entries.emplace_back(MenuItem(
-                        loc.Get(app::strings::sidebar_ctx_copy_name),
+                        app::images::copy, loc.Get(app::strings::sidebar_ctx_copy_name),
                         [copy_text, display_label] {
                           copy_text(display_label, app::strings::sidebar_copy_name_label);
                         }));
                     entries.emplace_back(MenuItem(
-                        loc.Get(app::strings::sidebar_ctx_copy_select),
+                        app::images::copy, loc.Get(app::strings::sidebar_ctx_copy_select),
                         [copy_text, select_sql] {
                           copy_text(select_sql, app::strings::sidebar_copy_select_label);
                         }));
+                    AppendTableIoMenuEntries(entries, picker, adbc, object, display_label,
+                                             session_ro, is_production, session_name, dialogs,
+                                             tasks, notify, loc, refresh_session, theme_config,
+                                             language_mode, system_dark);
                     entries.emplace_back(MenuSection{});
                     entries.emplace_back(MenuItem(
-                        loc.Get(app::strings::sidebar_ctx_refresh_objects), refresh_session));
-                    entries.emplace_back(MenuItem(
-                        loc.Fmt(app::strings::sidebar_ctx_drop_object, loc.Get(kind_res)),
-                        open_drop_dialog));
+                        app::images::refresh, loc.Get(app::strings::sidebar_ctx_refresh_objects),
+                        refresh_session));
+                    if (!session_ro) {
+                      entries.emplace_back(
+                          MenuItem(app::images::trash,
+                                   loc.Fmt(app::strings::sidebar_ctx_drop_object, loc.Get(kind_res)),
+                                   open_drop_dialog)
+                              .IconTint(danger));
+                    }
                     menu.ShowAt(position, std::move(entries));
                   })
               .Key("obj-" + key_prefix + "-" + object_schema + "-" + name + "-" +
                    std::to_string(idx)));
+
+      if (obj_expandable && obj_open) {
+        AppendTableSubtreeRows(tree_rows, session, object, obj_node_key, indent_level + 1,
+                               node_open_overrides, app, workspace, menu, clipboard, notify, loc,
+                               spec, semantic, copy_text);
+      }
     };
 
     const auto render_object_group =
@@ -717,15 +803,13 @@ struct SidebarConnectionEntry {
                       },
                       toggle_group)
                   .On<ViewEvents::ContextMenuRequested>(
-                      [menu, loc, group_open, toggle_group, refresh_session, app, workspace,
-                       session_id](Point position) {
+                      [menu, loc, refresh_session, app, workspace, session_id](Point position) {
                         menu.ShowAt(position, {
-                            MenuItem(loc.Get(group_open ? app::strings::sidebar_ctx_collapse_group
-                                                        : app::strings::sidebar_ctx_expand_group),
-                                     toggle_group),
-                            MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_objects),
+                            MenuItem(app::images::refresh,
+                                     loc.Get(app::strings::sidebar_ctx_refresh_objects),
                                      refresh_session),
-                            MenuItem(loc.Get(app::strings::nav_new_query),
+                            MenuItem(app::images::sql_console,
+                                     loc.Get(app::strings::nav_new_query),
                                      [app, workspace, session_id] {
                                        (void)OpenSqlTab(app, workspace, session_id);
                                      }),
@@ -734,6 +818,21 @@ struct SidebarConnectionEntry {
                   .Key("group-" + group_id));
 
           if (!group_open) {
+            return;
+          }
+
+          if (group.items.empty()) {
+            tree_rows.Add(TreeRow(TreeRowOptions{
+                                      .prefix = {},
+                                      .label = loc.Get(app::strings::sidebar_empty_items),
+                                      .trailing_text = {},
+                                      .indent_level = group_indent + 1,
+                                      .selected = false,
+                                      .emphasize = false,
+                                      .active_hint = false,
+                                      .muted = true,
+                                  })
+                              .Key("group-empty-" + group_id));
             return;
           }
 
@@ -782,19 +881,25 @@ struct SidebarConnectionEntry {
                     },
                     toggle_db)
                 .On<ViewEvents::ContextMenuRequested>(
-                    [menu, loc, db_open, toggle_db, refresh_session, app, workspace,
+                    [menu, loc, picker, adbc = session.session, db_name = db_bucket.name,
+                     read_only = session.read_only, is_production = session.production_mode,
+                     session_name = session.name, dialogs, tasks, notify, theme_config,
+                     language_mode, system_dark, refresh_session, app, workspace,
                      session_id](Point position) {
-                      menu.ShowAt(position, {
-                          MenuItem(loc.Get(db_open ? app::strings::sidebar_ctx_collapse_db
-                                                   : app::strings::sidebar_ctx_expand_db),
-                                   toggle_db),
-                          MenuItem(loc.Get(app::strings::sidebar_ctx_refresh_objects),
-                                   refresh_session),
-                          MenuItem(loc.Get(app::strings::nav_new_query),
-                                   [app, workspace, session_id] {
-                                     (void)OpenSqlTab(app, workspace, session_id);
-                                   }),
-                      });
+                      std::vector<MenuEntry> entries;
+                      entries.emplace_back(MenuItem(
+                          app::images::refresh,
+                          loc.Get(app::strings::sidebar_ctx_refresh_objects), refresh_session));
+                      entries.emplace_back(MenuItem(
+                          app::images::sql_console, loc.Get(app::strings::nav_new_query),
+                          [app, workspace, session_id] {
+                            (void)OpenSqlTab(app, workspace, session_id);
+                          }));
+                      AppendDatabaseIoMenuEntries(entries, picker, adbc, db_name, db_name,
+                                                  read_only, is_production, session_name, dialogs,
+                                                  tasks, notify, loc, refresh_session, theme_config,
+                                                  language_mode, system_dark);
+                      menu.ShowAt(position, std::move(entries));
                     })
                 .Key("db-" + db_key));
 
@@ -804,6 +909,10 @@ struct SidebarConnectionEntry {
         for (const SidebarObjectGroup& group : db_bucket.groups) {
           render_object_group(group, db_key + ":" + group.key, 2, true);
         }
+        AppendDatabaseExtraGroups(tree_rows, session, db_bucket, db_key, 2, node_open_overrides,
+                                  app, workspace, saved_queries, profiles_path, config_db, menu,
+                                  dialogs, clipboard, notify, loc, spec, semantic, theme_config,
+                                  language_mode, system_dark, copy_text);
       }
     } else {
       const std::vector<SidebarObjectGroup> groups = GroupSessionObjects(session);

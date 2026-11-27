@@ -1,6 +1,7 @@
 #include <huxerui/datatable.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -189,11 +190,14 @@ bool TableContext::Reveal(CellPosition position) const {
 
 void TableContext::Select(const DataTableCellId& id) const {
   const std::shared_ptr<EditSession> session = editing;
-  if (session && !session->suspended && session->id != id) {
-    editing = std::make_shared<EditSession>(EditSession{session->id, session->draft, true});
-  }
   active = id;
   static_cast<void>(focus.RequestFocus());
+  if (session && !session->suspended && session->id != id) {
+    const std::shared_ptr<EditSession>& current = editing;
+    if (current == session && !current->suspended) {
+      editing = std::make_shared<EditSession>(EditSession{session->id, session->draft, true});
+    }
+  }
   events.Emit<DataTableEvents::SelectionRequested>(id);
 }
 
@@ -494,8 +498,9 @@ View BodyCell(std::shared_ptr<const TableContext> table, CellPosition position,
       .With(Foreground(selected ? colors.on_primary_container : colors.on_surface))
       .OnClick([table, id = cell.id] { table->Select(id); });
   if (column.editor) {
-    cell_view = std::move(cell_view).With(MultiTapGesture{})
-        .On<MultiTapEvents::Recognized>([table, position](const MultiTapEvent&) { table->StartEditing(position); });
+    cell_view = std::move(cell_view)
+                    .With(MultiTapGesture{.maximum_interval = std::chrono::milliseconds(450)})
+                    .On<MultiTapEvents::Recognized>([table, position](const MultiTapEvent&) { table->StartEditing(position); });
   }
   return cell_view;
 }

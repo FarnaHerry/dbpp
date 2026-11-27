@@ -417,11 +417,19 @@ CellValue ExtractArrowCellImpl(const ArrowArrayView& view, std::int64_t row,
         return cell;
       }
       case NANOARROW_TYPE_TIMESTAMP: {
+        const std::int64_t ts_val = ArrowArrayViewGetIntUnsafe(&view, row);
         const std::string_view tz =
             schema_view.timezone != nullptr ? std::string_view(schema_view.timezone)
                                             : std::string_view{};
-        cell.text = detail::AdbcFormatTimestampTz(ArrowArrayViewGetIntUnsafe(&view, row),
-                                                  static_cast<int>(schema_view.time_unit), tz);
+        cell.text = detail::AdbcFormatTimestampTz(ts_val, static_cast<int>(schema_view.time_unit),
+                                                  tz);
+        if (!tz.empty() && !nested) {
+          const std::string local_text =
+              detail::AdbcFormatLocalTimestamp(ts_val, static_cast<int>(schema_view.time_unit));
+          if (!local_text.empty() && local_text != cell.text) {
+            cell.display_text = local_text;
+          }
+        }
         return cell;
       }
       case NANOARROW_TYPE_TIME32:
@@ -588,6 +596,9 @@ bool AdbcConsumeStreamRows(ArrowArrayStream& stream, std::size_t max_rows,
       out.rows.push_back(std::move(grid_row));
     }
   }
+  if (out.error.empty()) {
+    ApplyResultTimestampLocalization(out.columns, nullptr, out.rows);
+  }
   return out.error.empty();
 }
 
@@ -648,7 +659,8 @@ void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObjec
         }
       }
       for (std::size_t key_index = 0; key_index < hint_object->primary_key.size(); ++key_index) {
-        if (hint_object->primary_key[key_index] == column.name) {
+        if (hint_object->primary_key[key_index] == column.name ||
+            detail::AdbcEqualsIgnoreCase(hint_object->primary_key[key_index], column.name)) {
           column.primary_key = true;
           column.primary_key_order = static_cast<int>(key_index + 1);
           break;
@@ -657,6 +669,68 @@ void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObjec
     }
     out.push_back(std::move(column));
   }
+}
+
+std::string AdbcFormatArrowSqlLiteral(const ArrowArrayView& view, std::int64_t row,
+                                      const ArrowSchema* schema, Dialect dialect,
+                                      std::string_view declared_type) {
+  if (row < 0 || ArrowArrayViewIsNull(&view, row) != 0 ||
+      view.storage_type == NANOARROW_TYPE_NA) {
+    return "NULL";
+  }
+
+  if (view.storage_type == NANOARROW_TYPE_BINARY ||
+      view.storage_type == NANOARROW_TYPE_LARGE_BINARY ||
+      view.storage_type == NANOARROW_TYPE_FIXED_SIZE_BINARY ||
+      view.storage_type == NANOARROW_TYPE_BINARY_VIEW) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    const ArrowBufferView bytes = ArrowArrayViewGetBytesUnsafe(&view, row);
+    const auto* raw = reinterpret_cast<const std::uint8_t*>(bytes.data.data);
+    std::string out = dialect == Dialect::Postgresql ? "E'\\\\x" : "X'";
+    out.reserve(out.size() + static_cast<std::size_t>(bytes.size_bytes) * 2 + 1);
+    for (std::int64_t i = 0; i < bytes.size_bytes; ++i) {
+      out.push_back(kHex[(raw[i] >> 4) & 0x0FU]);
+      out.push_back(kHex[raw[i] & 0x0FU]);
+    }
+    out.push_back('\'');
+    return out;
+  }
+
+  const CellValue cell = ExtractArrowCellImpl(view, row, schema, 0, false);
+  if (cell.is_null) {
+    return "NULL";
+  }
+  std::string effective_type(declared_type);
+  if (effective_type.empty() || AdbcEqualsIgnoreCase(effective_type, "ANY")) {
+    switch (view.storage_type) {
+      case NANOARROW_TYPE_BOOL:
+        effective_type = "BOOLEAN";
+        break;
+      case NANOARROW_TYPE_INT8:
+      case NANOARROW_TYPE_UINT8:
+      case NANOARROW_TYPE_INT16:
+      case NANOARROW_TYPE_UINT16:
+      case NANOARROW_TYPE_INT32:
+      case NANOARROW_TYPE_UINT32:
+      case NANOARROW_TYPE_INT64:
+      case NANOARROW_TYPE_UINT64:
+        effective_type = "INTEGER";
+        break;
+      case NANOARROW_TYPE_HALF_FLOAT:
+      case NANOARROW_TYPE_FLOAT:
+      case NANOARROW_TYPE_DOUBLE:
+      case NANOARROW_TYPE_DECIMAL32:
+      case NANOARROW_TYPE_DECIMAL64:
+      case NANOARROW_TYPE_DECIMAL128:
+      case NANOARROW_TYPE_DECIMAL256:
+        effective_type = "DOUBLE";
+        break;
+      default:
+        effective_type = "TEXT";
+        break;
+    }
+  }
+  return SqlLiteral(dialect, cell.text, effective_type, false);
 }
 
 } // namespace detail

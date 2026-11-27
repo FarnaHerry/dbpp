@@ -214,12 +214,61 @@ bool EnsureConfigSqliteSync(const std::string& db_path) {
                "driver_path TEXT NOT NULL, "
                "uri TEXT NOT NULL, "
                "username TEXT NOT NULL DEFAULT '', "
-               "password TEXT NOT NULL DEFAULT ''"
+               "password TEXT NOT NULL DEFAULT '', "
+               "remark TEXT NOT NULL DEFAULT '', "
+               "read_only INTEGER NOT NULL DEFAULT 0, "
+               "production_mode INTEGER NOT NULL DEFAULT 0, "
+               "show_system_databases INTEGER NOT NULL DEFAULT 0"
                ");") ||
       !ExecSql(conn.db,
                "CREATE INDEX IF NOT EXISTS idx_connections_sort_order "
-               "ON connections (sort_order, id);")) {
+               "ON connections (sort_order, id);") ||
+      !ExecSql(conn.db,
+               "CREATE TABLE IF NOT EXISTS saved_queries ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "sort_order INTEGER NOT NULL DEFAULT 0, "
+               "connection_key TEXT NOT NULL DEFAULT '', "
+               "database_name TEXT NOT NULL DEFAULT '', "
+               "name TEXT NOT NULL DEFAULT '', "
+               "sql_text TEXT NOT NULL DEFAULT ''"
+               ");") ||
+      !ExecSql(conn.db,
+               "CREATE INDEX IF NOT EXISTS idx_saved_queries_sort_order "
+               "ON saved_queries (sort_order, id);")) {
     return false;
+  }
+
+  {
+    bool has_remark = false;
+    bool has_read_only = false;
+    bool has_prod = false;
+    bool has_show_sys = false;
+    StmtGuard cols_stmt;
+    if (sqlite3_prepare_v2(conn.db, "PRAGMA table_info(connections);", -1, &cols_stmt.stmt,
+                           nullptr) == SQLITE_OK) {
+      while (sqlite3_step(cols_stmt.stmt) == SQLITE_ROW) {
+        const unsigned char* ptr = sqlite3_column_text(cols_stmt.stmt, 1);
+        const std::string_view col_name =
+            ptr ? std::string_view(reinterpret_cast<const char*>(ptr)) : std::string_view{};
+        if (col_name == "remark") has_remark = true;
+        if (col_name == "read_only") has_read_only = true;
+        if (col_name == "production_mode") has_prod = true;
+        if (col_name == "show_system_databases") has_show_sys = true;
+      }
+    }
+    if ((!has_remark &&
+         !ExecSql(conn.db, "ALTER TABLE connections ADD COLUMN remark TEXT NOT NULL DEFAULT '';")) ||
+        (!has_read_only &&
+         !ExecSql(conn.db,
+                  "ALTER TABLE connections ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0;")) ||
+        (!has_prod &&
+         !ExecSql(conn.db,
+                  "ALTER TABLE connections ADD COLUMN production_mode INTEGER NOT NULL DEFAULT 0;")) ||
+        (!has_show_sys &&
+         !ExecSql(conn.db,
+                  "ALTER TABLE connections ADD COLUMN show_system_databases INTEGER NOT NULL DEFAULT 0;"))) {
+      return false;
+    }
   }
 
   {
@@ -232,7 +281,7 @@ bool EnsureConfigSqliteSync(const std::string& db_path) {
     if (sqlite3_step(version_stmt.stmt) == SQLITE_ROW) {
       version = sqlite3_column_int(version_stmt.stmt, 0);
     }
-    if (version == 0 && !ExecSql(conn.db, "PRAGMA user_version = 1;")) {
+    if (version < 2 && !ExecSql(conn.db, "PRAGMA user_version = 2;")) {
       return false;
     }
   }

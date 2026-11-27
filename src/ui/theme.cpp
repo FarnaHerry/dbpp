@@ -395,30 +395,45 @@ huxerui::Color ConfigureActionButtonStyle(ButtonStyle& style, ButtonTone tone,
   constexpr float kChevronSlot = 12.0F;
   const float left_padding =
       kBaseLeftPadding + static_cast<float>(std::max(0, options.indent_level)) * kIndentStep;
+  const bool split_chevron_click =
+      options.expanded.has_value() && static_cast<bool>(options.on_toggle_expand);
 
-  Views main_children;
+  View chevron_view;
   if (options.expanded.has_value()) {
     const Color p_color = options.selected
                               ? spec.colors.primary
                               : options.prefix_color.value_or(secondary);
-    main_children.Add(
+    chevron_view =
         TintedIcon(*options.expanded ? app::images::chevron_down : app::images::chevron_right,
-                   p_color, kChevronSlot));
+                   p_color, kChevronSlot);
+    if (split_chevron_click) {
+      chevron_view =
+          Row{std::move(chevron_view)}
+              .With(Padding{EdgeInsets{.top = 3.0F, .right = 2.0F, .bottom = 3.0F,
+                                       .left = left_padding}},
+                    CrossAlign{CrossAxisAlignment::Center})
+              .OnClick(std::move(options.on_toggle_expand));
+    }
   } else if (!options.prefix.empty()) {
     const Color p_color = options.selected
                               ? spec.colors.primary
                               : options.prefix_color.value_or(secondary);
-    main_children.Add(Text(options.prefix)
-                          .Style(TextStyle{Font::System(font_size::kCaption), p_color})
-                          .Align(TextAlign::Center)
-                          .LineLimit(1)
-                          .With(Frame{.width = kChevronSlot, .min_width = kChevronSlot,
-                                      .max_width = kChevronSlot}));
+    chevron_view = Text(options.prefix)
+                       .Style(TextStyle{Font::System(font_size::kCaption), p_color})
+                       .Align(TextAlign::Center)
+                       .LineLimit(1)
+                       .With(Frame{.width = kChevronSlot, .min_width = kChevronSlot,
+                                   .max_width = kChevronSlot});
   } else {
-    main_children.Add(Spacer().With(
+    chevron_view = Spacer().With(
         Grow(0.0F),
         Frame{.width = kChevronSlot, .height = kChevronSlot, .min_width = kChevronSlot,
-              .max_width = kChevronSlot, .min_height = kChevronSlot, .max_height = kChevronSlot}));
+              .max_width = kChevronSlot, .min_height = kChevronSlot, .max_height = kChevronSlot});
+  }
+
+  Views main_children;
+  if (!split_chevron_click) {
+    main_children.Add(std::move(chevron_view));
   }
   const bool has_leading_icon = static_cast<bool>(options.leading_icon);
   if (options.leading_icon) {
@@ -438,6 +453,10 @@ huxerui::Color ConfigureActionButtonStyle(ButtonStyle& style, ButtonTone tone,
                         .Overflow(TextOverflow::Ellipsis)
                         .With(Grow(1.0F)));
 
+  if (options.badge) {
+    main_children.Add(std::move(options.badge));
+  }
+
   if (has_leading_icon && options.status_dot.has_value()) {
     main_children.Add(AccentDot(*options.status_dot, 6.0F));
   }
@@ -455,13 +474,16 @@ huxerui::Color ConfigureActionButtonStyle(ButtonStyle& style, ButtonTone tone,
                 Padding{EdgeInsets{.top = 3.0F,
                                    .right = has_trailing_action ? 2.0F : 6.0F,
                                    .bottom = 3.0F,
-                                   .left = left_padding}},
+                                   .left = split_chevron_click ? 2.0F : left_padding}},
                 Spacing{4.0F}, CrossAlign{CrossAxisAlignment::Center});
   if (on_click) {
     main_area = std::move(main_area).OnClick(std::move(on_click));
   }
 
   Views outer_children;
+  if (split_chevron_click) {
+    outer_children.Add(std::move(chevron_view));
+  }
   outer_children.Add(std::move(main_area));
   if (has_trailing_action) {
     outer_children.Add(options.trailing_action);

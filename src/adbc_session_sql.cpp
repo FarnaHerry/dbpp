@@ -92,7 +92,9 @@ bool IsSystemDatabaseOrSchema(std::string_view name) {
   }
   return lower == "information_schema" || lower == "performance_schema" || lower == "mysql" ||
          lower == "sys" || lower == "pg_catalog" || lower == "pg_toast" ||
-         lower == "sqlite_temp_master" || lower.starts_with("pg_temp_") ||
+         lower == "sqlite_temp_master" || lower == "temp" || lower == "template0" ||
+         lower == "template1" || lower == "msdb" || lower == "model" || lower == "tempdb" ||
+         lower == "system" || lower.starts_with("pg_temp_") ||
          lower.starts_with("pg_toast_temp_");
 }
 
@@ -316,6 +318,169 @@ bool IsReadStatement(Dialect dialect, std::string_view text) {
     return IsRedisReadCommand(text);
   }
   return IsSqlReadStatement(text);
+}
+
+std::string ReadOnlyWriteBlockedMessage() {
+  return std::string(Tr("Write operation blocked: connection is in read-only mode",
+                        "只读模式下已拦截写入操作"));
+}
+
+bool IsSqlPureReadQuery(std::string_view sql) {
+  struct Scanner {
+    std::string_view s;
+    std::size_t i = 0;
+
+    void SkipTrivia() {
+      while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (std::isspace(c) != 0) {
+          ++i;
+          continue;
+        }
+        if (c == '-' && i + 1 < s.size() && s[i + 1] == '-') {
+          i += 2;
+          while (i < s.size() && s[i] != '\n') ++i;
+          continue;
+        }
+        if (c == '/' && i + 1 < s.size() && s[i + 1] == '*') {
+          i += 2;
+          while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) ++i;
+          i = (i + 1 < s.size()) ? (i + 2) : s.size();
+          continue;
+        }
+        break;
+      }
+    }
+
+    static bool IsSingleReadKeyword(std::string_view kw) {
+      return kw == "select" || kw == "show" || kw == "describe" || kw == "desc" ||
+             kw == "explain" || kw == "values" || kw == "table" || kw == "with" ||
+             kw == "pragma";
+    }
+
+    static bool IsWriteKeyword(std::string_view kw) {
+      return kw == "insert" || kw == "update" || kw == "delete" || kw == "replace" ||
+             kw == "merge" || kw == "create" || kw == "drop" || kw == "alter" ||
+             kw == "truncate" || kw == "attach" || kw == "detach" || kw == "vacuum" ||
+             kw == "reindex" || kw == "rename" || kw == "grant" || kw == "revoke" ||
+             kw == "call" || kw == "exec" || kw == "execute" || kw == "copy" ||
+             kw == "load" || kw == "import" || kw == "begin" || kw == "commit" ||
+             kw == "rollback" || kw == "savepoint" || kw == "release" || kw == "set" ||
+             kw == "use";
+    }
+  };
+
+  Scanner sc{sql, 0};
+  sc.SkipTrivia();
+  if (sc.i >= sql.size()) {
+    return false;
+  }
+
+  // Validate every semicolon-delimited statement at depth 0.
+  while (sc.i < sql.size()) {
+    sc.SkipTrivia();
+    if (sc.i >= sql.size()) {
+      break;
+    }
+    if (sql[sc.i] == ';') {
+      ++sc.i;
+      continue;
+    }
+
+    std::size_t stmt_start = sc.i;
+    int depth = 0;
+    bool first_word_seen = false;
+    std::string first_keyword;
+    bool saw_write = false;
+    bool saw_pragma_eq = false;
+    bool saw_select_into = false;
+
+    while (sc.i < sql.size()) {
+      sc.SkipTrivia();
+      if (sc.i >= sql.size()) {
+        break;
+      }
+      const char ch = sql[sc.i];
+      if (depth == 0 && ch == ';') {
+        ++sc.i;
+        break;
+      }
+      if (ch == '\'' || ch == '"' || ch == '`') {
+        const char q = ch;
+        ++sc.i;
+        while (sc.i < sql.size()) {
+          if (sql[sc.i] == '\\' && q == '\'' && sc.i + 1 < sql.size()) {
+            sc.i += 2;
+            continue;
+          }
+          if (sql[sc.i] == q) {
+            if (sc.i + 1 < sql.size() && sql[sc.i + 1] == q) {
+              sc.i += 2;
+              continue;
+            }
+            ++sc.i;
+            break;
+          }
+          ++sc.i;
+        }
+        continue;
+      }
+      if (ch == '(') {
+        ++depth;
+        ++sc.i;
+        continue;
+      }
+      if (ch == ')') {
+        depth = std::max(0, depth - 1);
+        ++sc.i;
+        continue;
+      }
+      if (ch == '=' && depth == 0 && first_keyword == "pragma") {
+        saw_pragma_eq = true;
+      }
+      const unsigned char uch = static_cast<unsigned char>(ch);
+      if (std::isalpha(uch) != 0 || ch == '_') {
+        const std::size_t wstart = sc.i;
+        while (sc.i < sql.size()) {
+          const unsigned char wc = static_cast<unsigned char>(sql[sc.i]);
+          if (std::isalnum(wc) == 0 && sql[sc.i] != '_') {
+            break;
+          }
+          ++sc.i;
+        }
+        if (depth == 0) {
+          const std::string word = detail::AdbcLowerAscii(sql.substr(wstart, sc.i - wstart));
+          if (!first_word_seen) {
+            first_word_seen = true;
+            first_keyword = word;
+          } else {
+            if (Scanner::IsWriteKeyword(word)) {
+              saw_write = true;
+            }
+            if (first_keyword == "select" && word == "into") {
+              saw_select_into = true;
+            }
+          }
+        }
+        continue;
+      }
+      ++sc.i;
+    }
+
+    (void)stmt_start;
+    if (!first_word_seen || !Scanner::IsSingleReadKeyword(first_keyword) || saw_write ||
+        saw_select_into || (first_keyword == "pragma" && saw_pragma_eq)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsPureReadQuery(Dialect dialect, std::string_view text) {
+  if (dialect == Dialect::Redis) {
+    return IsRedisReadCommand(text);
+  }
+  return IsSqlPureReadQuery(text);
 }
 
 std::string InferDriverForUri(std::string_view uri) {

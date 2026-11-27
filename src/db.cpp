@@ -198,7 +198,7 @@ void SyncAppFromActiveTab(AppModel& model, const WorkspaceModel& ws) {
     return;
   }
   model.active_session = active->session_id;
-  if (active->kind == WorkspaceTabKind::Table) {
+  if (active->kind == WorkspaceTabKind::Table || active->kind == WorkspaceTabKind::TableDesign) {
     model.active_object = active->object_name;
     model.active_is_view = active->is_view;
   } else {
@@ -288,15 +288,18 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     return model;
   }
   if (session.dialect == Dialect::Redis && session.redis) {
-    return LoadRedisTableBlocking(*session.redis, session_id, object, page, page_size,
-                                  std::move(sort), TrimAsciiCopy(filter));
+    TableModel redis_model = LoadRedisTableBlocking(*session.redis, session_id, object, page,
+                                                    page_size, std::move(sort),
+                                                    TrimAsciiCopy(filter));
+    redis_model.read_only = session.read_only;
+    return redis_model;
   }
   TableModel model;
   model.session_id = session_id;
   model.object = object.name;
   model.qualified_name = QualifiedName(session.dialect, object);
   model.is_view = object.is_view;
-  model.read_only = false;
+  model.read_only = session.read_only;
   model.page = std::max<std::int64_t>(0, page);
   model.page_size = std::max<std::int64_t>(1, page_size);
   model.sort = std::move(sort);
@@ -336,10 +339,53 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     return model.columns[left].primary_key_order < model.columns[right].primary_key_order;
   });
 
-  if (session.dialect == Dialect::Sqlite && !object.is_view && model.key_columns.empty()) {
-    const AdbcQueryResult probe = ExecuteBlocking(
-        session, "SELECT rowid FROM " + model.qualified_name + " LIMIT 0", true, 0);
-    model.uses_rowid = probe.error.empty();
+  if (session.dialect == Dialect::Sqlite && !object.is_view) {
+    const std::string pragma_target =
+        object.db_schema.empty()
+            ? ("PRAGMA table_info(" + QuoteIdentifier(Dialect::Sqlite, object.name) + ")")
+            : ("PRAGMA " + QuoteIdentifier(Dialect::Sqlite, object.db_schema) + ".table_info(" +
+               QuoteIdentifier(Dialect::Sqlite, object.name) + ")");
+    const AdbcQueryResult info = ExecuteBlocking(session, pragma_target, true, 0);
+    if (info.error.empty()) {
+      std::vector<std::pair<int, std::size_t>> pk_hits;
+      for (const GridRow& r : info.rows) {
+        if (r.values.size() >= 6) {
+          const std::string& col_name = r.values[1].text;
+          const std::string& col_type = r.values[2].text;
+          const int notnull_flag = static_cast<int>(ParseInt64(r.values[3].text));
+          const int pk_ord = static_cast<int>(ParseInt64(r.values[5].text));
+          for (std::size_t ci = 0; ci < model.columns.size(); ++ci) {
+            if (EqualsIgnoreCaseAscii(model.columns[ci].name, col_name)) {
+              if (!col_type.empty() &&
+                  (model.columns[ci].type.empty() || model.columns[ci].type == "ANY")) {
+                model.columns[ci].type = col_type;
+              }
+              if (notnull_flag != 0) {
+                model.columns[ci].nullable = false;
+              }
+              if (pk_ord > 0) {
+                model.columns[ci].primary_key = true;
+                model.columns[ci].primary_key_order = pk_ord;
+                pk_hits.emplace_back(pk_ord, ci);
+              }
+              break;
+            }
+          }
+        }
+      }
+      if (model.key_columns.empty() && !pk_hits.empty()) {
+        std::ranges::sort(pk_hits);
+        for (const auto& [ord, ci] : pk_hits) {
+          (void)ord;
+          model.key_columns.push_back(ci);
+        }
+      }
+    }
+    if (model.key_columns.empty()) {
+      const AdbcQueryResult probe = ExecuteBlocking(
+          session, "SELECT rowid FROM " + model.qualified_name + " LIMIT 0", true, 0);
+      model.uses_rowid = probe.error.empty();
+    }
   }
   model.editable = !object.is_view && (model.uses_rowid || !model.key_columns.empty());
 
@@ -430,6 +476,13 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     rows.push_back(std::move(row));
   }
 
+  std::vector<std::string> col_names;
+  col_names.reserve(model.columns.size());
+  for (const ColumnMeta& col : model.columns) {
+    col_names.push_back(col.name);
+  }
+  ApplyResultTimestampLocalization(col_names, &model.columns, rows);
+
   model.snapshot = std::make_shared<const GridSnapshot>(GridSnapshot{.rows = std::move(rows)});
   if (!data.error.empty()) {
     model.error = data.error;
@@ -441,217 +494,6 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
 
 
 namespace {
-
-std::string SqlPlaceholder(Dialect dialect, std::size_t one_based_index) {
-  if (dialect == Dialect::Postgresql) {
-    return "$" + std::to_string(one_based_index);
-  }
-  return "?";
-}
-
-bool BuildParameterizedWhere(Dialect dialect, const TableModel& model, const GridRow& row,
-                             std::string& where_out, std::vector<PreparedParamValue>& params_out,
-                             std::vector<std::string>& types_out, std::size_t& next_param_idx) {
-  where_out.clear();
-  if (model.uses_rowid && row.rowid.has_value()) {
-    where_out = "rowid = " + SqlPlaceholder(dialect, next_param_idx++);
-    params_out.push_back(PreparedParamValue{.text = std::to_string(*row.rowid), .is_null = false});
-    types_out.emplace_back("INTEGER");
-    return true;
-  }
-  for (std::size_t key_index = 0; key_index < model.key_columns.size(); ++key_index) {
-    const std::size_t column_index = model.key_columns[key_index];
-    if (column_index >= model.columns.size() || key_index >= row.key_values.size()) {
-      return false;
-    }
-    if (!where_out.empty()) {
-      where_out += " AND ";
-    }
-    const ColumnMeta& column = model.columns[column_index];
-    const CellValue& key = row.key_values[key_index];
-    where_out += QuoteIdentifier(dialect, column.name);
-    if (key.is_null) {
-      where_out += " IS NULL";
-    } else {
-      where_out += " = " + SqlPlaceholder(dialect, next_param_idx++);
-      params_out.push_back(PreparedParamValue{.text = key.text, .is_null = false});
-      types_out.push_back(column.type);
-    }
-  }
-  return !where_out.empty();
-}
-
-AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model,
-                                   std::size_t row_index, std::size_t column_index,
-                                   const std::string& text) {
-  if (session.dialect == Dialect::Redis && session.redis) {
-    return UpdateRedisCellBlocking(*session.redis, model, row_index, column_index, text);
-  }
-  AdbcQueryResult result;
-  if (!model.snapshot || row_index >= model.snapshot->rows.size() ||
-      column_index >= model.columns.size()) {
-    result.error = Tr("Target row or column is invalid", "目标行或列已失效");
-    return result;
-  }
-  if (!model.editable) {
-    result.error = Tr("Current object is not editable", "当前对象不允许编辑");
-    return result;
-  }
-  const GridRow& row = model.snapshot->rows[row_index];
-  const ColumnMeta& column = model.columns[column_index];
-  const bool is_null = text.empty() || EqualsIgnoreCaseAscii(text, "NULL");
-
-  std::size_t next_idx = 1;
-  std::vector<PreparedParamValue> params;
-  std::vector<std::string> param_types;
-  const std::string set_placeholder = SqlPlaceholder(session.dialect, next_idx++);
-  params.push_back(PreparedParamValue{.text = is_null ? std::string{} : text, .is_null = is_null});
-  param_types.push_back(column.type);
-
-  std::string param_where;
-  if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
-                              next_idx)) {
-    const std::string param_sql = "UPDATE " + model.qualified_name + " SET " +
-                                  QuoteIdentifier(session.dialect, column.name) + " = " +
-                                  set_placeholder + " WHERE " + param_where;
-    int prep_status = 0;
-    AdbcQueryResult prep_res;
-    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
-      return prep_res;
-    }
-    if (!prep_res.error.empty() && prep_status != 2 /* ADBC_STATUS_NOT_IMPLEMENTED */) {
-      // Fall through only when driver does not implement prepared bind; report real errors directly
-      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-        prep_res.connection_lost = true;
-      }
-      return prep_res;
-    }
-  }
-
-  const std::string where = BuildWhere(session.dialect, model, row);
-  if (where.empty()) {
-    result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
-    return result;
-  }
-  const std::string value = SqlLiteral(session.dialect, text, column.type, is_null);
-  const std::string sql = "UPDATE " + model.qualified_name + " SET " +
-                          QuoteIdentifier(session.dialect, column.name) + " = " + value +
-                          " WHERE " + where;
-  return ExecuteBlocking(session, sql, false, 0);
-}
-
-AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
-                                  std::size_t row_index) {
-  if (session.dialect == Dialect::Redis && session.redis) {
-    return DeleteRedisKeyBlocking(*session.redis, model, row_index);
-  }
-  AdbcQueryResult result;
-  if (!model.snapshot || row_index >= model.snapshot->rows.size()) {
-    result.error = Tr("Target row is invalid", "目标行已失效");
-    return result;
-  }
-  if (!model.editable) {
-    result.error = Tr("Current object does not allow deleting rows", "当前对象不允许删除行");
-    return result;
-  }
-  const GridRow& row = model.snapshot->rows[row_index];
-
-  std::size_t next_idx = 1;
-  std::vector<PreparedParamValue> params;
-  std::vector<std::string> param_types;
-  std::string param_where;
-  if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
-                              next_idx)) {
-    const std::string param_sql = "DELETE FROM " + model.qualified_name + " WHERE " + param_where;
-    int prep_status = 0;
-    AdbcQueryResult prep_res;
-    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
-      return prep_res;
-    }
-    if (!prep_res.error.empty() && prep_status != 2 /* ADBC_STATUS_NOT_IMPLEMENTED */) {
-      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-        prep_res.connection_lost = true;
-      }
-      return prep_res;
-    }
-  }
-
-  const std::string where = BuildWhere(session.dialect, model, row);
-  if (where.empty()) {
-    result.error = Tr("Table has no usable row identifier", "该表没有可用的行标识");
-    return result;
-  }
-  return ExecuteBlocking(session,
-                         "DELETE FROM " + model.qualified_name + " WHERE " + where, false,
-                         0);
-}
-
-AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
-                                  std::vector<std::string> values) {
-  AdbcQueryResult result;
-  if (!model.editable) {
-    result.error = Tr("Current object does not allow inserting rows", "当前对象不允许插入行");
-    return result;
-  }
-  if (values.size() < model.columns.size()) {
-    values.resize(model.columns.size());
-  }
-
-  std::string columns;
-  std::string param_placeholders;
-  std::string literal_placeholders;
-  std::vector<PreparedParamValue> params;
-  std::vector<std::string> param_types;
-  std::size_t next_idx = 1;
-  for (std::size_t index = 0; index < model.columns.size() && index < values.size();
-       ++index) {
-    if (values[index].empty()) {
-      continue;
-    }
-    if (!columns.empty()) {
-      columns += ", ";
-      param_placeholders += ", ";
-      literal_placeholders += ", ";
-    }
-    columns += QuoteIdentifier(session.dialect, model.columns[index].name);
-    const bool is_null = EqualsIgnoreCaseAscii(values[index], "NULL");
-    param_placeholders += SqlPlaceholder(session.dialect, next_idx++);
-    params.push_back(PreparedParamValue{
-        .text = is_null ? std::string{} : values[index],
-        .is_null = is_null,
-    });
-    param_types.push_back(model.columns[index].type);
-    literal_placeholders += SqlLiteral(session.dialect, values[index], model.columns[index].type,
-                                       is_null);
-  }
-
-  if (!columns.empty()) {
-    const std::string param_sql = "INSERT INTO " + model.qualified_name + " (" + columns +
-                                  ") VALUES (" + param_placeholders + ")";
-    int prep_status = 0;
-    AdbcQueryResult prep_res;
-    if (ExecutePreparedNonQuery(session, param_sql, params, param_types, prep_res, prep_status)) {
-      return prep_res;
-    }
-    if (!prep_res.error.empty() && prep_status != 2 /* ADBC_STATUS_NOT_IMPLEMENTED */) {
-      if (IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
-        prep_res.connection_lost = true;
-      }
-      return prep_res;
-    }
-  }
-
-  std::string sql;
-  if (columns.empty()) {
-    sql = session.dialect == Dialect::Mysql
-              ? "INSERT INTO " + model.qualified_name + " () VALUES ()"
-              : "INSERT INTO " + model.qualified_name + " DEFAULT VALUES";
-  } else {
-    sql = "INSERT INTO " + model.qualified_name + " (" + columns + ") VALUES (" +
-          literal_placeholders + ")";
-  }
-  return ExecuteBlocking(session, sql, false, 0);
-}
 
 void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                         const TaskScope& tasks, AdbcOpenResult opened,
@@ -678,14 +520,22 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
   session->name = request.title.empty()
                       ? DisplayNameFromUri(request.uri, "ADBC")
                       : request.title;
-  session->uri = request.uri;
+  session->uri = opened.session->request.uri.empty() ? request.uri : opened.session->request.uri;
   session->driver_path = request.driver_path;
+  session->remark = !opened.session->remark.empty() ? opened.session->remark : request.remark;
   session->dialect = opened.session->dialect;
   session->sqlite = opened.session->dialect == Dialect::Sqlite;
   session->read_only = opened.session->read_only;
+  session->production_mode = opened.session->production_mode || request.production_mode;
+  session->show_system_databases =
+      opened.session->show_system_databases || request.show_system_databases;
   session->connection_info = opened.session->connection_info;
   session->session = std::move(opened.session);
   session->objects = std::move(objects.objects);
+  session->databases = std::move(objects.databases);
+  session->triggers = std::move(objects.triggers);
+  session->routines = std::move(objects.routines);
+  session->events = std::move(objects.events);
 
   bool duplicated = false;
   bool reconnected = false;
@@ -729,8 +579,16 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
           stale_or_redundant = std::move(existing.session);
           existing.name = session->name;
           existing.driver_path = session->driver_path;
+          existing.remark = session->remark;
+          existing.read_only = session->read_only;
+          existing.production_mode = session->production_mode;
+          existing.show_system_databases = session->show_system_databases;
           existing.session = session->session;
           existing.objects = std::move(session->objects);
+          existing.databases = std::move(session->databases);
+          existing.triggers = std::move(session->triggers);
+          existing.routines = std::move(session->routines);
+          existing.events = std::move(session->events);
           ++model.revision;
           reconnected = true;
           pick_first_object(existing, first_object, first_schema, first_is_view);
@@ -840,84 +698,6 @@ void ApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>&
 
 } // namespace
 
-BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
-                                     const std::vector<PendingInsertRow>& rows) {
-  if (session.IsClosed()) {
-    return BatchInsertResult{.inserted = 0,
-                             .rolled_back = true,
-                             .connection_lost = true,
-                             .error = std::string(Tr("Connection is closed", "连接已关闭"))};
-  }
-  if (session.dialect == Dialect::Redis && session.redis) {
-    return InsertRedisRowsBlocking(*session.redis, model, rows);
-  }
-  if (rows.empty()) {
-    return {};
-  }
-  if (rows.size() == 1) {
-    AdbcQueryResult result = InsertRowBlocking(session, model, rows[0].values);
-    if (!result.error.empty()) {
-      return BatchInsertResult{.inserted = 0,
-                               .rolled_back = true,
-                               .connection_lost = result.connection_lost,
-                               .error = result.error};
-    }
-    return BatchInsertResult{.inserted = 1, .rolled_back = false, .error = {}};
-  }
-
-  const bool supports_tx = session.dialect == Dialect::Sqlite ||
-                           session.dialect == Dialect::Postgresql ||
-                           session.dialect == Dialect::Mysql ||
-                           session.dialect == Dialect::Duckdb;
-  bool managed_tx = false;
-  if (supports_tx && !session.in_transaction) {
-    std::string tx_err;
-    if (SetAutocommitBlocking(session, false, tx_err)) {
-      managed_tx = true;
-    }
-  }
-
-  for (std::size_t i = 0; i < rows.size(); ++i) {
-    AdbcQueryResult result = InsertRowBlocking(session, model, rows[i].values);
-    if (!result.error.empty()) {
-      const std::string msg = TrFmt("Row {0} insert failed: {1}", "第 {0} 行插入失败: {1}",
-                                    {std::to_string(i + 1), result.error});
-      if (managed_tx && !result.connection_lost) {
-        std::string rb_err;
-        (void)RollbackTransactionBlocking(session, rb_err);
-        (void)SetAutocommitBlocking(session, true, rb_err);
-        return BatchInsertResult{.inserted = 0,
-                                 .rolled_back = true,
-                                 .connection_lost = false,
-                                 .error = msg};
-      }
-      return BatchInsertResult{.inserted = result.connection_lost && managed_tx ? 0 : i,
-                               .rolled_back = result.connection_lost && managed_tx,
-                               .connection_lost = result.connection_lost,
-                               .error = msg};
-    }
-  }
-
-  if (managed_tx) {
-    std::string commit_err;
-    if (!CommitTransactionBlocking(session, commit_err)) {
-      std::string rb_err;
-      (void)RollbackTransactionBlocking(session, rb_err);
-      (void)SetAutocommitBlocking(session, true, rb_err);
-      return BatchInsertResult{
-          .inserted = 0,
-          .rolled_back = true,
-          .connection_lost = IsConnectionLostError(0, commit_err),
-          .error = TrFmt("Failed to commit transaction: {0}", "提交事务失败: {0}",
-                         {commit_err})};
-    }
-    std::string ac_err;
-    (void)SetAutocommitBlocking(session, true, ac_err);
-  }
-
-  return BatchInsertResult{.inserted = rows.size(), .rolled_back = false, .error = {}};
-}
-
 namespace detail {
 
 std::string DbTrimAscii(std::string_view text) { return TrimAsciiCopy(text); }
@@ -954,14 +734,8 @@ bool DbEqualsIgnoreCaseAscii(std::string_view left, std::string_view right) {
 void DbCloseSessionAsync(std::shared_ptr<AdbcSession> adbc, const TaskScope& tasks) {
   CloseSessionAsync(std::move(adbc), tasks);
 }
-AdbcQueryResult DbUpdateCellBlocking(AdbcSession& session, const TableModel& model,
-                                     std::size_t row_index, std::size_t column_index,
-                                     const std::string& text) {
-  return UpdateCellBlocking(session, model, row_index, column_index, text);
-}
-AdbcQueryResult DbDeleteRowBlocking(AdbcSession& session, const TableModel& model,
-                                    std::size_t row_index) {
-  return DeleteRowBlocking(session, model, row_index);
+std::string DbBuildWhere(Dialect dialect, const TableModel& model, const GridRow& row) {
+  return BuildWhere(dialect, model, row);
 }
 void DbApplyOpenedSession(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                           const TaskScope& tasks, AdbcOpenResult opened,

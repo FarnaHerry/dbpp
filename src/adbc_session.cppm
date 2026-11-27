@@ -1,6 +1,7 @@
 module;
 
 #include <arrow-adbc/adbc.h>
+#include <nanoarrow/nanoarrow.h>
 #include <huxerui/datatable.h>
 #include <huxerui/task.h>
 
@@ -40,7 +41,10 @@ struct AdbcSession {
   ConnectionRequest request;
   Dialect dialect = Dialect::Generic;
   AdbcConnectionInfo connection_info;
+  std::string remark;
   bool read_only = false;
+  bool production_mode = false;
+  bool show_system_databases = false;
   bool autocommit = true;
   bool in_transaction = false;
   bool database_created = false;
@@ -103,6 +107,9 @@ struct AdbcOpenResult {
                                                   std::string_view new_type, bool nullable);
 [[nodiscard]] bool IsSqlReadStatement(std::string_view sql);
 [[nodiscard]] bool IsReadStatement(Dialect dialect, std::string_view text);
+[[nodiscard]] bool IsSqlPureReadQuery(std::string_view sql);
+[[nodiscard]] bool IsPureReadQuery(Dialect dialect, std::string_view text);
+[[nodiscard]] std::string ReadOnlyWriteBlockedMessage();
 [[nodiscard]] std::string InferDriverForUri(std::string_view uri);
 [[nodiscard]] DatabaseBrand DetectDatabaseBrand(std::string_view driver_or_id,
                                                 std::string_view uri = {},
@@ -137,6 +144,7 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session);
 AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object);
 AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want_rows,
                                 std::size_t max_rows);
+AdbcQueryResult ExecuteSwitchDatabaseSqlBlocking(AdbcSession& session, std::string sql);
 
 AdbcConnectionInfo LoadConnectionInfoBlocking(AdbcSession& session);
 std::vector<std::string> LoadTableTypesBlocking(AdbcSession& session, std::string& error_out);
@@ -197,6 +205,68 @@ BulkIngestResult CopyQueryToTableBlocking(AdbcSession& source, std::string sourc
                                           IngestMode mode,
                                           std::string_view target_catalog = {},
                                           std::string_view target_schema = {});
+
+struct SqlDumpOptions {
+  std::string target_database;
+  std::optional<DbObject> single_object;
+  bool include_schema = true;
+  bool include_data = true;
+};
+
+struct SqlDumpResult {
+  std::size_t tables_exported = 0;
+  std::size_t rows_written = 0;
+  bool connection_lost = false;
+  std::string error;
+};
+
+struct SqlScriptImportResult {
+  std::size_t statements_executed = 0;
+  std::int64_t rows_affected = -1;
+  bool connection_lost = false;
+  std::string error;
+};
+
+struct TableDesignSnapshot {
+  DbObject object;
+  std::vector<TriggerMeta> triggers;
+  std::string ddl;
+  bool connection_lost = false;
+  std::string error;
+};
+
+[[nodiscard]] std::vector<std::string> SplitSqlStatements(std::string_view script,
+                                                          Dialect dialect);
+[[nodiscard]] std::string FormatSqlStatement(std::string_view sql,
+                                             Dialect dialect = Dialect::Generic);
+[[nodiscard]] std::string FormatSqlScript(std::string_view script,
+                                          Dialect dialect = Dialect::Generic);
+[[nodiscard]] std::string MakeTempSqlExportPath();
+TableDesignSnapshot LoadTableDesignBlocking(AdbcSession& session, const DbObject& object);
+SqlDumpResult ExportDatabaseSqlToFileBlocking(AdbcSession& session,
+                                              const SqlDumpOptions& options,
+                                              const std::filesystem::path& path);
+SqlDumpResult ExportDatabaseSqlToFilePathBlocking(AdbcSession& session,
+                                                  const SqlDumpOptions& options,
+                                                  std::string_view path);
+SqlScriptImportResult ImportSqlScriptFileBlocking(AdbcSession& session,
+                                                  const std::filesystem::path& path,
+                                                  std::string_view target_database = {});
+SqlScriptImportResult ImportSqlScriptPathBlocking(AdbcSession& session,
+                                                  std::string_view path,
+                                                  std::string_view target_database = {});
+
+[[nodiscard]] bool IsTimestampColumnHint(std::string_view column_name,
+                                         std::string_view column_type);
+[[nodiscard]] std::optional<std::string> LocalizeTimestampValue(
+    std::string_view raw_value, std::string_view column_name = {},
+    std::string_view column_type = {});
+[[nodiscard]] std::string NormalizeTimestampForWrite(
+    std::string_view input, std::string_view raw_original = {},
+    std::string_view column_name = {}, std::string_view column_type = {});
+void ApplyResultTimestampLocalization(const std::vector<std::string>& columns,
+                                      const std::vector<ColumnMeta>* meta,
+                                      std::vector<GridRow>& rows);
 
 } // namespace dbpp
 
@@ -260,12 +330,19 @@ void AdbcRegisterActiveStatement(AdbcSession& session, AdbcStatement* stmt) noex
 void AdbcClearActiveStatement(AdbcSession& session, AdbcStatement* stmt) noexcept;
 void AdbcReleaseNativeHandles(AdbcSession& session) noexcept;
 std::string AdbcFormatTimestampTz(std::int64_t value, int time_unit, std::string_view tz);
+std::string AdbcFormatLocalTimestamp(std::int64_t value, int time_unit);
 std::string AdbcFormatTimeUnit(std::int64_t value, int time_unit);
 bool AdbcConsumeStreamRows(ArrowArrayStream& stream, std::size_t max_rows,
                            AdbcSession* cancel_session, AdbcQueryResult& out);
 void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObject* hint_object,
                                         std::vector<ColumnMeta>& out);
+std::string AdbcFormatArrowSqlLiteral(const ArrowArrayView& view, std::int64_t row,
+                                      const ArrowSchema* schema, Dialect dialect,
+                                      std::string_view declared_type);
 AdbcObjectsResult AdbcLoadObjectsBlockingOnce(AdbcSession& session, AdbcStatusCode& status_out);
+void AdbcEnrichCatalogObjects(AdbcSession& session, AdbcObjectsResult& result);
+AdbcQueryResult AdbcExecuteBlockingRaw(AdbcSession& session, std::string sql, bool want_rows,
+                                       std::size_t max_rows);
 AdbcSchemaResult AdbcLoadSchemaBlockingOnce(AdbcSession& session, const DbObject& object,
                                             AdbcStatusCode& status_out);
 std::optional<std::int64_t> AdbcParseInt64(std::string_view text);

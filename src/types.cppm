@@ -67,6 +67,61 @@ struct TableConstraintMeta {
   bool operator==(const TableConstraintMeta&) const = default;
 };
 
+struct IndexMeta {
+  std::string name;
+  bool unique = false;
+  bool primary = false;
+  std::vector<std::string> columns;
+  std::string definition;
+
+  bool operator==(const IndexMeta&) const = default;
+};
+
+struct TriggerMeta {
+  std::string name;
+  std::string catalog;
+  std::string db_schema;
+  std::string table_name;
+  std::string timing;
+  std::string event;
+  std::string definition;
+
+  bool operator==(const TriggerMeta&) const = default;
+};
+
+struct RoutineMeta {
+  std::string name;
+  std::string catalog;
+  std::string db_schema;
+  bool is_function = false;
+  std::string return_type;
+  std::string signature;
+  std::string definition;
+
+  bool operator==(const RoutineMeta&) const = default;
+};
+
+struct EventMeta {
+  std::string name;
+  std::string catalog;
+  std::string db_schema;
+  std::string schedule;
+  std::string status;
+  std::string definition;
+
+  bool operator==(const EventMeta&) const = default;
+};
+
+struct SavedQuery {
+  std::int64_t id = 0;
+  std::string connection_key;
+  std::string database_name;
+  std::string name;
+  std::string sql_text;
+
+  bool operator==(const SavedQuery&) const = default;
+};
+
 struct ColumnMeta {
   std::string name;
   std::string type;
@@ -104,15 +159,20 @@ struct DbObject {
   std::vector<ColumnMeta> columns;
   std::vector<ForeignKeyMeta> foreign_keys;
   std::vector<TableConstraintMeta> constraints;
+  std::vector<IndexMeta> indexes;
 };
 
 struct ConnectionRequest {
   std::string driver_path;
   std::string uri;
+  std::string fallback_uri;
   std::string username;
   std::string password;
   std::string title;
+  std::string remark;
   bool read_only = false;
+  bool production_mode = false;
+  bool show_system_databases = false;
 };
 
 /// User-saved ADBC/Redis connection (persisted in `dbpp.sqlite3`, including optional password).
@@ -122,6 +182,10 @@ struct ConnectionProfile {
   std::string uri;
   std::string username;
   std::string password;
+  std::string remark;
+  bool read_only = false;
+  bool production_mode = false;
+  bool show_system_databases = false;
 
   bool operator==(const ConnectionProfile&) const = default;
 };
@@ -190,6 +254,11 @@ struct SanitizedUriResult {
 struct CellValue {
   std::string text;
   bool is_null = false;
+  std::string display_text;
+
+  [[nodiscard]] const std::string& DisplayText() const noexcept {
+    return display_text.empty() ? text : display_text;
+  }
 };
 
 struct GridRow {
@@ -275,6 +344,7 @@ enum class WorkspaceTabKind {
   Table,
   Sql,
   Settings,
+  TableDesign,
 };
 
 struct WorkspaceTab {
@@ -291,6 +361,9 @@ struct WorkspaceTab {
   TableModel table;
   std::optional<huxerui::DataTableCellId> selected_cell;
   huxerui::TextEditingValue filter_input;
+
+  DbObject design_object;
+  std::string design_display_label;
 
   SqlModel sql;
 };
@@ -343,6 +416,30 @@ struct WorkspaceModel {
       if (tab.kind == WorkspaceTabKind::Table && tab.session_id == session_id &&
           tab.object_name == object_name && tab.object_schema == object_schema &&
           tab.is_view == is_view) {
+        return &tab;
+      }
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] const WorkspaceTab* FindTableDesignTab(std::uint64_t session_id,
+                                                       std::string_view object_name,
+                                                       std::string_view object_schema) const {
+    for (const auto& tab : tabs) {
+      if (tab.kind == WorkspaceTabKind::TableDesign && tab.session_id == session_id &&
+          tab.object_name == object_name && tab.object_schema == object_schema) {
+        return &tab;
+      }
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] WorkspaceTab* FindTableDesignTab(std::uint64_t session_id,
+                                                 std::string_view object_name,
+                                                 std::string_view object_schema) {
+    for (auto& tab : tabs) {
+      if (tab.kind == WorkspaceTabKind::TableDesign && tab.session_id == session_id &&
+          tab.object_name == object_name && tab.object_schema == object_schema) {
         return &tab;
       }
     }
@@ -430,6 +527,10 @@ struct BulkIngestResult {
 
 struct AdbcObjectsResult {
   std::vector<DbObject> objects;
+  std::vector<std::string> databases;
+  std::vector<TriggerMeta> triggers;
+  std::vector<RoutineMeta> routines;
+  std::vector<EventMeta> events;
   bool connection_lost = false;
   std::string error;
   std::string sqlstate;

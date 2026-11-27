@@ -21,12 +21,19 @@ struct DbSession {
   std::string name;
   std::string uri;
   std::string driver_path;
+  std::string remark;
   Dialect dialect = Dialect::Generic;
   bool sqlite = false;
   bool read_only = false;
+  bool production_mode = false;
+  bool show_system_databases = false;
   AdbcConnectionInfo connection_info;
   std::shared_ptr<AdbcSession> session;
   std::vector<DbObject> objects;
+  std::vector<std::string> databases;
+  std::vector<TriggerMeta> triggers;
+  std::vector<RoutineMeta> routines;
+  std::vector<EventMeta> events;
 };
 
 struct AppModel {
@@ -104,6 +111,10 @@ struct SqlLimitRewriteResult {
 [[nodiscard]] std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path);
 bool SaveConnectionProfiles(const std::string& path,
                             const std::vector<ConnectionProfile>& profiles);
+[[nodiscard]] std::vector<SavedQuery> LoadSavedQueries(const std::string& path);
+bool SaveSavedQueries(const std::string& path, const std::vector<SavedQuery>& queries);
+[[nodiscard]] std::string SavedQueryConnectionKey(std::string_view driver_path,
+                                                  std::string_view uri);
 [[nodiscard]] std::vector<std::string> OrderConnectionKeys(
     const std::vector<std::string>& natural_keys,
     const std::vector<std::string>& custom_order);
@@ -113,6 +124,14 @@ bool SaveConnectionProfiles(const std::string& path,
     std::string_view to_key);
 BatchInsertResult InsertRowsBlocking(AdbcSession& session, const TableModel& model,
                                      const std::vector<PendingInsertRow>& rows);
+AdbcQueryResult UpdateCellBlocking(AdbcSession& session, const TableModel& model,
+                                   std::size_t row_index, std::size_t column_index,
+                                   const std::string& text);
+AdbcQueryResult UpdateRowBlocking(
+    AdbcSession& session, const TableModel& model, std::size_t row_index,
+    const std::vector<std::pair<std::size_t, std::string>>& updates);
+AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
+                                  std::size_t row_index);
 TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
                              DbObject object, std::int64_t page, std::int64_t page_size,
                              std::optional<huxerui::DataTableSort> sort, std::string filter);
@@ -157,6 +176,10 @@ std::uint64_t OpenSqlTab(const huxerui::State<AppModel>& app,
                          const huxerui::State<WorkspaceModel>& workspace,
                          std::uint64_t session_id, std::string initial_sql = {},
                          std::string custom_title = {}, std::string initial_database = {});
+std::uint64_t OpenTableDesignTab(const huxerui::State<AppModel>& app,
+                                 const huxerui::State<WorkspaceModel>& workspace,
+                                 std::uint64_t session_id, DbObject object,
+                                 std::string display_label);
 [[nodiscard]] std::vector<std::string> ListSessionDatabases(const DbSession& session);
 [[nodiscard]] std::string DefaultSessionDatabase(const DbSession& session);
 [[nodiscard]] std::string BuildSwitchDatabaseSql(Dialect dialect,
@@ -222,8 +245,12 @@ void DbCloseSessionAsync(std::shared_ptr<AdbcSession> adbc, const huxerui::TaskS
 AdbcQueryResult DbUpdateCellBlocking(AdbcSession& session, const TableModel& model,
                                      std::size_t row_index, std::size_t column_index,
                                      const std::string& text);
+AdbcQueryResult DbUpdateRowBlocking(
+    AdbcSession& session, const TableModel& model, std::size_t row_index,
+    const std::vector<std::pair<std::size_t, std::string>>& updates);
 AdbcQueryResult DbDeleteRowBlocking(AdbcSession& session, const TableModel& model,
                                     std::size_t row_index);
+std::string DbBuildWhere(Dialect dialect, const TableModel& model, const GridRow& row);
 void DbApplyOpenedSession(const huxerui::State<AppModel>& app,
                           const huxerui::State<WorkspaceModel>& workspace,
                           const huxerui::TaskScope& tasks, AdbcOpenResult opened,

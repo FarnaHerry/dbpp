@@ -38,6 +38,10 @@ using namespace dbpp::ui;
   auto username = UseState(TextEditingValue::FromText({}));
   auto password = UseState(TextEditingValue::FromText({}));
   auto title = UseState(TextEditingValue::FromText({}));
+  auto remark = UseState(TextEditingValue::FromText({}));
+  auto read_only = UseState(false);
+  auto production_mode = UseState(false);
+  auto show_system_databases = UseState(false);
   auto save_profile_flag = UseState(true);
 
   const ConnectionFormStates form{
@@ -50,6 +54,10 @@ using namespace dbpp::ui;
       .username = username,
       .password = password,
       .title = title,
+      .remark = remark,
+      .read_only = read_only,
+      .production_mode = production_mode,
+      .show_system_databases = show_system_databases,
       .extra_query = extra_query,
       .input_mode = input_mode,
   };
@@ -85,13 +93,18 @@ using namespace dbpp::ui;
       FindInstalledDriverForPreset(active_preset, driver_list);
 
   const auto select_preset = [context, step, selected_preset_id, input_mode, driver, uri,
-                              host, port, database, username, password, title, extra_query,
+                              host, port, database, username, password, title, remark,
+                              read_only, production_mode, show_system_databases, extra_query,
                               install_status, drivers](const DatabasePreset& preset) {
     selected_preset_id = preset.id;
     step = 1;
     input_mode = 0;
     install_status = {};
     title = TextEditingValue::FromText({});
+    remark = TextEditingValue::FromText({});
+    read_only = false;
+    production_mode = false;
+    show_system_databases = false;
     password = TextEditingValue::FromText({});
     extra_query = {};
 
@@ -116,8 +129,7 @@ using namespace dbpp::ui;
       port = TextEditingValue::FromText(preset.default_port);
       database = TextEditingValue::FromText(preset.default_database);
       username = TextEditingValue::FromText(preset.default_user);
-      uri = TextEditingValue::FromText(
-          ComposePresetUri(preset, preset.default_host, preset.default_port, preset.default_database));
+      uri = TextEditingValue::FromText({});
       return;
     }
     if (preset.form_kind == ConnectionFormKind::Uri) {
@@ -365,22 +377,26 @@ using namespace dbpp::ui;
     });
   };
 
-  const auto connect = [context, config_db, active_preset, input_mode, driver, uri, host, port,
-                        database, extra_query, username, password, title, save_profile_flag, dialog,
-                        loc] {
-    const std::string effective_uri =
-        (active_preset.form_kind == ConnectionFormKind::HostPort && input_mode.Get() == 0)
-            ? ComposePresetUri(active_preset, host.Get().text, port.Get().text,
-                               database.Get().text, extra_query.Get())
-            : uri.Get().text;
-    const SanitizedUriResult sanitized = SanitizeUriCredentials(effective_uri);
+  const auto connect = [context, config_db, active_preset, driver, uri, host, port, database,
+                        extra_query, username, password, title, remark, read_only, production_mode,
+                        show_system_databases, save_profile_flag, dialog, loc] {
+    const ResolvedConnectionUris resolved = ResolveOrderedConnectionUris(
+        active_preset, uri.Get().text, host.Get().text, port.Get().text, database.Get().text,
+        extra_query.Get());
+    const SanitizedUriResult sanitized = SanitizeUriCredentials(resolved.primary_uri);
+    const SanitizedUriResult fallback_sanitized = SanitizeUriCredentials(resolved.fallback_uri);
 
     ConnectionRequest request;
     request.driver_path = driver.Get().text;
     request.uri = sanitized.uri;
+    request.fallback_uri = fallback_sanitized.uri;
     request.username = username.Get().text.empty() ? sanitized.username : username.Get().text;
     request.password = password.Get().text.empty() ? sanitized.password : password.Get().text;
     request.title = title.Get().text.empty() ? UriDisplayName(sanitized.uri) : title.Get().text;
+    request.remark = TrimmedSql(remark.Get().text);
+    request.read_only = read_only.Get();
+    request.production_mode = production_mode.Get();
+    request.show_system_databases = show_system_databases.Get();
 
     if (request.driver_path.empty() || request.uri.empty()) {
       if (context.notify) {
@@ -396,6 +412,10 @@ using namespace dbpp::ui;
           .uri = request.uri,
           .username = request.username,
           .password = request.password,
+          .remark = request.remark,
+          .read_only = request.read_only,
+          .production_mode = request.production_mode,
+          .show_system_databases = request.show_system_databases,
       };
       std::vector<ConnectionProfile> list = context.profiles.Get();
       bool updated = false;

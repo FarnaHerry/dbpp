@@ -230,7 +230,8 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
   std::vector<ConnectionProfile> profiles;
   if (sqlite3_prepare_v2(
           db_guard.db,
-          "SELECT name, driver_path, uri, username, password "
+          "SELECT name, driver_path, uri, username, password, "
+          "remark, read_only, production_mode, show_system_databases "
           "FROM connections ORDER BY sort_order ASC, id ASC;",
           -1, &stmt_guard.stmt, nullptr) == SQLITE_OK) {
     while (sqlite3_step(stmt_guard.stmt) == SQLITE_ROW) {
@@ -240,6 +241,10 @@ std::vector<ConnectionProfile> LoadConnectionProfiles(const std::string& path) {
       profile.uri = ColumnTextString(stmt_guard.stmt, 2);
       profile.username = ColumnTextString(stmt_guard.stmt, 3);
       profile.password = ColumnTextString(stmt_guard.stmt, 4);
+      profile.remark = ColumnTextString(stmt_guard.stmt, 5);
+      profile.read_only = sqlite3_column_int(stmt_guard.stmt, 6) != 0;
+      profile.production_mode = sqlite3_column_int(stmt_guard.stmt, 7) != 0;
+      profile.show_system_databases = sqlite3_column_int(stmt_guard.stmt, 8) != 0;
       if (!profile.driver_path.empty() && !profile.uri.empty()) {
         profiles.push_back(std::move(profile));
       }
@@ -279,8 +284,9 @@ bool SaveConnectionProfiles(const std::string& path,
       if (sqlite3_prepare_v2(
               db_guard.db,
               "INSERT INTO connections "
-              "(sort_order, name, driver_path, uri, username, password) "
-              "VALUES (?, ?, ?, ?, ?, ?);",
+              "(sort_order, name, driver_path, uri, username, password, "
+              "remark, read_only, production_mode, show_system_databases) "
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
               -1, &stmt_guard.stmt, nullptr) != SQLITE_OK) {
         ok = false;
       } else {
@@ -299,6 +305,115 @@ bool SaveConnectionProfiles(const std::string& path,
                             static_cast<int>(p.username.size()), SQLITE_TRANSIENT);
           sqlite3_bind_text(stmt_guard.stmt, 6, p.password.data(),
                             static_cast<int>(p.password.size()), SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 7, p.remark.data(),
+                            static_cast<int>(p.remark.size()), SQLITE_TRANSIENT);
+          sqlite3_bind_int(stmt_guard.stmt, 8, p.read_only ? 1 : 0);
+          sqlite3_bind_int(stmt_guard.stmt, 9, p.production_mode ? 1 : 0);
+          sqlite3_bind_int(stmt_guard.stmt, 10, p.show_system_databases ? 1 : 0);
+          if (sqlite3_step(stmt_guard.stmt) != SQLITE_DONE) {
+            ok = false;
+            break;
+          }
+        }
+      }
+    }
+    if (ok) {
+      ok = sqlite3_exec(db_guard.db, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK;
+    }
+    if (!ok) {
+      sqlite3_exec(db_guard.db, "ROLLBACK;", nullptr, nullptr, nullptr);
+    }
+  }
+  if (ok) {
+    detail::RestrictConfigFilePermissions(path);
+  }
+  return ok;
+}
+
+std::string SavedQueryConnectionKey(std::string_view driver_path, std::string_view uri) {
+  return ConnectionFailureKey(driver_path, uri);
+}
+
+std::vector<SavedQuery> LoadSavedQueries(const std::string& path) {
+  if (path.empty() || detail::IsLegacyTsvPath(path)) {
+    return {};
+  }
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(path, ec)) {
+    return {};
+  }
+  SqliteDbGuard db_guard;
+  if (sqlite3_open_v2(path.c_str(), &db_guard.db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
+      db_guard.db == nullptr) {
+    return {};
+  }
+  sqlite3_busy_timeout(db_guard.db, 5000);
+
+  SqliteStmtGuard stmt_guard;
+  std::vector<SavedQuery> queries;
+  if (sqlite3_prepare_v2(
+          db_guard.db,
+          "SELECT id, connection_key, database_name, name, sql_text "
+          "FROM saved_queries ORDER BY sort_order ASC, id ASC;",
+          -1, &stmt_guard.stmt, nullptr) == SQLITE_OK) {
+    while (sqlite3_step(stmt_guard.stmt) == SQLITE_ROW) {
+      SavedQuery q;
+      q.id = sqlite3_column_int64(stmt_guard.stmt, 0);
+      q.connection_key = ColumnTextString(stmt_guard.stmt, 1);
+      q.database_name = ColumnTextString(stmt_guard.stmt, 2);
+      q.name = ColumnTextString(stmt_guard.stmt, 3);
+      q.sql_text = ColumnTextString(stmt_guard.stmt, 4);
+      if (!q.name.empty()) {
+        queries.push_back(std::move(q));
+      }
+    }
+  }
+  return queries;
+}
+
+bool SaveSavedQueries(const std::string& path, const std::vector<SavedQuery>& queries) {
+  if (path.empty() || detail::IsLegacyTsvPath(path)) {
+    return false;
+  }
+  if (!detail::EnsureConfigSqliteSync(path)) {
+    return false;
+  }
+  bool ok = false;
+  {
+    SqliteDbGuard db_guard;
+    if (sqlite3_open_v2(path.c_str(), &db_guard.db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK ||
+        db_guard.db == nullptr) {
+      return false;
+    }
+    sqlite3_busy_timeout(db_guard.db, 5000);
+    ok = sqlite3_exec(db_guard.db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) == SQLITE_OK;
+    if (ok) {
+      ok = sqlite3_exec(db_guard.db, "DELETE FROM saved_queries;", nullptr, nullptr, nullptr) ==
+           SQLITE_OK;
+    }
+    if (ok && !queries.empty()) {
+      SqliteStmtGuard stmt_guard;
+      if (sqlite3_prepare_v2(
+              db_guard.db,
+              "INSERT INTO saved_queries "
+              "(sort_order, connection_key, database_name, name, sql_text) "
+              "VALUES (?, ?, ?, ?, ?);",
+              -1, &stmt_guard.stmt, nullptr) != SQLITE_OK) {
+        ok = false;
+      } else {
+        for (std::size_t i = 0; i < queries.size(); ++i) {
+          const SavedQuery& q = queries[i];
+          sqlite3_reset(stmt_guard.stmt);
+          sqlite3_clear_bindings(stmt_guard.stmt);
+          sqlite3_bind_int64(stmt_guard.stmt, 1, static_cast<sqlite3_int64>(i));
+          sqlite3_bind_text(stmt_guard.stmt, 2, q.connection_key.data(),
+                            static_cast<int>(q.connection_key.size()), SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 3, q.database_name.data(),
+                            static_cast<int>(q.database_name.size()), SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 4, q.name.data(), static_cast<int>(q.name.size()),
+                            SQLITE_TRANSIENT);
+          sqlite3_bind_text(stmt_guard.stmt, 5, q.sql_text.data(),
+                            static_cast<int>(q.sql_text.size()), SQLITE_TRANSIENT);
           if (sqlite3_step(stmt_guard.stmt) != SQLITE_DONE) {
             ok = false;
             break;

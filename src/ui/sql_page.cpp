@@ -16,368 +16,12 @@ namespace dbpp {
 using namespace huxerui;
 using namespace dbpp::ui;
 
-namespace {
-
-bool HasLikelySqlParameters(std::string_view sql) {
-  bool in_single = false;
-  bool in_double = false;
-  for (std::size_t i = 0; i < sql.size(); ++i) {
-    const char ch = sql[i];
-    if (in_single) {
-      if (ch == '\'') in_single = false;
-      continue;
-    }
-    if (in_double) {
-      if (ch == '"') in_double = false;
-      continue;
-    }
-    if (ch == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-      while (i < sql.size() && sql[i] != '\n') ++i;
-      continue;
-    }
-    if (ch == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-      i += 2;
-      while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/')) ++i;
-      continue;
-    }
-    if (ch == '\'') {
-      in_single = true;
-      continue;
-    }
-    if (ch == '"') {
-      in_double = true;
-      continue;
-    }
-    if (ch == '?') {
-      return true;
-    }
-    if (ch == '$' && i + 1 < sql.size() &&
-        std::isdigit(static_cast<unsigned char>(sql[i + 1]))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-[[huxerui::composable]] View SqlParametersDialog(
-    DialogContext dialog, std::vector<QueryParameterMeta> parameters,
-    std::function<void(std::vector<PreparedParamValue>)> on_execute) {
-  const ThemeSpec& spec = UseTheme();
-  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
-  auto values = UseState(std::vector<TextEditingValue>(parameters.size()));
-
-  Views fields;
-  fields.Reserve(parameters.size());
-  for (std::size_t i = 0; i < parameters.size(); ++i) {
-    const QueryParameterMeta& meta = parameters[i];
-    TextEditingValue cur = i < values.Get().size() ? values.Get()[i] : TextEditingValue{};
-    fields.Add(Column{
-        Row{
-            Text(meta.name)
-                .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::SemiBold),
-                                 spec.colors.on_surface}),
-            Spacer(),
-            MutedText(meta.type),
-        }.With(CrossAlign{CrossAxisAlignment::Center}),
-        TextField(std::move(cur))
-            .Placeholder("NULL")
-            .Variant(TextFieldVariant::Outlined)
-            .LineLimits(TextFieldLineLimits::SingleLine())
-            .OnChanged([values, i](const TextEditingValue& val) {
-              values.Update([i, val](std::vector<TextEditingValue>& list) {
-                if (i < list.size()) {
-                  list[i] = val;
-                }
-              });
-            }),
-    }.With(Spacing{4.0F}, Padding{EdgeInsets::Symmetric(8.0F, 6.0F)}, CornerRadius{6.0F},
-           Background{VisualFill{spec.colors.surface}}, Border{semantic.border_subtle, 1.0F})
-     .Key("sql-param-" + std::to_string(i)));
-  }
-
-  return DialogCard(Column{
-      Text(app::strings::sql_params_title, TextRole::Title),
-      MutedText(UseString(app::strings::sql_params_subtitle)),
-      ScrollView(Column{std::move(fields)}
-                     .With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Stretch}))
-          .With(Frame{.max_height = 320.0F}),
-      Row{
-          Spacer(),
-          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button(app::strings::sql_params_run).OnClick([dialog, values, on_execute] {
-                         const auto& raw = values.Get();
-                         std::vector<PreparedParamValue> params;
-                         params.reserve(raw.size());
-                         for (const TextEditingValue& v : raw) {
-                           const bool is_null = v.text.empty() || v.text == "NULL" || v.text == "null";
-                           params.push_back(PreparedParamValue{
-                               .text = is_null ? std::string{} : v.text,
-                               .is_null = is_null,
-                           });
-                         }
-                         dialog.Dismiss();
-                         if (on_execute) {
-                           on_execute(std::move(params));
-                         }
-                       }),
-                       ButtonTone::Primary),
-      }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
-  }.With(Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch})
-                    .With(Frame{.width = 460.0F}));
-}
-
-} // namespace
-
-void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
-                        const std::shared_ptr<SettingsModel>& settings, std::uint64_t tab_id,
-                        const TaskScope& tasks, NotifyFn notify, const LocalizedCatalog& loc,
-                        std::int64_t requested_page, bool from_editor,
-                        std::int64_t override_page_size,
-                        std::vector<PreparedParamValue> bound_params) {
-  const WorkspaceTab* cur_tab = workspace.Get().FindTab(tab_id);
-  if (cur_tab == nullptr || cur_tab->kind != WorkspaceTabKind::Sql) {
-    return;
-  }
-  if (!from_editor && !cur_tab->sql.paginated) {
-    return;
-  }
-  const std::string text =
-      TrimmedSql(from_editor ? cur_tab->sql.editor.text : cur_tab->sql.last_sql);
-  if (text.empty()) {
-    return;
-  }
-  const std::int64_t clamped_page =
-      from_editor ? 0 : std::max<std::int64_t>(0, requested_page);
-  const std::uint64_t session_id = cur_tab->session_id;
-  std::shared_ptr<AdbcSession> adbc;
-  bool session_found = false;
-  bool session_is_redis = false;
-  Dialect session_dialect = Dialect::Generic;
-  std::string target_database = TrimmedSql(
-      from_editor
-          ? cur_tab->sql.target_database
-          : (cur_tab->sql.last_database.empty() ? cur_tab->sql.target_database
-                                                : cur_tab->sql.last_database));
-  for (const DbSession& open : app.Get().sessions) {
-    if (open.id == session_id) {
-      session_found = true;
-      adbc = open.session;
-      session_dialect = open.dialect;
-      session_is_redis = (open.dialect == Dialect::Redis);
-      if (target_database.empty()) {
-        target_database = DefaultSessionDatabase(open);
-      }
-      break;
-    }
-  }
-  if (!adbc || adbc->IsClosed()) {
-    if (session_found) {
-      HandleSessionDisconnected(app, workspace, tasks, session_id, {}, notify);
-    } else if (notify) {
-      notify(loc.Get(app::strings::toast_connection_closed));
-    }
-    return;
-  }
-
-  const std::int64_t configured_limit =
-      settings ? settings->default_page_size.Get() : kDefaultPageSize;
-  const std::int64_t active_limit =
-      override_page_size > 0
-          ? std::clamp(override_page_size, kMinPageSize, kMaxPageSize)
-          : (cur_tab->sql.page_size > 0 ? cur_tab->sql.page_size : configured_limit);
-
-  const std::string running_status = loc.Get(app::strings::sql_running);
-  workspace.Update([tab_id, running_status, active_limit](WorkspaceModel& ws) {
-    if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-      target->sql.page_size = active_limit;
-      target->sql.running = true;
-      target->sql.error.clear();
-      target->sql.status = running_status;
-    }
-  });
-
-  tasks.Launch([app, workspace, tab_id, tasks, notify, adbc, session_id, session_dialect,
-                session_is_redis, text, target_database, active_limit, clamped_page,
-                from_editor, loc, bound_params = std::move(bound_params)]() mutable -> Task<void> {
-    if (session_is_redis || IsSqlReadStatement(text)) {
-      const SqlLimitRewriteResult rewritten =
-          (session_is_redis || !bound_params.empty())
-              ? SqlLimitRewriteResult{}
-              : ApplyImplicitSqlLimit(session_dialect, text, active_limit, clamped_page);
-      const std::string exec_sql = rewritten.applied ? rewritten.sql : text;
-      const std::size_t max_rows =
-          session_is_redis
-              ? kMaxQueryRows
-              : (rewritten.applied
-                     ? static_cast<std::size_t>(rewritten.effective_limit)
-                     : std::max<std::size_t>(kMaxQueryRows,
-                                             static_cast<std::size_t>(active_limit)));
-      AdbcQueryResult result =
-          !bound_params.empty()
-              ? co_await ExecutePreparedQueryAsync(adbc, exec_sql, std::move(bound_params), true,
-                                                   max_rows, target_database)
-              : co_await ExecuteQueryAsync(adbc, exec_sql, true, max_rows, target_database);
-      if (result.connection_lost) {
-        const std::string message = result.error;
-        workspace.Update([tab_id](WorkspaceModel& ws) {
-          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-            target->sql.running = false;
-            target->sql.error.clear();
-            target->sql.status.clear();
-          }
-        });
-        HandleSessionDisconnected(app, workspace, tasks, session_id, message, notify);
-        co_return;
-      }
-      if (!result.error.empty()) {
-        const std::string message = result.error;
-        const std::int64_t elapsed_us = result.elapsed_us;
-        workspace.Update([tab_id, exec_sql, elapsed_us](WorkspaceModel& ws) {
-          if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-            target->sql.last_executed_sql = exec_sql;
-            target->sql.last_elapsed_us = elapsed_us;
-            target->sql.running = false;
-            target->sql.error.clear();
-            target->sql.status.clear();
-          }
-        });
-        if (notify) {
-          if (result.cancelled) {
-            notify(loc.Get(app::strings::sql_cancelled));
-          } else {
-            notify(loc.Fmt(session_is_redis ? app::strings::sql_cmd_failed
-                                            : app::strings::sql_query_failed,
-                           message));
-          }
-        }
-        co_return;
-      }
-      auto query = std::make_shared<QueryResult>();
-      query->columns = std::move(result.columns);
-      query->snapshot =
-          std::make_shared<const GridSnapshot>(GridSnapshot{.rows = std::move(result.rows)});
-      query->truncated = result.truncated;
-      const std::int64_t elapsed_us = result.elapsed_us;
-      std::unordered_map<std::string, float> auto_widths;
-      auto_widths.reserve(query->columns.size());
-      for (std::size_t i = 0; i < query->columns.size(); ++i) {
-        auto_widths.emplace("result-" + std::to_string(i),
-                            ComputeAutoColumnWidth(query->columns[i], i, query->snapshot.get()));
-      }
-      const std::size_t rows = query->snapshot->rows.size();
-      const std::string returned_status =
-          rewritten.applied
-              ? loc.Fmt(query->truncated ? app::strings::sql_returned_rows_page_more
-                                         : app::strings::sql_returned_rows_page,
-                        rows)
-              : loc.Fmt(query->truncated ? app::strings::sql_returned_rows_truncated
-                                         : app::strings::sql_returned_rows,
-                        rows);
-      const std::string redis_current_db =
-          (session_is_redis && adbc && adbc->redis)
-              ? ("db" + std::to_string(adbc->redis->CurrentDb()))
-              : std::string{};
-      workspace.Update([tab_id, query, returned_status, redis_current_db, rewritten, active_limit,
-                        clamped_page, from_editor, text, exec_sql, elapsed_us, target_database,
-                        auto_widths = std::move(auto_widths)](WorkspaceModel& ws) mutable {
-        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-          query->id = target->sql.next_result_id++;
-          const bool keep_widths = !from_editor && target->sql.result &&
-                                   target->sql.result->columns == query->columns;
-          target->sql.result = query;
-          if (!keep_widths) {
-            target->sql.column_widths = std::move(auto_widths);
-          }
-          target->sql.page_size = active_limit;
-          target->sql.page = rewritten.applied ? clamped_page : 0;
-          target->sql.paginated = rewritten.applied;
-          target->sql.has_next_page = rewritten.applied && query->truncated;
-          target->sql.last_sql = rewritten.applied ? text : std::string{};
-          target->sql.last_database = rewritten.applied ? target_database : std::string{};
-          target->sql.last_executed_sql = exec_sql;
-          target->sql.last_elapsed_us = elapsed_us;
-          target->sql.running = false;
-          target->sql.error.clear();
-          target->sql.status = returned_status;
-          if (!redis_current_db.empty()) {
-            target->sql.target_database = redis_current_db;
-          }
-        }
-      });
-      if (session_is_redis && !IsReadStatement(Dialect::Redis, text)) {
-        RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
-      }
-      co_return;
-    }
-
-    AdbcQueryResult executed =
-        !bound_params.empty()
-            ? co_await ExecutePreparedQueryAsync(adbc, text, std::move(bound_params), false, 0,
-                                                 target_database)
-            : co_await ExecuteQueryAsync(adbc, text, false, 0, target_database);
-    if (executed.connection_lost) {
-      const std::string message = executed.error;
-      workspace.Update([tab_id](WorkspaceModel& ws) {
-        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-          target->sql.running = false;
-          target->sql.error.clear();
-          target->sql.status.clear();
-        }
-      });
-      HandleSessionDisconnected(app, workspace, tasks, session_id, message, notify);
-      co_return;
-    }
-    if (!executed.error.empty()) {
-      const std::string message = executed.error;
-      const std::int64_t elapsed_us = executed.elapsed_us;
-      workspace.Update([tab_id, text, elapsed_us](WorkspaceModel& ws) {
-        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-          target->sql.last_executed_sql = text;
-          target->sql.last_elapsed_us = elapsed_us;
-          target->sql.running = false;
-          target->sql.error.clear();
-          target->sql.status.clear();
-        }
-      });
-      if (notify) {
-        notify(loc.Fmt(app::strings::sql_query_failed, message));
-      }
-      co_return;
-    }
-
-    const std::int64_t elapsed_us = executed.elapsed_us;
-    const std::string done_status =
-        executed.affected >= 0
-            ? loc.Fmt(app::strings::sql_affected_rows, executed.affected)
-            : loc.Get(app::strings::sql_exec_done);
-    workspace.Update([tab_id, done_status, text, elapsed_us](WorkspaceModel& ws) {
-      if (WorkspaceTab* target = ws.FindTab(tab_id)) {
-        target->sql.result.reset();
-        target->sql.column_widths.clear();
-        target->sql.page = 0;
-        target->sql.paginated = false;
-        target->sql.has_next_page = false;
-        target->sql.last_sql.clear();
-        target->sql.last_database.clear();
-        target->sql.last_executed_sql = text;
-        target->sql.last_elapsed_us = elapsed_us;
-        target->sql.running = false;
-        target->sql.error.clear();
-        target->sql.status = done_status;
-      }
-    });
-    RefreshSessionObjects(app, workspace, tasks, session_id, notify, false);
-    if (notify) {
-      notify(loc.Fmt(app::strings::sql_toast_affected, executed.affected));
-    }
-  });
-}
-
 [[huxerui::composable]] View SqlPage(State<AppModel> app, State<WorkspaceModel> workspace,
                                      State<std::vector<ConnectionProfile>> profiles,
-                                     std::uint64_t tab_id, TaskScope tasks, NotifyFn notify,
-                                     AppThemeConfig theme_config, LanguageMode language_mode,
-                                     bool system_dark) {
+                                     State<std::vector<SavedQuery>> saved_queries,
+                                     std::string profiles_path, std::uint64_t tab_id,
+                                     TaskScope tasks, NotifyFn notify, AppThemeConfig theme_config,
+                                     LanguageMode language_mode, bool system_dark) {
   const ThemeSpec& spec = UseTheme();
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
@@ -385,6 +29,7 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
   const auto picker = UseService<FilePicker>();
   const auto dialogs = UseDialog();
   const auto menu = UseMenu();
+  const auto clipboard = UseApplication().Clipboard();
   const auto limit_popup = UsePopup();
   const auto conn_anchor = UseViewHandle();
   const auto db_anchor = UseViewHandle();
@@ -438,9 +83,19 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
     ExecuteSqlTabQuery(app, workspace, settings, tab_id, tasks, notify, loc, requested_page,
                        from_editor, override_page_size, std::move(bound_params));
   };
+  const bool session_read_only = session != nullptr && session->read_only;
+  const bool session_production = session != nullptr && session->production_mode;
+  const Dialect active_dialect = session != nullptr ? session->dialect : Dialect::Generic;
+  const std::string active_session_name =
+      session != nullptr ? session->name : tab->session_name;
+  const std::string conn_key =
+      session != nullptr ? SavedQueryConnectionKey(session->driver_path, session->uri)
+                         : std::string{};
+
   const auto run = [execute_query, workspace, tab_id, session_connected, is_redis,
+                    session_read_only, session_production, active_dialect, active_session_name,
                     adbc_ptr = session_connected ? session->session : std::shared_ptr<AdbcSession>{},
-                    tasks, dialogs, theme_config, language_mode, system_dark] {
+                    tasks, dialogs, notify, loc, theme_config, language_mode, system_dark] {
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
     if (cur == nullptr || !session_connected || !adbc_ptr) {
       return;
@@ -449,30 +104,53 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
     if (sql_text.empty()) {
       return;
     }
-    if (!is_redis && HasLikelySqlParameters(sql_text)) {
-      tasks.Launch([adbc_ptr, sql_text, execute_query, dialogs, theme_config, language_mode,
-                    system_dark]() -> Task<void> {
-        const AdbcParamSchemaResult param_res = co_await adbc_ptr->sequence.Run(
-            [adbc_ptr, sql_text](std::stop_token) {
-              return InspectStatementParametersBlocking(*adbc_ptr, sql_text);
-            });
-        if (!param_res.supported || param_res.parameters.empty()) {
-          execute_query(0, true, 0, {});
-          co_return;
-        }
-        dialogs.Show([params = param_res.parameters, execute_query, theme_config, language_mode,
-                      system_dark](DialogContext dialog) {
-          return WithDialogTheme(
-              theme_config, language_mode, system_dark,
-              SqlParametersDialog(dialog, params,
-                                  [execute_query](std::vector<PreparedParamValue> bound) {
-                                    execute_query(0, true, 0, std::move(bound));
-                                  }));
+    const bool is_write = !IsPureReadQuery(active_dialect, sql_text);
+    if (session_read_only && is_write) {
+      if (notify) {
+        notify(loc.Get(app::strings::toast_readonly_blocked));
+      }
+      return;
+    }
+
+    const auto proceed_execution = [execute_query, is_redis, adbc_ptr, sql_text, tasks, dialogs,
+                                    theme_config, language_mode, system_dark] {
+      if (!is_redis && HasLikelySqlParameters(sql_text)) {
+        tasks.Launch([adbc_ptr, sql_text, execute_query, dialogs, theme_config, language_mode,
+                      system_dark]() -> Task<void> {
+          const AdbcParamSchemaResult param_res = co_await adbc_ptr->sequence.Run(
+              [adbc_ptr, sql_text](std::stop_token) {
+                return InspectStatementParametersBlocking(*adbc_ptr, sql_text);
+              });
+          if (!param_res.supported || param_res.parameters.empty()) {
+            execute_query(0, true, 0, {});
+            co_return;
+          }
+          dialogs.Show([params = param_res.parameters, execute_query, theme_config, language_mode,
+                        system_dark](DialogContext dialog) {
+            return WithDialogTheme(
+                theme_config, language_mode, system_dark,
+                SqlParametersDialog(dialog, params,
+                                    [execute_query](std::vector<PreparedParamValue> bound) {
+                                      execute_query(0, true, 0, std::move(bound));
+                                    }));
+          });
         });
+        return;
+      }
+      execute_query(0, true, 0, {});
+    };
+
+    if (session_production && is_write) {
+      const std::string preview = CompactSqlPreview(sql_text, 240);
+      dialogs.Show([active_session_name, preview, proceed_execution, theme_config, language_mode,
+                    system_dark](DialogContext dialog) {
+        return WithDialogTheme(
+            theme_config, language_mode, system_dark,
+            ProductionWriteConfirmDialog(dialog, active_session_name, preview, proceed_execution));
       });
       return;
     }
-    execute_query(0, true, 0, {});
+    proceed_execution();
   };
   const auto cancel_running = [adbc_ptr = session_connected ? session->session
                                                             : std::shared_ptr<AdbcSession>{}] {
@@ -504,7 +182,25 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
                                                          : (settings ? settings->default_page_size.Get()
                                                                      : kDefaultPageSize))
                                     : 0,
-                spec.colors.on_surface_variant),
+                spec.colors.on_surface_variant,
+                [snapshot, menu, clipboard, notify, loc](Point pos, std::size_t row_idx,
+                                                         std::size_t col_idx) {
+                  const GridRow* gr = RowAt(snapshot, row_idx);
+                  if (gr == nullptr || col_idx >= gr->values.size()) {
+                    return;
+                  }
+                  const CellValue& cv = gr->values[col_idx];
+                  const std::string cell_display =
+                      cv.is_null ? std::string{"NULL"} : cv.DisplayText();
+                  std::string row_tsv;
+                  for (std::size_t ci = 0; ci < gr->values.size(); ++ci) {
+                    if (ci > 0) row_tsv.push_back('\t');
+                    row_tsv +=
+                        gr->values[ci].is_null ? std::string{"NULL"} : gr->values[ci].DisplayText();
+                  }
+                  ShowReadOnlyCellContextMenu(pos, menu, clipboard, cell_display, row_tsv, notify,
+                                              loc);
+                }),
             .row_height = 26.0F,
             .header_height = 28.0F,
             .frozen_column_count = 0,
@@ -613,6 +309,10 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
                         .username = profile.username.empty() ? sanitized.username : profile.username,
                         .password = profile.password.empty() ? sanitized.password : profile.password,
                         .title = display,
+                        .remark = profile.remark,
+                        .read_only = profile.read_only,
+                        .production_mode = profile.production_mode,
+                        .show_system_databases = profile.show_system_databases,
                     };
                     OpenConnection(
                         app, workspace, tasks, std::move(request), notify,
@@ -700,19 +400,21 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
               }
             }
             std::vector<MenuEntry> entries;
-            bool inserted_sys_sep = false;
+            const bool show_sys = live_session->show_system_databases;
             for (const std::string& db : dbs) {
-              if (!is_redis_sess && has_non_sys && !inserted_sys_sep &&
-                  IsSystemDatabaseOrSchema(db)) {
-                entries.emplace_back(MenuSection{});
-                inserted_sys_sep = true;
+              const bool is_sys = !is_redis_sess && IsSystemDatabaseOrSchema(db);
+              if (is_sys && !show_sys && has_non_sys && db != current_db) {
+                continue;
               }
               entries.emplace_back(
-                  MenuItem(db,
+                  MenuItem(app::images::database, db,
                            [app, workspace, tab_id, db] {
                              (void)SwitchSqlTabDatabase(app, workspace, tab_id, db);
                            })
                       .Checked(db == current_db));
+            }
+            if (entries.empty()) {
+              return;
             }
             menu.Show(db_anchor, std::move(entries),
                       MenuOptions{
@@ -824,152 +526,188 @@ void ExecuteSqlTabQuery(const State<AppModel>& app, const State<WorkspaceModel>&
   }
   View sql_footer = BottomStatusBar(std::move(sql_footer_items));
 
+  const auto open_save_query = [dialogs, conn_key, active_db, workspace, tab_id, saved_queries,
+                                profiles_path, notify, theme_config, language_mode, system_dark] {
+    const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+    const std::string sql_text = cur != nullptr ? cur->sql.editor.text : std::string{};
+    const std::string init_name =
+        (cur != nullptr && !cur->title.empty() && !cur->title.starts_with("SQL"))
+            ? cur->title
+            : std::string{};
+    dialogs.Show([conn_key, active_db, init_name, sql_text, saved_queries, profiles_path, notify,
+                  theme_config, language_mode, system_dark](DialogContext dialog) {
+      return WithDialogTheme(
+          theme_config, language_mode, system_dark,
+          SaveQueryDialog(dialog, std::nullopt, conn_key, active_db, init_name, sql_text,
+                          saved_queries, profiles_path, notify));
+    });
+  };
+
+  Views header_items;
+  header_items.Add(DatabaseIcon(current_brand, 18.0F));
+  header_items.Add(Text(is_redis ? app::strings::sql_title_redis : app::strings::sql_title_sql,
+                        TextRole::Title));
+  if (session_production) {
+    header_items.Add(StatusBadge(loc.Get(app::strings::badge_prod), semantic.danger,
+                                 semantic.danger_container, WithAlpha(semantic.danger, 0.35F))
+                         .Key("sql-badge-prod"));
+  }
+  if (session_read_only) {
+    header_items.Add(StatusBadge(loc.Get(app::strings::badge_ro), semantic.warning,
+                                 semantic.warning_container, WithAlpha(semantic.warning, 0.35F))
+                         .Key("sql-badge-ro"));
+  }
+  header_items.Add(Spacer().Key("sql-header-spacer"));
+  header_items.Add(std::move(connection_selector).Key("sql-conn-selector"));
+  header_items.Add(std::move(database_selector).Key("sql-db-selector"));
+  if (!is_redis && session_connected && !session_read_only) {
+    header_items.Add(
+        CompactActionButton(
+            Button(in_tx_now ? app::strings::sql_tx_manual : app::strings::sql_tx_auto)
+                .OnClick([menu, tx_anchor, live_adbc, tasks, notify, loc, in_tx_now,
+                          tx_active_state] {
+                  std::vector<MenuEntry> entries;
+                  if (!in_tx_now) {
+                    entries.emplace_back(
+                        MenuItem(app::images::connect, loc.Get(app::strings::sql_tx_begin),
+                                 [live_adbc, tasks, notify, loc, tx_active_state] {
+                                   tasks.Launch([live_adbc, notify, loc,
+                                                 tx_active_state]() -> Task<void> {
+                                     std::string err;
+                                     const bool ok = co_await live_adbc->sequence.Run(
+                                         [live_adbc, &err](std::stop_token) {
+                                           return SetAutocommitBlocking(*live_adbc, false, err);
+                                         });
+                                     if (ok) {
+                                       tx_active_state = true;
+                                       if (notify) notify(loc.Get(app::strings::sql_tx_started));
+                                     } else if (notify) {
+                                       notify(loc.Fmt(app::strings::sql_tx_failed, err));
+                                     }
+                                   });
+                                 }));
+                  } else {
+                    entries.emplace_back(
+                        MenuItem(app::images::add, loc.Get(app::strings::sql_tx_commit),
+                                 [live_adbc, tasks, notify, loc, tx_active_state] {
+                                   tasks.Launch([live_adbc, notify, loc,
+                                                 tx_active_state]() -> Task<void> {
+                                     std::string err;
+                                     const bool ok = co_await live_adbc->sequence.Run(
+                                         [live_adbc, &err](std::stop_token) {
+                                           if (!CommitTransactionBlocking(*live_adbc, err)) {
+                                             return false;
+                                           }
+                                           return SetAutocommitBlocking(*live_adbc, true, err);
+                                         });
+                                     if (ok) {
+                                       tx_active_state = false;
+                                       if (notify) notify(loc.Get(app::strings::sql_tx_committed));
+                                     } else if (notify) {
+                                       notify(loc.Fmt(app::strings::sql_tx_failed, err));
+                                     }
+                                   });
+                                 }));
+                    entries.emplace_back(
+                        MenuItem(app::images::disconnect, loc.Get(app::strings::sql_tx_rollback),
+                                 [live_adbc, tasks, notify, loc, tx_active_state] {
+                                   tasks.Launch([live_adbc, notify, loc,
+                                                 tx_active_state]() -> Task<void> {
+                                     std::string err;
+                                     const bool ok = co_await live_adbc->sequence.Run(
+                                         [live_adbc, &err](std::stop_token) {
+                                           if (!RollbackTransactionBlocking(*live_adbc, err)) {
+                                             return false;
+                                           }
+                                           return SetAutocommitBlocking(*live_adbc, true, err);
+                                         });
+                                     if (ok) {
+                                       tx_active_state = false;
+                                       if (notify) notify(loc.Get(app::strings::sql_tx_rolled_back));
+                                     } else if (notify) {
+                                       notify(loc.Fmt(app::strings::sql_tx_failed, err));
+                                     }
+                                   });
+                                 }));
+                  }
+                  menu.Show(tx_anchor, std::move(entries),
+                            MenuOptions{.placement = {.side = AnchorSide::Below,
+                                                      .alignment = AnchorAlignment::End},
+                                        .gap = 4.0F,
+                                        .viewport_margin = 8.0F,
+                                        .offset = {},
+                                        .width = std::nullopt,
+                                        .dismiss_on_outside_press = true,
+                                        .dismiss_on_cancel = true,
+                                        .on_dismiss_request = {}});
+                })
+                .With(Enabled{!sql_model.running}),
+            in_tx_now ? ButtonTone::Primary : ButtonTone::Default, 28.0F, 10.0F)
+            .With(tx_anchor)
+            .Key("sql-tx-btn"));
+  }
+  if (!is_redis && session_connected) {
+    header_items.Add(
+        CompactActionButton(Button(app::strings::sql_save_query_btn).OnClick(open_save_query),
+                            ButtonTone::Default, 28.0F, 10.0F)
+            .Key("sql-save-btn"));
+    header_items.Add(
+        CompactActionButton(
+            Button(app::strings::sql_export)
+                .OnClick([menu, export_anchor, live_adbc, workspace, tab_id, picker, tasks, notify,
+                          loc] {
+                  const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+                  const std::string sql_text =
+                      cur != nullptr ? TrimmedSql(cur->sql.editor.text) : std::string{};
+                  if (sql_text.empty()) {
+                    return;
+                  }
+                  std::vector<MenuEntry> entries;
+                  entries.emplace_back(MenuItem(
+                      app::images::external_link, loc.Get(app::strings::sql_export_csv),
+                      [live_adbc, sql_text, picker, tasks, notify, loc] {
+                        ExportSqlWithPicker(live_adbc, sql_text, ExportFormat::Csv, "query.csv",
+                                            picker, tasks, notify, loc);
+                      }));
+                  entries.emplace_back(MenuItem(
+                      app::images::external_link, loc.Get(app::strings::sql_export_jsonl),
+                      [live_adbc, sql_text, picker, tasks, notify, loc] {
+                        ExportSqlWithPicker(live_adbc, sql_text, ExportFormat::Jsonl,
+                                            "query.jsonl", picker, tasks, notify, loc);
+                      }));
+                  menu.Show(export_anchor, std::move(entries),
+                            MenuOptions{.placement = {.side = AnchorSide::Below,
+                                                      .alignment = AnchorAlignment::End},
+                                        .gap = 4.0F,
+                                        .viewport_margin = 8.0F,
+                                        .offset = {},
+                                        .width = std::nullopt,
+                                        .dismiss_on_outside_press = true,
+                                        .dismiss_on_cancel = true,
+                                        .on_dismiss_request = {}});
+                })
+                .With(Enabled{!sql_model.running}),
+            ButtonTone::Default, 28.0F, 10.0F)
+            .With(export_anchor)
+            .Key("sql-export-btn"));
+  }
+  if (sql_model.running && !is_redis) {
+    header_items.Add(CompactActionButton(Button(app::strings::sql_cancel).OnClick(cancel_running),
+                                         ButtonTone::Danger, 28.0F, 10.0F)
+                         .Key("sql-cancel-btn"));
+  }
+  header_items.Add(
+      CompactActionButton(
+          Button(sql_model.running ? app::strings::sql_running : app::strings::sql_run)
+              .OnClick(run)
+              .With(Enabled{!sql_model.running && session_connected}),
+          ButtonTone::Primary, 28.0F, 12.0F)
+          .Key("sql-run-btn"));
+
   return Column{
-      Row{
-          DatabaseIcon(current_brand, 18.0F),
-          Text(is_redis ? app::strings::sql_title_redis : app::strings::sql_title_sql,
-               TextRole::Title),
-          Spacer(),
-          std::move(connection_selector),
-          std::move(database_selector),
-          (!is_redis && session_connected)
-              ? CompactActionButton(
-                    Button(in_tx_now ? app::strings::sql_tx_manual : app::strings::sql_tx_auto)
-                        .OnClick([menu, tx_anchor, live_adbc, tasks, notify, loc, in_tx_now,
-                                  tx_active_state] {
-                          std::vector<MenuEntry> entries;
-                          if (!in_tx_now) {
-                            entries.emplace_back(
-                                MenuItem(loc.Get(app::strings::sql_tx_begin),
-                                         [live_adbc, tasks, notify, loc, tx_active_state] {
-                                           tasks.Launch([live_adbc, notify, loc,
-                                                         tx_active_state]() -> Task<void> {
-                                             std::string err;
-                                             const bool ok = co_await live_adbc->sequence.Run(
-                                                 [live_adbc, &err](std::stop_token) {
-                                                   return SetAutocommitBlocking(*live_adbc, false,
-                                                                                err);
-                                                 });
-                                             if (ok) {
-                                               tx_active_state = true;
-                                               if (notify) notify(loc.Get(app::strings::sql_tx_started));
-                                             } else if (notify) {
-                                               notify(loc.Fmt(app::strings::sql_tx_failed, err));
-                                             }
-                                           });
-                                         }));
-                          } else {
-                            entries.emplace_back(
-                                MenuItem(loc.Get(app::strings::sql_tx_commit),
-                                         [live_adbc, tasks, notify, loc, tx_active_state] {
-                                           tasks.Launch([live_adbc, notify, loc,
-                                                         tx_active_state]() -> Task<void> {
-                                             std::string err;
-                                             const bool ok = co_await live_adbc->sequence.Run(
-                                                 [live_adbc, &err](std::stop_token) {
-                                                   if (!CommitTransactionBlocking(*live_adbc, err)) {
-                                                     return false;
-                                                   }
-                                                   return SetAutocommitBlocking(*live_adbc, true,
-                                                                                err);
-                                                 });
-                                             if (ok) {
-                                               tx_active_state = false;
-                                               if (notify) notify(loc.Get(app::strings::sql_tx_committed));
-                                             } else if (notify) {
-                                               notify(loc.Fmt(app::strings::sql_tx_failed, err));
-                                             }
-                                           });
-                                         }));
-                            entries.emplace_back(
-                                MenuItem(loc.Get(app::strings::sql_tx_rollback),
-                                         [live_adbc, tasks, notify, loc, tx_active_state] {
-                                           tasks.Launch([live_adbc, notify, loc,
-                                                         tx_active_state]() -> Task<void> {
-                                             std::string err;
-                                             const bool ok = co_await live_adbc->sequence.Run(
-                                                 [live_adbc, &err](std::stop_token) {
-                                                   if (!RollbackTransactionBlocking(*live_adbc,
-                                                                                  err)) {
-                                                     return false;
-                                                   }
-                                                   return SetAutocommitBlocking(*live_adbc, true,
-                                                                                err);
-                                                 });
-                                             if (ok) {
-                                               tx_active_state = false;
-                                               if (notify) notify(loc.Get(app::strings::sql_tx_rolled_back));
-                                             } else if (notify) {
-                                               notify(loc.Fmt(app::strings::sql_tx_failed, err));
-                                             }
-                                           });
-                                         }));
-                          }
-                          menu.Show(tx_anchor, std::move(entries),
-                                    MenuOptions{.placement = {.side = AnchorSide::Below,
-                                                              .alignment = AnchorAlignment::End},
-                                                .gap = 4.0F,
-                                                .viewport_margin = 8.0F,
-                                                .offset = {},
-                                                .width = std::nullopt,
-                                                .dismiss_on_outside_press = true,
-                                                .dismiss_on_cancel = true,
-                                                .on_dismiss_request = {}});
-                        })
-                        .With(Enabled{!sql_model.running}),
-                    in_tx_now ? ButtonTone::Primary : ButtonTone::Default, 28.0F, 10.0F)
-                    .With(tx_anchor)
-              : View{},
-          (!is_redis && session_connected)
-              ? CompactActionButton(
-                    Button(app::strings::sql_export)
-                        .OnClick([menu, export_anchor, live_adbc, workspace, tab_id, picker, tasks,
-                                  notify, loc] {
-                          const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
-                          const std::string sql_text =
-                              cur != nullptr ? TrimmedSql(cur->sql.editor.text) : std::string{};
-                          if (sql_text.empty()) {
-                            return;
-                          }
-                          std::vector<MenuEntry> entries;
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sql_export_csv),
-                              [live_adbc, sql_text, picker, tasks, notify, loc] {
-                                ExportSqlWithPicker(live_adbc, sql_text, ExportFormat::Csv,
-                                                    "query.csv", picker, tasks, notify, loc);
-                              }));
-                          entries.emplace_back(MenuItem(
-                              loc.Get(app::strings::sql_export_jsonl),
-                              [live_adbc, sql_text, picker, tasks, notify, loc] {
-                                ExportSqlWithPicker(live_adbc, sql_text, ExportFormat::Jsonl,
-                                                    "query.jsonl", picker, tasks, notify, loc);
-                              }));
-                          menu.Show(export_anchor, std::move(entries),
-                                    MenuOptions{.placement = {.side = AnchorSide::Below,
-                                                              .alignment = AnchorAlignment::End},
-                                                .gap = 4.0F,
-                                                .viewport_margin = 8.0F,
-                                                .offset = {},
-                                                .width = std::nullopt,
-                                                .dismiss_on_outside_press = true,
-                                                .dismiss_on_cancel = true,
-                                                .on_dismiss_request = {}});
-                        })
-                        .With(Enabled{!sql_model.running}),
-                    ButtonTone::Default, 28.0F, 10.0F)
-                    .With(export_anchor)
-              : View{},
-          (sql_model.running && !is_redis)
-              ? CompactActionButton(Button(app::strings::sql_cancel).OnClick(cancel_running),
-                                    ButtonTone::Danger, 28.0F, 10.0F)
-              : View{},
-          CompactActionButton(
-              Button(sql_model.running ? app::strings::sql_running : app::strings::sql_run)
-                  .OnClick(run)
-                  .With(Enabled{!sql_model.running && session_connected}),
-              ButtonTone::Primary, 28.0F, 12.0F),
-      }.With(Padding{EdgeInsets::Symmetric(6.0F, 0.0F)},
-             CrossAlign{CrossAxisAlignment::Center}, Spacing{4.0F}),
+      Row{std::move(header_items)}
+          .With(Padding{EdgeInsets::Symmetric(6.0F, 0.0F)},
+                CrossAlign{CrossAxisAlignment::Center}, Spacing{4.0F}),
       MonospaceField(
           TextField(sql_model.editor)
               .Label(is_redis ? app::strings::sql_label_redis : app::strings::sql_label_sql)

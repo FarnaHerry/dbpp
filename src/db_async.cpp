@@ -31,6 +31,11 @@ Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
   co_return co_await session->sequence.Run(
       [session, sql = std::move(sql), want_rows, max_rows,
        target_database = std::move(target_database)](std::stop_token) mutable {
+        if (session->read_only && !IsPureReadQuery(session->dialect, sql)) {
+          AdbcQueryResult result;
+          result.error = ReadOnlyWriteBlockedMessage();
+          return result;
+        }
         const std::string trimmed_db = detail::DbTrimAscii(target_database);
         if (!trimmed_db.empty()) {
           if (session->dialect == Dialect::Redis && session->redis) {
@@ -51,7 +56,8 @@ Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
               const std::string switch_sql =
                   BuildSwitchDatabaseSql(session->dialect, trimmed_db);
               if (!switch_sql.empty()) {
-                AdbcQueryResult sw = ExecuteBlocking(*session, switch_sql, false, 0);
+                AdbcQueryResult sw =
+                    ExecuteSwitchDatabaseSqlBlocking(*session, switch_sql);
                 if (sw.connection_lost) {
                   return sw;
                 }
@@ -81,6 +87,11 @@ Task<AdbcQueryResult> ExecutePreparedQueryAsync(std::shared_ptr<AdbcSession> ses
   co_return co_await session->sequence.Run(
       [session, sql = std::move(sql), params = std::move(params), want_rows, max_rows,
        target_database = std::move(target_database)](std::stop_token) mutable {
+        if (session->read_only && !IsPureReadQuery(session->dialect, sql)) {
+          AdbcQueryResult result;
+          result.error = ReadOnlyWriteBlockedMessage();
+          return result;
+        }
         const std::string trimmed_db = detail::DbTrimAscii(target_database);
         if (!trimmed_db.empty()) {
           std::string ns_err;
@@ -88,7 +99,8 @@ Task<AdbcQueryResult> ExecutePreparedQueryAsync(std::shared_ptr<AdbcSession> ses
             const std::string switch_sql =
                 BuildSwitchDatabaseSql(session->dialect, trimmed_db);
             if (!switch_sql.empty()) {
-              AdbcQueryResult sw = ExecuteBlocking(*session, switch_sql, false, 0);
+              AdbcQueryResult sw =
+                  ExecuteSwitchDatabaseSqlBlocking(*session, switch_sql);
               if (sw.connection_lost) {
                 return sw;
               }
@@ -204,7 +216,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
 
   tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session, tab_id, session_id,
                 object_copy = std::move(object_copy), object_name, object_schema, page,
-                effective_page_size, sort, filter]() mutable -> Task<void> {
+                effective_page_size, sort, filter, keep_selection]() mutable -> Task<void> {
     TableModel result = co_await adbc_session->sequence.Run(
         [adbc_session, session_id, object_copy = std::move(object_copy), page,
          effective_page_size, sort, filter](std::stop_token) mutable {
@@ -261,8 +273,13 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
         result.error.clear();
       }
       result.snapshot_version = target->table.snapshot_version + 1;
+      const bool had_valid_sel =
+          keep_selection && target->selected_cell.has_value() && result.snapshot != nullptr &&
+          detail::DbParseRowIndex(target->selected_cell->row_id) < result.snapshot->rows.size();
       target->table = std::move(result);
-      target->selected_cell = std::nullopt;
+      if (!had_valid_sel) {
+        target->selected_cell = std::nullopt;
+      }
     });
 
     if (!tab_matches) {
@@ -316,10 +333,13 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
     return;
   }
   const CellValue& current = table_value.snapshot->rows[row_index].values[column_index];
-  if (!current.is_null && current.text == edit.text) {
+  const ColumnMeta& target_col = table_value.columns[column_index];
+  const std::string normalized_text =
+      NormalizeTimestampForWrite(edit.text, current.text, target_col.name, target_col.type);
+  if (!current.is_null && current.text == normalized_text) {
     return;
   }
-  if (current.is_null && detail::DbEqualsIgnoreCaseAscii(edit.text, "NULL")) {
+  if (current.is_null && detail::DbEqualsIgnoreCaseAscii(normalized_text, "NULL")) {
     return;
   }
 
@@ -329,7 +349,7 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
 
   tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session,
                 table_value = std::move(table_value), tab_id, session_id, object_name,
-                row_index, column_index, text = edit.text]() mutable -> Task<void> {
+                row_index, column_index, text = normalized_text]() mutable -> Task<void> {
     AdbcQueryResult result =
         co_await UpdateCellAsync(adbc_session, table_value, row_index, column_index, text);
     if (result.connection_lost) {
@@ -350,6 +370,9 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
     }
     RequestLoadTable(app, workspace, tasks, tab_id, table_value.page, table_value.sort,
                      table_value.filter, true, notify);
+    if (notify) {
+      notify(std::string(Tr("Record updated", "记录已更新")));
+    }
   });
 }
 
@@ -436,6 +459,16 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
   const std::string object_name = tab->object_name;
   TableModel table_copy = tab->table;
   std::vector<PendingInsertRow> rows = tab->table.pending_inserts;
+  for (PendingInsertRow& row : rows) {
+    for (std::size_t col_idx = 0;
+         col_idx < row.values.size() && col_idx < table_copy.columns.size(); ++col_idx) {
+      if (!row.values[col_idx].empty()) {
+        const ColumnMeta& col = table_copy.columns[col_idx];
+        row.values[col_idx] =
+            NormalizeTimestampForWrite(row.values[col_idx], {}, col.name, col.type);
+      }
+    }
+  }
 
   workspace.Update([&](WorkspaceModel& ws) {
     if (WorkspaceTab* target = ws.FindTab(tab_id);
@@ -777,6 +810,10 @@ void RefreshSessionObjects(const State<AppModel>& app, const State<WorkspaceMode
         }
         session_present = true;
         open.objects = std::move(objects.objects);
+        open.databases = std::move(objects.databases);
+        open.triggers = std::move(objects.triggers);
+        open.routines = std::move(objects.routines);
+        open.events = std::move(objects.events);
         ++value.revision;
         break;
       }

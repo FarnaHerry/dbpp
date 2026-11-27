@@ -64,17 +64,21 @@ using namespace dbpp::ui;
             ? (is_active ? spec.colors.primary : spec.colors.on_surface_variant)
             : (t.kind == WorkspaceTabKind::Sql
                    ? semantic.accent_sql
-                   : (is_redis_tab
-                          ? semantic.accent_database
-                          : (t.is_view ? semantic.accent_view : semantic.accent_table)));
+                   : (t.kind == WorkspaceTabKind::TableDesign
+                          ? semantic.accent_table
+                          : (is_redis_tab
+                                 ? semantic.accent_database
+                                 : (t.is_view ? semantic.accent_view : semantic.accent_table))));
     const ImageResource& icon_res =
         t.kind == WorkspaceTabKind::Settings
             ? app::images::settings
             : (t.kind == WorkspaceTabKind::Sql
                    ? app::images::sql_console
-                   : (is_redis_tab
-                          ? app::images::database
-                          : (t.is_view ? app::images::view : app::images::table)));
+                   : (t.kind == WorkspaceTabKind::TableDesign
+                          ? app::images::edit
+                          : (is_redis_tab
+                                 ? app::images::database
+                                 : (t.is_view ? app::images::view : app::images::table))));
     const std::string detail =
         t.kind == WorkspaceTabKind::Settings
             ? std::string{}
@@ -400,14 +404,17 @@ using namespace dbpp::ui;
                           spec.colors.on_surface_variant, spec.colors.surface_container,
                           semantic.border_subtle);
 
-    right_pane = Column{
+    Views mcp_items;
+    mcp_items.Add(
         Row{
             TintedIcon(app::images::mcp, spec.colors.primary, 20.0F),
             Text(app::strings::settings_mcp_title, TextRole::Title),
             Spacer(),
             std::move(status_badge),
-        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
-        MutedText(UseString(app::strings::settings_mcp_desc)),
+        }
+            .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}));
+    mcp_items.Add(MutedText(UseString(app::strings::settings_mcp_desc)));
+    mcp_items.Add(
         Switch(app::strings::settings_mcp_enable, settings->mcp_enabled)
             .OnChanged([settings, mcp_service, notify, loc](bool value) {
               (void)settings->SetMcpEnabled(value);
@@ -422,7 +429,8 @@ using namespace dbpp::ui;
                   }
                 }
               }
-            }),
+            }));
+    mcp_items.Add(
         Switch(app::strings::settings_mcp_readonly, settings->mcp_read_only)
             .OnChanged([settings, mcp_service, mcp_enabled, notify, loc](bool value) {
               (void)settings->SetMcpReadOnly(value);
@@ -433,7 +441,8 @@ using namespace dbpp::ui;
                   notify(loc.Fmt(app::strings::toast_mcp_failed, mcp_service->status.Get().error));
                 }
               }
-            }),
+            }));
+    mcp_items.Add(
         Row{
             TextField(mcp_host_input)
                 .Label(app::strings::settings_mcp_host_label)
@@ -449,22 +458,32 @@ using namespace dbpp::ui;
                 .With(Frame{.width = 140.0F}),
             ActionButton(Button(app::strings::settings_mcp_apply).OnClick(apply_mcp_config),
                          ButtonTone::Primary),
-        }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
-        !mcp_status.error.empty() ? ErrorText(mcp_status.error) : View{},
-        Divider(),
+        }
+            .With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}));
+    if (!mcp_status.error.empty()) {
+      mcp_items.Add(ErrorText(mcp_status.error).Key("settings-mcp-error"));
+    }
+    mcp_items.Add(Divider().Key("settings-mcp-div-1"));
+    mcp_items.Add(
         Row{
             Caption(UseString(app::strings::settings_mcp_endpoint_label)),
             Spacer(),
             ActionButton(Button(app::strings::settings_mcp_copy_endpoint)
                              .OnClick([copy_text, endpoint_url] {
-                               copy_text(endpoint_url, app::strings::settings_mcp_endpoint_copied_label);
+                               copy_text(endpoint_url,
+                                         app::strings::settings_mcp_endpoint_copied_label);
                              })),
-        }.With(CrossAlign{CrossAxisAlignment::Center}),
+        }
+            .With(CrossAlign{CrossAxisAlignment::Center})
+            .Key("settings-mcp-endpoint-row"));
+    mcp_items.Add(
         Text(endpoint_url)
             .Style(TextStyle{Font::Monospace(13.0F), spec.colors.on_surface})
             .With(Padding{EdgeInsets::Symmetric(10.0F, 8.0F)}, CornerRadius{6.0F},
                   Background{VisualFill{spec.colors.surface}},
-                  Border{semantic.border_subtle, 1.0F}),
+                  Border{semantic.border_subtle, 1.0F})
+            .Key("settings-mcp-endpoint-val"));
+    mcp_items.Add(
         Row{
             Caption(UseString(app::strings::settings_mcp_snippet_label)),
             Spacer(),
@@ -472,14 +491,20 @@ using namespace dbpp::ui;
                              .OnClick([copy_text, snippet] {
                                copy_text(snippet, app::strings::settings_mcp_snippet_copied_label);
                              })),
-        }.With(CrossAlign{CrossAxisAlignment::Center}),
+        }
+            .With(CrossAlign{CrossAxisAlignment::Center})
+            .Key("settings-mcp-snippet-row"));
+    mcp_items.Add(
         Text(snippet)
             .Style(TextStyle{Font::Monospace(12.0F), spec.colors.on_surface_variant})
             .With(Padding{EdgeInsets::Symmetric(10.0F, 8.0F)}, CornerRadius{6.0F},
                   Background{VisualFill{spec.colors.surface}},
-                  Border{semantic.border_subtle, 1.0F}),
-        Divider(),
-        Caption(UseString(app::strings::settings_mcp_tools_heading)),
+                  Border{semantic.border_subtle, 1.0F})
+            .Key("settings-mcp-snippet-val"));
+    mcp_items.Add(Divider().Key("settings-mcp-div-2"));
+    mcp_items.Add(
+        Caption(UseString(app::strings::settings_mcp_tools_heading)).Key("settings-mcp-tools-hdr"));
+    mcp_items.Add(
         Column{
             MutedText(UseString(app::strings::settings_mcp_tool_profiles)),
             MutedText(UseString(app::strings::settings_mcp_tool_tables)),
@@ -488,8 +513,13 @@ using namespace dbpp::ui;
             MutedText(UseString(app::strings::settings_mcp_tool_info)),
             MutedText(UseString(app::strings::settings_mcp_tool_stats)),
             MutedText(UseString(app::strings::settings_mcp_tool_inspect_schema)),
-        }.With(Spacing{4.0F}, CrossAlign{CrossAxisAlignment::Stretch}),
-    }.With(Frame{.max_width = 640.0F}, Spacing{10.0F}, CrossAlign{CrossAxisAlignment::Stretch});
+        }
+            .With(Spacing{4.0F}, CrossAlign{CrossAxisAlignment::Stretch})
+            .Key("settings-mcp-tools-list"));
+
+    right_pane = Column{std::move(mcp_items)}
+                     .With(Frame{.max_width = 640.0F}, Spacing{10.0F},
+                           CrossAlign{CrossAxisAlignment::Stretch});
   } else {
     const auto open_link = [notify, loc](std::string_view url) {
       if (!OpenExternalUrl(url) && notify) {

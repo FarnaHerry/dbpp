@@ -101,6 +101,15 @@ std::string CellText(const std::shared_ptr<const GridSnapshot>& snapshot, std::s
   return row->values[column].text;
 }
 
+std::string CellDisplayText(const std::shared_ptr<const GridSnapshot>& snapshot,
+                            std::string_view row_id, std::size_t column) {
+  const GridRow* row = RowAt(snapshot, RowIndexFromId(row_id));
+  if (row == nullptr || column >= row->values.size()) {
+    return {};
+  }
+  return row->values[column].DisplayText();
+}
+
 bool CellIsNull(const std::shared_ptr<const GridSnapshot>& snapshot, std::string_view row_id,
                 std::size_t column) {
   const GridRow* row = RowAt(snapshot, RowIndexFromId(row_id));
@@ -204,11 +213,32 @@ const ImageResource& ObjectGroupIconResource(std::string_view key) {
   if (key == "mviews") {
     return app::images::mview;
   }
-  if (key == "foreign") {
+  if (key == "foreign" || key == "fks") {
     return app::images::foreign_table;
   }
   if (key == "tables") {
     return app::images::table;
+  }
+  if (key == "columns") {
+    return app::images::column;
+  }
+  if (key == "indexes") {
+    return app::images::index;
+  }
+  if (key == "triggers") {
+    return app::images::trigger;
+  }
+  if (key == "procedures") {
+    return app::images::procedure;
+  }
+  if (key == "functions") {
+    return app::images::function;
+  }
+  if (key == "events") {
+    return app::images::event;
+  }
+  if (key == "queries") {
+    return app::images::query;
   }
   return app::images::folder;
 }
@@ -434,7 +464,8 @@ DataTableColumn MakeRowNumberColumn(std::int64_t base_offset, std::size_t row_co
 std::vector<DataTableColumn> BuildReadOnlyColumns(
     const std::vector<std::string>& names, const std::shared_ptr<const GridSnapshot>& snapshot,
     const std::unordered_map<std::string, float>& column_widths, Color text_color,
-    Color null_color, std::int64_t base_offset, Color muted_color) {
+    Color null_color, std::int64_t base_offset, Color muted_color,
+    std::function<void(Point, std::size_t, std::size_t)> on_context_menu) {
   std::vector<DataTableColumn> columns;
   columns.reserve(names.size() + 1);
   columns.push_back(MakeRowNumberColumn(base_offset, snapshot ? snapshot->rows.size() : 0,
@@ -453,20 +484,37 @@ std::vector<DataTableColumn> BuildReadOnlyColumns(
         .min = kMinColumnWidth,
         .max = kMaxColumnWidth,
     };
-    column.render_cell = [snapshot, i, text_color, null_color](
+    column.render_cell = [snapshot, i, text_color, null_color, on_context_menu](
                              const DataTableCellContext& cell) -> DataTableCellContent {
       const bool is_null = CellIsNull(snapshot, cell.id.row_id, i);
-      const std::string text = CellText(snapshot, cell.id.row_id, i);
-      TextStyle style{Font::Monospace(13.0F), is_null ? null_color : text_color};
+      const std::string raw = CellText(snapshot, cell.id.row_id, i);
+      const std::string display = CellDisplayText(snapshot, cell.id.row_id, i);
+      View cell_view;
       if (is_null) {
-        style.font = Font::Monospace(13.0F).WithSlant(FontSlant::Italic);
+        cell_view = NullValueBadge(null_color);
+      } else {
+        cell_view = Text(SingleLineCellPreview(display))
+                        .Style(TextStyle{Font::Monospace(13.0F), text_color})
+                        .LineLimit(1)
+                        .Overflow(TextOverflow::Ellipsis);
+        if (display != raw && !raw.empty()) {
+          cell_view = std::move(cell_view).With(Tooltip(StringVariant(raw)));
+        }
+      }
+      if (on_context_menu) {
+        const std::size_t row_idx = RowIndexFromId(cell.id.row_id);
+        cell_view =
+            Row{std::move(cell_view)}
+                .With(Frame{.min_height = 26.0F}, CrossAlign{CrossAxisAlignment::Center})
+                .On<ViewEvents::ContextMenuRequested>([on_context_menu, row_idx, i](Point pos) {
+                  if (row_idx != static_cast<std::size_t>(-1)) {
+                    on_context_menu(pos, row_idx, i);
+                  }
+                });
       }
       return DataTableCellContent{
-          .view = Text(SingleLineCellPreview(text))
-                      .Style(style)
-                      .LineLimit(1)
-                      .Overflow(TextOverflow::Ellipsis),
-          .label = text,
+          .view = std::move(cell_view),
+          .label = display,
       };
     };
     columns.push_back(std::move(column));
@@ -617,6 +665,15 @@ bool PersistConnectionProfileList(const std::shared_ptr<ConfigDbService>& config
     return true;
   }
   return !profiles_path.empty() && SaveConnectionProfiles(profiles_path, list);
+}
+
+bool PersistSavedQueryList(const std::shared_ptr<ConfigDbService>& config_db,
+                           const std::string& db_path, const std::vector<SavedQuery>& list) {
+  if (config_db) {
+    config_db->PersistSavedQueries(list);
+    return true;
+  }
+  return !db_path.empty() && SaveSavedQueries(db_path, list);
 }
 
 StringResource ObjectKindResource(const DbObject& object) {

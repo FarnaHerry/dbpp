@@ -284,6 +284,11 @@ bool ExecutePreparedNonQuery(AdbcSession& session, std::string_view sql,
     out.error = Tr("Connection is closed", "连接已关闭");
     return false;
   }
+  if (session.read_only) {
+    status_out = ADBC_STATUS_UNAUTHORIZED;
+    out.error = ReadOnlyWriteBlockedMessage();
+    return false;
+  }
 
   detail::AdbcErrorGuard error;
   detail::AdbcStatementGuard stmt;
@@ -453,6 +458,11 @@ AdbcQueryResult ExecutePreparedBlocking(AdbcSession& session, std::string sql,
   };
 
   session.cancel_requested.store(false, std::memory_order_release);
+  if (session.read_only && !IsPureReadQuery(session.dialect, sql)) {
+    result.error = ReadOnlyWriteBlockedMessage();
+    result.elapsed_us = elapsed();
+    return result;
+  }
   detail::AdbcErrorGuard error;
   detail::AdbcStatementGuard stmt;
   AdbcStatusCode status = AdbcStatementNew(&session.connection, &stmt.statement, error.Ptr());

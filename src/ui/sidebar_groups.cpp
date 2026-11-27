@@ -17,7 +17,7 @@ using namespace huxerui;
 using namespace dbpp::ui;
 
 std::vector<SidebarObjectGroup> GroupObjectItems(
-    Dialect dialect, const std::vector<const DbObject*>& items) {
+    Dialect dialect, const std::vector<const DbObject*>& items, bool include_empty_standard = false) {
   if (dialect == Dialect::Redis) {
     SidebarObjectGroup dbs{
         .key = "redis_dbs", .label = app::strings::sidebar_group_redis_dbs, .items = items};
@@ -53,7 +53,9 @@ std::vector<SidebarObjectGroup> GroupObjectItems(
 
   std::vector<SidebarObjectGroup> groups;
   for (SidebarObjectGroup* group : {&tables, &views, &mviews, &foreign}) {
-    if (!group->items.empty()) {
+    const bool mandatory = include_empty_standard &&
+                           (group->key == "tables" || group->key == "views");
+    if (mandatory || !group->items.empty()) {
       groups.push_back(std::move(*group));
     }
   }
@@ -66,7 +68,7 @@ std::vector<SidebarObjectGroup> GroupSessionObjects(const DbSession& session) {
   for (const DbObject& object : session.objects) {
     all_items.push_back(&object);
   }
-  return GroupObjectItems(session.dialect, all_items);
+  return GroupObjectItems(session.dialect, all_items, false);
 }
 
 std::string SessionObjectBucketName(const DbSession& session, const DbObject& object,
@@ -130,8 +132,13 @@ bool SessionHasMultipleCatalogs(const DbSession& session) {
 }
 
 bool SessionUsesDatabaseHierarchy(const DbSession& session) {
-  if (session.dialect == Dialect::Redis || session.objects.empty()) {
+  if (session.dialect == Dialect::Redis) {
     return false;
+  }
+  if (session.objects.empty() && session.databases.empty() && session.triggers.empty() &&
+      session.routines.empty() && session.events.empty()) {
+    return session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb ||
+           session.dialect == Dialect::Mysql || session.dialect == Dialect::Postgresql;
   }
   const bool multi_catalog = SessionHasMultipleCatalogs(session);
   std::vector<std::string> distinct_buckets;
@@ -147,7 +154,15 @@ bool SessionUsesDatabaseHierarchy(const DbSession& session) {
       }
     }
   }
-  if (distinct_buckets.size() == 1) {
+  for (const std::string& extra_db : session.databases) {
+    if (!extra_db.empty() && std::ranges::find(distinct_buckets, extra_db) == distinct_buckets.end()) {
+      distinct_buckets.push_back(extra_db);
+      if (distinct_buckets.size() >= 2) {
+        return true;
+      }
+    }
+  }
+  if (distinct_buckets.size() <= 1) {
     return session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb ||
            session.dialect == Dialect::Mysql || session.dialect == Dialect::Postgresql ||
            ContainsIgnoreCaseAscii(session.driver_path, "mssql") ||
@@ -174,29 +189,85 @@ std::vector<SidebarDatabaseGroup> GroupSessionDatabases(const DbSession& session
     bool is_system = false;
     bool is_target = false;
     std::vector<const DbObject*> items;
+    std::vector<const RoutineMeta*> procedures;
+    std::vector<const RoutineMeta*> functions;
+    std::vector<const TriggerMeta*> triggers;
+    std::vector<const EventMeta*> events;
   };
   std::vector<RawBucket> raw_buckets;
+  const auto ensure_bucket = [&](const std::string& bucket) -> RawBucket* {
+    auto it = std::ranges::find_if(raw_buckets,
+                                   [&bucket](const RawBucket& b) { return b.name == bucket; });
+    if (it != raw_buckets.end()) {
+      return &(*it);
+    }
+    std::string lower_name = bucket;
+    for (char& ch : lower_name) {
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    raw_buckets.push_back(RawBucket{
+        .name = bucket,
+        .is_system = IsSystemDatabaseOrSchema(bucket),
+        .is_target = !target_lower.empty() && lower_name == target_lower,
+    });
+    return &raw_buckets.back();
+  };
+
   for (const DbObject& object : session.objects) {
     std::string bucket = SessionObjectBucketName(session, object, multi_catalog);
     if (bucket.empty()) {
       bucket = !target_db.empty() ? target_db : std::string("default");
     }
-    auto it = std::ranges::find_if(raw_buckets,
-                                   [&bucket](const RawBucket& b) { return b.name == bucket; });
-    if (it == raw_buckets.end()) {
-      std::string lower_name = bucket;
-      for (char& ch : lower_name) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-      }
-      raw_buckets.push_back(RawBucket{
-          .name = bucket,
-          .is_system = IsSystemDatabaseOrSchema(bucket),
-          .is_target = !target_lower.empty() && lower_name == target_lower,
-          .items = {&object},
-      });
-    } else {
-      it->items.push_back(&object);
+    ensure_bucket(bucket)->items.push_back(&object);
+  }
+  for (const std::string& extra_db : session.databases) {
+    if (!extra_db.empty()) {
+      (void)ensure_bucket(extra_db);
     }
+  }
+  if (raw_buckets.empty()) {
+    const std::string fallback_name =
+        !target_db.empty()
+            ? target_db
+            : ((session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb)
+                   ? "main"
+                   : "default");
+    (void)ensure_bucket(fallback_name);
+  }
+
+  const auto bucket_name_for_meta = [&](std::string_view db_schema,
+                                        std::string_view catalog) -> std::string {
+    if (!db_schema.empty()) {
+      return std::string(db_schema);
+    }
+    if (!catalog.empty() && !ContainsIgnoreCaseAscii(catalog, "def")) {
+      return std::string(catalog);
+    }
+    if (!target_db.empty()) {
+      return target_db;
+    }
+    return (session.dialect == Dialect::Sqlite || session.dialect == Dialect::Duckdb)
+               ? "main"
+               : raw_buckets.front().name;
+  };
+
+  for (const RoutineMeta& rt : session.routines) {
+    RawBucket* bucket = ensure_bucket(bucket_name_for_meta(rt.db_schema, rt.catalog));
+    if (rt.is_function) {
+      bucket->functions.push_back(&rt);
+    } else {
+      bucket->procedures.push_back(&rt);
+    }
+  }
+  for (const TriggerMeta& trg : session.triggers) {
+    ensure_bucket(bucket_name_for_meta(trg.db_schema, trg.catalog))->triggers.push_back(&trg);
+  }
+  for (const EventMeta& ev : session.events) {
+    ensure_bucket(bucket_name_for_meta(ev.db_schema, ev.catalog))->events.push_back(&ev);
+  }
+
+  if (!session.show_system_databases) {
+    std::erase_if(raw_buckets, [](const RawBucket& b) { return b.is_system; });
   }
 
   std::ranges::sort(raw_buckets, [](const RawBucket& a, const RawBucket& b) {
@@ -235,13 +306,19 @@ std::vector<SidebarDatabaseGroup> GroupSessionDatabases(const DbSession& session
       open = true;
       opened_first_fallback = true;
     }
+    const std::size_t total_count = b.items.size() + b.procedures.size() + b.functions.size() +
+                                    b.triggers.size() + b.events.size();
     result.push_back(SidebarDatabaseGroup{
         .name = std::move(b.name),
         .is_system = b.is_system,
         .is_target = b.is_target,
         .default_open = open,
-        .object_count = b.items.size(),
-        .groups = GroupObjectItems(session.dialect, b.items),
+        .object_count = total_count,
+        .groups = GroupObjectItems(session.dialect, b.items, true),
+        .procedures = std::move(b.procedures),
+        .functions = std::move(b.functions),
+        .triggers = std::move(b.triggers),
+        .events = std::move(b.events),
     });
   }
   return result;

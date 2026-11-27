@@ -3,7 +3,7 @@ module;
 #include <huxerui/datatable.h>
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.0"
+#define DBPP_VERSION "0.4.1"
 #endif
 
 module dbpp.cli;
@@ -662,7 +662,8 @@ GridRow CliMakeTextRow(std::initializer_list<std::string_view> cells) {
   GridRow row;
   row.values.reserve(cells.size());
   for (std::string_view cell : cells) {
-    row.values.push_back(CellValue{.text = std::string(cell), .is_null = false});
+    row.values.push_back(
+        CellValue{.text = std::string(cell), .is_null = false, .display_text = {}});
   }
   return row;
 }
@@ -715,90 +716,7 @@ bool CliReadSqlInput(std::ostream& err, bool json_mode, std::istream& in,
 }
 
 std::vector<std::string> CliSplitSqlStatements(std::string_view script, Dialect dialect) {
-  std::vector<std::string> statements;
-  std::size_t stmt_start = 0;
-  std::size_t i = 0;
-
-  while (i < script.size()) {
-    const char c = script[i];
-    if (c == '-' && i + 1 < script.size() && script[i + 1] == '-') {
-      i += 2;
-      while (i < script.size() && script[i] != '\n') {
-        ++i;
-      }
-      continue;
-    }
-    if (c == '/' && i + 1 < script.size() && script[i + 1] == '*') {
-      i += 2;
-      while (i + 1 < script.size() && !(script[i] == '*' && script[i + 1] == '/')) {
-        ++i;
-      }
-      i = (i + 1 < script.size()) ? i + 2 : script.size();
-      continue;
-    }
-    if (c == '\'') {
-      ++i;
-      while (i < script.size()) {
-        if (dialect == Dialect::Mysql && script[i] == '\\' && i + 1 < script.size()) {
-          i += 2;
-          continue;
-        }
-        if (script[i] == '\'') {
-          if (i + 1 < script.size() && script[i + 1] == '\'') {
-            i += 2;
-            continue;
-          }
-          ++i;
-          break;
-        }
-        ++i;
-      }
-      continue;
-    }
-    if (c == '"' || c == '`') {
-      const char quote = c;
-      ++i;
-      while (i < script.size()) {
-        if (script[i] == quote) {
-          if (i + 1 < script.size() && script[i + 1] == quote) {
-            i += 2;
-            continue;
-          }
-          ++i;
-          break;
-        }
-        ++i;
-      }
-      continue;
-    }
-    if (c == '$') {
-      std::size_t j = i + 1;
-      while (j < script.size() &&
-             (std::isalnum(static_cast<unsigned char>(script[j])) || script[j] == '_')) {
-        ++j;
-      }
-      if (j < script.size() && script[j] == '$') {
-        const std::string_view tag = script.substr(i, j - i + 1);
-        const std::size_t close = script.find(tag, j + 1);
-        i = close == std::string_view::npos ? script.size() : close + tag.size();
-        continue;
-      }
-    }
-    if (c == ';') {
-      const std::string_view piece = CliTrimAscii(script.substr(stmt_start, i - stmt_start));
-      if (!piece.empty()) {
-        statements.emplace_back(piece);
-      }
-      stmt_start = i + 1;
-    }
-    ++i;
-  }
-
-  const std::string_view tail = CliTrimAscii(script.substr(stmt_start));
-  if (!tail.empty()) {
-    statements.emplace_back(tail);
-  }
-  return statements;
+  return SplitSqlStatements(script, dialect);
 }
 
 std::optional<DbObject> CliFindObjectByName(const std::vector<DbObject>& objects,

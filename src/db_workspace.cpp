@@ -348,6 +348,56 @@ std::uint64_t OpenSettingsTab(const State<AppModel>& app, const State<WorkspaceM
   return created_id;
 }
 
+std::uint64_t OpenTableDesignTab(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
+                                 std::uint64_t session_id, DbObject object,
+                                 std::string display_label) {
+  if (const WorkspaceTab* existing =
+          workspace.Get().FindTableDesignTab(session_id, object.name, object.db_schema)) {
+    workspace.Update([&](WorkspaceModel& ws) {
+      if (WorkspaceTab* mutable_tab = ws.FindTab(existing->id)) {
+        mutable_tab->design_object = object;
+        if (!display_label.empty()) {
+          mutable_tab->design_display_label = display_label;
+        }
+      }
+    });
+    ActivateWorkspaceTab(app, workspace, existing->id);
+    return existing->id;
+  }
+  const DbSession* session = detail::DbFindSession(app.Get(), session_id);
+  if (session == nullptr) {
+    return 0;
+  }
+
+  const std::string label =
+      display_label.empty() ? detail::DbFormatTabTitle(*session, object.name, object.db_schema)
+                            : display_label;
+  std::uint64_t created_id = 0;
+  workspace.Update([&](WorkspaceModel& ws) {
+    WorkspaceTab tab;
+    tab.id = ws.next_tab_id++;
+    created_id = tab.id;
+    tab.kind = WorkspaceTabKind::TableDesign;
+    tab.session_id = session_id;
+    tab.session_name = session->name;
+    tab.session_uri = session->uri;
+    tab.title = TrFmt("Design · {0}", "表结构 · {0}", {label});
+    tab.object_name = object.name;
+    tab.object_schema = object.db_schema;
+    tab.is_view = object.is_view;
+    tab.design_object = std::move(object);
+    tab.design_display_label = label;
+    ws.tabs.push_back(std::move(tab));
+    ws.active_tab_id = created_id;
+  });
+  const WorkspaceModel& ws_now = workspace.Get();
+  app.Update([&ws_now](AppModel& model) {
+    detail::DbSyncAppFromActiveTab(model, ws_now);
+    model.error.clear();
+  });
+  return created_id;
+}
+
 void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                   const TaskScope& tasks, std::uint64_t session_id, std::string object,
                   std::string db_schema, bool is_view, NotifyFn notify) {
@@ -527,7 +577,8 @@ float ComputeAutoColumnWidth(std::string_view header, std::size_t col_index,
       const CellValue& cell = row.values[col_index];
       const float units =
           cell.is_null ? 4.0F
-                       : EstimateDisplayUnits(SingleLineCellPreview(cell.text), kMaxMeasuredUnits);
+                       : EstimateDisplayUnits(SingleLineCellPreview(cell.DisplayText()),
+                                              kMaxMeasuredUnits);
       max_cell_units = std::max(max_cell_units, units);
       if (max_cell_units >= kMaxMeasuredUnits) {
         break;

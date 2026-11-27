@@ -50,6 +50,8 @@ struct TreeRowOptions {
   huxerui::View leading_icon{};
   std::optional<bool> expanded{};
   huxerui::View trailing_action{};
+  std::function<void()> on_toggle_expand{};
+  huxerui::View badge{};
 };
 
 huxerui::View TreeRow(TreeRowOptions options, std::function<void()> on_click = {});

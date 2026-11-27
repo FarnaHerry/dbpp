@@ -501,6 +501,14 @@ BulkIngestResult ExecuteBulkIngestStream(AdbcSession& session, ArrowArrayStream&
     }
     return result;
   }
+  if (session.read_only) {
+    result.error = ReadOnlyWriteBlockedMessage();
+    if (stream.release != nullptr) {
+      stream.release(&stream);
+      stream = ArrowArrayStream{};
+    }
+    return result;
+  }
 
   detail::AdbcErrorGuard error;
   detail::AdbcStatementGuard stmt;

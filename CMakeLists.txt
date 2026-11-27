@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.4.0 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.4.1 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -128,11 +128,16 @@ set(DBPP_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/connect_dialog.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/connection_dialogs.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/schema_dialogs.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/schema_tables.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/settings_page.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sidebar.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sidebar_groups.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sidebar_tree.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sql_dialogs.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/sql_page.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_browser_page.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_design_page.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_edit_dialog.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/theme.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/tray.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/ui_common.cpp"
@@ -207,14 +212,19 @@ add_library(dbpp_core STATIC
         src/adbc_session_exec.cpp
         src/adbc_arrow.cpp
         src/adbc_metadata.cpp
+        src/adbc_catalog_extras.cpp
         src/adbc_prepared.cpp
         src/adbc_ingest.cpp
+        src/adbc_dump.cpp
+        src/adbc_sql_format.cpp
+        src/adbc_time.cpp
         src/adbc_session_sql.cpp
         src/adbc_session_presets.cpp
         src/driver_installer.cpp
         src/driver_installer_registry.cpp
         src/instance.cpp
         src/db.cpp
+        src/db_edit.cpp
         src/db_async.cpp
         src/db_workspace.cpp
         src/db_profiles_limit.cpp

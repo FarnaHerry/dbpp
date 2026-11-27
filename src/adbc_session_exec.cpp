@@ -254,11 +254,16 @@ AdbcSession::~AdbcSession() {
   ReleaseResourcesBlocking();
 }
 
-AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
+namespace {
+
+AdbcOpenResult OpenAdbcBlockingSingle(const ConnectionRequest& request) {
   AdbcOpenResult result;
   auto session = std::make_shared<AdbcSession>();
   session->request = request;
+  session->remark = request.remark;
   session->read_only = request.read_only;
+  session->production_mode = request.production_mode;
+  session->show_system_databases = request.show_system_databases;
   const Dialect dialect = detail::AdbcDetectDialect(request.driver_path, request.uri);
   if (dialect == Dialect::Redis) {
     const RedisParseUriResult parsed =
@@ -395,12 +400,30 @@ AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
   session->dialect = dialect;
   session->initialized = true;
   if (request.read_only && dialect == Dialect::Sqlite) {
-    (void)ExecuteBlocking(*session, "PRAGMA query_only = ON", false, 0);
+    (void)detail::AdbcExecuteBlockingRaw(*session, "PRAGMA query_only = ON", false, 0);
   }
   session->connection_info = LoadConnectionInfoBlocking(*session);
   session->alive.store(true, std::memory_order_release);
   result.session = std::move(session);
   return result;
+}
+
+} // namespace
+
+AdbcOpenResult OpenAdbcBlocking(const ConnectionRequest& request) {
+  AdbcOpenResult primary = OpenAdbcBlockingSingle(request);
+  if (primary.session || request.fallback_uri.empty() ||
+      request.fallback_uri == request.uri) {
+    return primary;
+  }
+  ConnectionRequest fallback_req = request;
+  fallback_req.uri = request.fallback_uri;
+  fallback_req.fallback_uri.clear();
+  AdbcOpenResult secondary = OpenAdbcBlockingSingle(fallback_req);
+  if (secondary.session) {
+    return secondary;
+  }
+  return primary;
 }
 
 bool ReconnectBlocking(AdbcSession& session, std::string& error_out) {
@@ -488,6 +511,7 @@ AdbcObjectsResult LoadObjectsBlocking(AdbcSession& session) {
   }
   if (result.error.empty()) {
     session.alive.store(true, std::memory_order_release);
+    detail::AdbcEnrichCatalogObjects(session, result);
   }
   return result;
 }
@@ -532,8 +556,10 @@ AdbcSchemaResult LoadSchemaBlocking(AdbcSession& session, const DbObject& object
   return result;
 }
 
-AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want_rows,
-                                std::size_t max_rows) {
+namespace detail {
+
+AdbcQueryResult AdbcExecuteBlockingRaw(AdbcSession& session, std::string sql, bool want_rows,
+                                       std::size_t max_rows) {
   if (session.IsClosed()) {
     AdbcQueryResult result;
     result.connection_lost = true;
@@ -591,6 +617,28 @@ AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want
   }
   result.elapsed_us = elapsed_micros();
   return result;
+}
+
+} // namespace detail
+
+AdbcQueryResult ExecuteBlocking(AdbcSession& session, std::string sql, bool want_rows,
+                                std::size_t max_rows) {
+  if (session.IsClosed()) {
+    AdbcQueryResult result;
+    result.connection_lost = true;
+    result.error = Tr("Connection is closed", "连接已关闭");
+    return result;
+  }
+  if (session.read_only && !IsPureReadQuery(session.dialect, sql)) {
+    AdbcQueryResult result;
+    result.error = ReadOnlyWriteBlockedMessage();
+    return result;
+  }
+  return detail::AdbcExecuteBlockingRaw(session, std::move(sql), want_rows, max_rows);
+}
+
+AdbcQueryResult ExecuteSwitchDatabaseSqlBlocking(AdbcSession& session, std::string sql) {
+  return detail::AdbcExecuteBlockingRaw(session, std::move(sql), false, 0);
 }
 
 bool SetAutocommitBlocking(AdbcSession& session, bool enabled, std::string& error_out) {
