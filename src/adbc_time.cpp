@@ -132,12 +132,15 @@ struct ParsedDateTime {
 };
 
 bool ParseDateTimeInput(std::string_view raw, ParsedDateTime& out) {
+  out = ParsedDateTime{};
   const std::string_view s = detail::AdbcTrimAscii(raw);
   if (s.size() < 16) {
     return false;
   }
-  if (!ParseFixedDigits(s, 0, 4, out.year) || s[4] != '-' ||
-      !ParseFixedDigits(s, 5, 2, out.month) || s[7] != '-' ||
+  const char date_sep = s[4];
+  if ((date_sep != '-' && date_sep != '/') || s[7] != date_sep ||
+      !ParseFixedDigits(s, 0, 4, out.year) ||
+      !ParseFixedDigits(s, 5, 2, out.month) ||
       !ParseFixedDigits(s, 8, 2, out.day)) {
     return false;
   }
@@ -321,6 +324,16 @@ bool IsIntegerColumnType(std::string_view col_type) {
   return lower.find("int") != std::string::npos;
 }
 
+std::string FormatUtcIso(std::int64_t utc_sec, std::int64_t sub_val, int sub_prec) {
+  std::tm utc_tm{};
+  if (!UtcTimeFromEpoch(static_cast<std::time_t>(utc_sec), utc_tm)) {
+    return {};
+  }
+  std::string out = FormatTmDateTime(utc_tm, sub_val, sub_prec, 'T');
+  out.push_back('Z');
+  return out;
+}
+
 std::string FormatUtcLikeOriginal(std::int64_t utc_sec, std::int64_t sub_val, int sub_prec,
                                   std::string_view raw_original) {
   std::tm utc_tm{};
@@ -356,6 +369,148 @@ std::string AdbcFormatLocalTimestamp(std::int64_t value, int time_unit) {
     return formatted;
   }
   return AdbcFormatTimestampTz(value, time_unit, {});
+}
+
+bool AdbcParseTimestampInstant(std::string_view text, bool assume_local_if_naive,
+                               std::int64_t& utc_sec_out, std::int64_t& sub_ns_out) {
+  const std::string_view s = AdbcTrimAscii(text);
+  if (s.empty()) {
+    return false;
+  }
+  ParsedDateTime dt;
+  if (ParseDateTimeInput(s, dt)) {
+    sub_ns_out = RescaleSubSeconds(dt.sub_val, dt.sub_precision, 9);
+    if (dt.has_tz) {
+      if (const auto civil = CivilToUtcEpochSeconds(dt.year, dt.month, dt.day, dt.hour, dt.minute,
+                                                    dt.second)) {
+        utc_sec_out = *civil - dt.tz_offset_seconds;
+        return true;
+      }
+      return false;
+    }
+    if (assume_local_if_naive) {
+      if (const auto local_sec = LocalDateTimeToUtcEpochSeconds(dt)) {
+        utc_sec_out = *local_sec;
+        return true;
+      }
+      return false;
+    }
+    if (const auto civil = CivilToUtcEpochSeconds(dt.year, dt.month, dt.day, dt.hour, dt.minute,
+                                                  dt.second)) {
+      utc_sec_out = *civil;
+      return true;
+    }
+    return false;
+  }
+  if (const auto prec = DetectPlausibleUnixEpochPrecision(s)) {
+    if (const auto iv = AdbcParseInt64(s)) {
+      const std::int64_t scale = ScaleForPrecision(*prec);
+      std::int64_t sec = *iv / scale;
+      std::int64_t rem = *iv % scale;
+      if (rem < 0) {
+        --sec;
+        rem += scale;
+      }
+      utc_sec_out = sec;
+      sub_ns_out = RescaleSubSeconds(rem, *prec, 9);
+      return true;
+    }
+  }
+  const std::size_t dot = s.find('.');
+  if (dot != std::string_view::npos && dot > 0 && dot + 1 < s.size()) {
+    const std::string_view whole = s.substr(0, dot);
+    const std::string_view frac = s.substr(dot + 1);
+    if (IsStrictDigits(frac)) {
+      if (const auto prec = DetectPlausibleUnixEpochPrecision(whole); prec == 0) {
+        if (const auto sec_val = AdbcParseInt64(whole)) {
+          std::int64_t ns = 0;
+          std::size_t digits = 0;
+          for (const char c : frac) {
+            if (digits < 9) {
+              ns = ns * 10 + (c - '0');
+              ++digits;
+            }
+          }
+          while (digits < 9) {
+            ns *= 10;
+            ++digits;
+          }
+          utc_sec_out = *sec_val;
+          sub_ns_out = ns;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool AdbcParseNaiveDateTime(std::string_view text, std::string& formatted_out) {
+  const std::string_view s = AdbcTrimAscii(text);
+  if (s.empty()) {
+    return false;
+  }
+  ParsedDateTime dt;
+  if (ParseDateTimeInput(s, dt)) {
+    if (dt.has_tz) {
+      const auto civil = CivilToUtcEpochSeconds(dt.year, dt.month, dt.day, dt.hour, dt.minute,
+                                                dt.second);
+      if (!civil.has_value()) {
+        return false;
+      }
+      const std::int64_t instant_sec = *civil - dt.tz_offset_seconds;
+      std::tm local_tm{};
+      if (!LocalTimeFromEpoch(static_cast<std::time_t>(instant_sec), local_tm)) {
+        return false;
+      }
+      formatted_out = FormatTmDateTime(local_tm, dt.sub_val, dt.sub_precision, ' ');
+      return true;
+    }
+    std::tm tm_val{};
+    tm_val.tm_year = dt.year - 1900;
+    tm_val.tm_mon = dt.month - 1;
+    tm_val.tm_mday = dt.day;
+    tm_val.tm_hour = dt.hour;
+    tm_val.tm_min = dt.minute;
+    tm_val.tm_sec = dt.second;
+    formatted_out = FormatTmDateTime(tm_val, dt.sub_val, dt.sub_precision, ' ');
+    return true;
+  }
+  if (const auto prec = DetectPlausibleUnixEpochPrecision(s)) {
+    if (const auto iv = AdbcParseInt64(s)) {
+      formatted_out = FormatLocalEpoch(*iv, *prec);
+      return !formatted_out.empty();
+    }
+  }
+  return false;
+}
+
+bool AdbcParseDateDays(std::string_view text, std::int32_t& days_since_epoch_out) {
+  const std::string_view s = AdbcTrimAscii(text);
+  if (s.size() < 10) {
+    return false;
+  }
+  const char sep = s[4];
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  if ((sep != '-' && sep != '/') || s[7] != sep ||
+      !ParseFixedDigits(s, 0, 4, year) ||
+      !ParseFixedDigits(s, 5, 2, month) ||
+      !ParseFixedDigits(s, 8, 2, day)) {
+    return false;
+  }
+  if (s.size() > 10 && s[10] != ' ' && s[10] != 'T' && s[10] != 't') {
+    return false;
+  }
+  const auto ymd = std::chrono::year{year} / std::chrono::month{static_cast<unsigned>(month)} /
+                   std::chrono::day{static_cast<unsigned>(day)};
+  if (!ymd.ok()) {
+    return false;
+  }
+  days_since_epoch_out =
+      static_cast<std::int32_t>(std::chrono::sys_days{ymd}.time_since_epoch().count());
+  return true;
 }
 
 } // namespace detail
@@ -412,10 +567,56 @@ std::optional<std::string> LocalizeTimestampValue(std::string_view raw_value,
 
 std::string NormalizeTimestampForWrite(std::string_view input, std::string_view raw_original,
                                          std::string_view column_name,
-                                         std::string_view column_type) {
+                                         std::string_view column_type, Dialect dialect) {
   const std::string_view trimmed = detail::AdbcTrimAscii(input);
   if (trimmed.empty() || detail::AdbcEqualsIgnoreCase(trimmed, "NULL")) {
-    return std::string(input);
+    return std::string(trimmed);
+  }
+
+  const std::string t_lower = detail::AdbcLowerAscii(column_type);
+  const bool is_int_type = IsIntegerColumnType(column_type);
+  const bool is_date_only = !is_int_type && t_lower.find("date") != std::string::npos &&
+                            t_lower.find("datetime") == std::string::npos &&
+                            t_lower.find("timestamp") == std::string::npos;
+  const bool is_time_only = !is_int_type && t_lower.find("time") != std::string::npos &&
+                            t_lower.find("timestamp") == std::string::npos &&
+                            t_lower.find("datetime") == std::string::npos &&
+                            t_lower.find("date") == std::string::npos;
+
+  if (is_date_only) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      std::tm local_tm{};
+      if (LocalTimeFromEpoch(static_cast<std::time_t>(now_sec), local_tm)) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", local_tm.tm_year + 1900,
+                      local_tm.tm_mon + 1, local_tm.tm_mday);
+        return std::string(buf);
+      }
+    }
+    std::int32_t days = 0;
+    if (detail::AdbcParseDateDays(trimmed, days)) {
+      return detail::AdbcFormatDate(std::chrono::sys_days{std::chrono::days{days}});
+    }
+    return std::string(trimmed);
+  }
+
+  if (is_time_only) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      std::tm local_tm{};
+      if (LocalTimeFromEpoch(static_cast<std::time_t>(now_sec), local_tm)) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", local_tm.tm_hour, local_tm.tm_min,
+                      local_tm.tm_sec);
+        return std::string(buf);
+      }
+    }
+    return std::string(trimmed);
   }
 
   const bool hint = IsTimestampColumnHint(column_name, column_type);
@@ -423,57 +624,92 @@ std::string NormalizeTimestampForWrite(std::string_view input, std::string_view 
   const std::optional<int> target_epoch_prec =
       orig_epoch_prec.has_value()
           ? orig_epoch_prec
-          : ((hint && IsIntegerColumnType(column_type)) ? std::optional<int>{0} : std::nullopt);
+          : ((hint && is_int_type) ? std::optional<int>{0} : std::nullopt);
 
-  ParsedDateTime orig_dt;
-  const bool orig_is_zoned_iso =
-      (ParseDateTimeInput(raw_original, orig_dt) && orig_dt.has_tz) ||
-      IsIsoZonedColumnType(column_type);
-
-  if (detail::AdbcEqualsIgnoreCase(trimmed, "now") &&
-      (target_epoch_prec.has_value() || orig_is_zoned_iso || hint)) {
-    const auto now = std::chrono::system_clock::now();
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
-    const std::int64_t sec = std::chrono::duration_cast<std::chrono::seconds>(ns).count();
-    if (target_epoch_prec.has_value()) {
+  if (target_epoch_prec.has_value()) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now = std::chrono::system_clock::now();
+      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
+      const std::int64_t sec = std::chrono::duration_cast<std::chrono::seconds>(ns).count();
       const std::int64_t sub =
           RescaleSubSeconds((ns % std::chrono::seconds{1}).count(), 9, *target_epoch_prec);
       return std::to_string(sec * ScaleForPrecision(*target_epoch_prec) + sub);
     }
-    if (orig_is_zoned_iso) {
-      return FormatUtcLikeOriginal(sec, 0, 0, raw_original);
-    }
-    std::tm local_tm{};
-    if (LocalTimeFromEpoch(static_cast<std::time_t>(sec), local_tm)) {
-      return FormatTmDateTime(local_tm, 0, 0, ' ');
-    }
-  }
-
-  if (target_epoch_prec.has_value()) {
     if (IsStrictDigits(trimmed)) {
       return std::string(trimmed);
     }
-    ParsedDateTime dt;
-    if (ParseDateTimeInput(trimmed, dt)) {
-      std::optional<std::int64_t> utc_sec;
-      if (dt.has_tz) {
-        if (const auto civil = CivilToUtcEpochSeconds(dt.year, dt.month, dt.day, dt.hour,
-                                                      dt.minute, dt.second)) {
-          utc_sec = *civil - dt.tz_offset_seconds;
-        }
-      } else {
-        utc_sec = LocalDateTimeToUtcEpochSeconds(dt);
-      }
-      if (utc_sec.has_value()) {
-        const std::int64_t sub =
-            RescaleSubSeconds(dt.sub_val, dt.sub_precision, *target_epoch_prec);
-        return std::to_string(*utc_sec * ScaleForPrecision(*target_epoch_prec) + sub);
-      }
+    std::int64_t utc_sec = 0;
+    std::int64_t sub_ns = 0;
+    if (detail::AdbcParseTimestampInstant(trimmed, /*assume_local_if_naive=*/true, utc_sec,
+                                          sub_ns)) {
+      const std::int64_t sub = RescaleSubSeconds(sub_ns, 9, *target_epoch_prec);
+      return std::to_string(utc_sec * ScaleForPrecision(*target_epoch_prec) + sub);
     }
     return std::string(input);
   }
 
-  if (orig_is_zoned_iso) {
+  const bool is_mysql_datetime =
+      (dialect == Dialect::Mysql) && t_lower.find("datetime") != std::string::npos;
+  const bool is_mysql_timestamp = (dialect == Dialect::Mysql) &&
+                                  t_lower.find("timestamp") != std::string::npos &&
+                                  t_lower.find("datetime") == std::string::npos;
+  const bool is_zoned_sql_type = is_mysql_timestamp || IsIsoZonedColumnType(column_type);
+  const bool is_naive_sql_datetime =
+      is_mysql_datetime ||
+      (!is_zoned_sql_type && !is_int_type &&
+       (t_lower.find("datetime") != std::string::npos ||
+        t_lower.find("timestamp") != std::string::npos));
+
+  if (is_mysql_datetime) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      std::tm local_tm{};
+      if (LocalTimeFromEpoch(static_cast<std::time_t>(now_sec), local_tm)) {
+        return FormatTmDateTime(local_tm, 0, 0, ' ');
+      }
+    }
+    std::string formatted;
+    if (detail::AdbcParseNaiveDateTime(trimmed, formatted)) {
+      return formatted;
+    }
+    return std::string(trimmed);
+  }
+
+  if (is_zoned_sql_type) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      const std::string iso = FormatUtcIso(now_sec, 0, 0);
+      if (!iso.empty()) {
+        return iso;
+      }
+    }
+    std::int64_t utc_sec = 0;
+    std::int64_t sub_ns = 0;
+    if (detail::AdbcParseTimestampInstant(trimmed, /*assume_local_if_naive=*/true, utc_sec,
+                                          sub_ns)) {
+      const int frac_prec = sub_ns > 0 ? 9 : 0;
+      const std::string iso = FormatUtcIso(utc_sec, sub_ns, frac_prec);
+      if (!iso.empty()) {
+        return iso;
+      }
+    }
+    return std::string(trimmed);
+  }
+
+  ParsedDateTime orig_dt;
+  const bool orig_is_zoned_iso =
+      ParseDateTimeInput(raw_original, orig_dt) && orig_dt.has_tz;
+  if (orig_is_zoned_iso && (dialect == Dialect::Sqlite || dialect == Dialect::Generic)) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      return FormatUtcLikeOriginal(now_sec, 0, 0, raw_original);
+    }
     ParsedDateTime dt;
     if (ParseDateTimeInput(trimmed, dt)) {
       if (dt.has_tz) {
@@ -488,6 +724,23 @@ std::string NormalizeTimestampForWrite(std::string_view input, std::string_view 
       }
     }
   }
+
+  if (is_naive_sql_datetime) {
+    if (detail::AdbcEqualsIgnoreCase(trimmed, "now")) {
+      const auto now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      std::tm local_tm{};
+      if (LocalTimeFromEpoch(static_cast<std::time_t>(now_sec), local_tm)) {
+        return FormatTmDateTime(local_tm, 0, 0, ' ');
+      }
+    }
+    std::string formatted;
+    if (detail::AdbcParseNaiveDateTime(trimmed, formatted)) {
+      return formatted;
+    }
+  }
+
   return std::string(input);
 }
 

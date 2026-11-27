@@ -5,6 +5,7 @@ module;
 
 #include <cerrno>
 #include <cstdlib>
+#include <limits>
 
 module dbpp.adbc;
 
@@ -81,6 +82,28 @@ ArrowType InferParamArrowType(const PreparedParamValue& param, std::string_view 
             return NANOARROW_TYPE_BINARY;
           }
           break;
+        case NANOARROW_TYPE_TIMESTAMP: {
+          if (param.is_null) {
+            return NANOARROW_TYPE_TIMESTAMP;
+          }
+          const bool zoned = view.timezone != nullptr && view.timezone[0] != '\0';
+          std::int64_t utc_sec = 0;
+          std::int64_t sub_ns = 0;
+          if (detail::AdbcParseTimestampInstant(param.text, zoned, utc_sec, sub_ns)) {
+            return NANOARROW_TYPE_TIMESTAMP;
+          }
+          break;
+        }
+        case NANOARROW_TYPE_DATE32: {
+          if (param.is_null) {
+            return NANOARROW_TYPE_DATE32;
+          }
+          std::int32_t days = 0;
+          if (detail::AdbcParseDateDays(param.text, days)) {
+            return NANOARROW_TYPE_DATE32;
+          }
+          break;
+        }
         default:
           break;
       }
@@ -127,6 +150,8 @@ bool BuildParameterBatch(const std::vector<PreparedParamValue>& params,
   }
 
   std::vector<ArrowType> col_types(n, NANOARROW_TYPE_STRING);
+  std::vector<ArrowTimeUnit> col_time_units(n, NANOARROW_TIME_UNIT_MICRO);
+  std::vector<const char*> col_timezones(n, nullptr);
   for (std::size_t i = 0; i < n; ++i) {
     const ArrowSchema* hint_field =
         (hint_schema != nullptr && static_cast<std::int64_t>(i) < hint_schema->n_children)
@@ -135,13 +160,28 @@ bool BuildParameterBatch(const std::vector<PreparedParamValue>& params,
     const std::string_view decl =
         i < declared_types.size() ? std::string_view(declared_types[i]) : std::string_view{};
     col_types[i] = InferParamArrowType(params[i], decl, hint_field);
+    if (hint_field != nullptr) {
+      ArrowSchemaView hv{};
+      ArrowError hae;
+      ArrowErrorInit(&hae);
+      if (ArrowSchemaViewInit(&hv, hint_field, &hae) == NANOARROW_OK &&
+          hv.type == NANOARROW_TYPE_TIMESTAMP) {
+        col_time_units[i] = hv.time_unit;
+        col_timezones[i] = hv.timezone;
+      }
+    }
 
     std::string param_name = "p" + std::to_string(i + 1);
     if (hint_field != nullptr && hint_field->name != nullptr && *hint_field->name != '\0') {
       param_name = hint_field->name;
     }
     ArrowSchema* child = schema_out.children[i];
-    if (ArrowSchemaSetType(child, col_types[i]) != NANOARROW_OK ||
+    const ArrowErrorCode type_rc =
+        col_types[i] == NANOARROW_TYPE_TIMESTAMP
+            ? ArrowSchemaSetTypeDateTime(child, NANOARROW_TYPE_TIMESTAMP, col_time_units[i],
+                                         col_timezones[i])
+            : ArrowSchemaSetType(child, col_types[i]);
+    if (type_rc != NANOARROW_OK ||
         ArrowSchemaSetName(child, param_name.c_str()) != NANOARROW_OK) {
       schema_out.release(&schema_out);
       schema_out = ArrowSchema{};
@@ -188,6 +228,49 @@ bool BuildParameterBatch(const std::vector<PreparedParamValue>& params,
       case NANOARROW_TYPE_DOUBLE: {
         const auto dv = detail::AdbcParseDouble(params[i].text);
         rc = ArrowArrayAppendDouble(child, dv.value_or(0.0));
+        break;
+      }
+      case NANOARROW_TYPE_TIMESTAMP: {
+        const bool zoned = col_timezones[i] != nullptr && col_timezones[i][0] != '\0';
+        std::int64_t utc_sec = 0;
+        std::int64_t sub_ns = 0;
+        if (!detail::AdbcParseTimestampInstant(params[i].text, zoned, utc_sec, sub_ns)) {
+          rc = EINVAL;
+          break;
+        }
+        std::int64_t ticks = utc_sec;
+        auto scale_ticks = [&](std::int64_t mul, std::int64_t div) -> bool {
+          if (utc_sec > std::numeric_limits<std::int64_t>::max() / mul - 1 ||
+              utc_sec < std::numeric_limits<std::int64_t>::min() / mul + 1) {
+            return false;
+          }
+          ticks = utc_sec * mul + sub_ns / div;
+          return true;
+        };
+        bool ok = true;
+        switch (col_time_units[i]) {
+          case NANOARROW_TIME_UNIT_SECOND:
+            break;
+          case NANOARROW_TIME_UNIT_MILLI:
+            ok = scale_ticks(1'000LL, 1'000'000LL);
+            break;
+          case NANOARROW_TIME_UNIT_MICRO:
+            ok = scale_ticks(1'000'000LL, 1'000LL);
+            break;
+          case NANOARROW_TIME_UNIT_NANO:
+            ok = scale_ticks(1'000'000'000LL, 1LL);
+            break;
+        }
+        rc = ok ? ArrowArrayAppendInt(child, ticks) : EOVERFLOW;
+        break;
+      }
+      case NANOARROW_TYPE_DATE32: {
+        std::int32_t days = 0;
+        if (!detail::AdbcParseDateDays(params[i].text, days)) {
+          rc = EINVAL;
+          break;
+        }
+        rc = ArrowArrayAppendInt(child, days);
         break;
       }
       case NANOARROW_TYPE_BINARY: {

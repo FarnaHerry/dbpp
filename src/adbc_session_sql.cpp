@@ -3,6 +3,7 @@ module;
 #include <huxerui/datatable.h>
 
 #include <cerrno>
+#include <cstdio>
 
 module dbpp.adbc;
 
@@ -264,10 +265,102 @@ std::string SqlLiteral(Dialect dialect, std::string_view text, std::string_view 
   if (IsNumericType(declared_type) && IsValidNumber(text)) {
     return std::string(text);
   }
+
+  std::string adjusted_text;
+  std::string_view value_to_quote = text;
+  const std::string lower_type = detail::AdbcLowerAscii(declared_type);
+  const bool is_int_type = lower_type.find("int") != std::string::npos;
+  if (!is_int_type) {
+    if (dialect == Dialect::Mysql) {
+      if (lower_type.find("timestamp") != std::string::npos &&
+          lower_type.find("datetime") == std::string::npos) {
+        std::int64_t utc_sec = 0;
+        std::int64_t sub_ns = 0;
+        if (detail::AdbcParseTimestampInstant(text, /*assume_local_if_naive=*/true, utc_sec,
+                                              sub_ns)) {
+          if (utc_sec >= 0) {
+            std::string out = "FROM_UNIXTIME(" + std::to_string(utc_sec);
+            const std::int64_t sub_us = sub_ns / 1000;
+            if (sub_us > 0) {
+              char frac_buf[32];
+              std::snprintf(frac_buf, sizeof(frac_buf), "%06lld",
+                            static_cast<long long>(sub_us));
+              std::string_view frac(frac_buf);
+              while (!frac.empty() && frac.back() == '0') {
+                frac.remove_suffix(1);
+              }
+              if (!frac.empty()) {
+                out.push_back('.');
+                out.append(frac);
+              }
+            }
+            out.push_back(')');
+            return out;
+          }
+          if (detail::AdbcParseNaiveDateTime(text, adjusted_text)) {
+            value_to_quote = adjusted_text;
+          }
+        }
+      } else if (lower_type.find("datetime") != std::string::npos) {
+        if (detail::AdbcParseNaiveDateTime(text, adjusted_text)) {
+          value_to_quote = adjusted_text;
+        }
+      } else if (lower_type.find("date") != std::string::npos) {
+        std::int32_t days = 0;
+        if (detail::AdbcParseDateDays(text, days)) {
+          adjusted_text = detail::AdbcFormatDate(std::chrono::sys_days{std::chrono::days{days}});
+          value_to_quote = adjusted_text;
+        }
+      }
+    } else if (dialect == Dialect::Postgresql || dialect == Dialect::Duckdb) {
+      const bool is_tz = lower_type.find("timestamptz") != std::string::npos ||
+                         lower_type.find("with time zone") != std::string::npos ||
+                         lower_type.find("with local time zone") != std::string::npos;
+      if (is_tz) {
+        std::int64_t utc_sec = 0;
+        std::int64_t sub_ns = 0;
+        if (detail::AdbcParseTimestampInstant(text, /*assume_local_if_naive=*/true, utc_sec,
+                                              sub_ns)) {
+          const auto tp = std::chrono::sys_seconds{std::chrono::seconds{utc_sec}};
+          const auto days = std::chrono::floor<std::chrono::days>(tp);
+          adjusted_text = detail::AdbcFormatDate(days) + "T" +
+                          detail::AdbcFormatTime(
+                              std::chrono::floor<std::chrono::seconds>(tp) - days);
+          if (sub_ns > 0) {
+            char frac_buf[32];
+            std::snprintf(frac_buf, sizeof(frac_buf), "%09lld",
+                          static_cast<long long>(sub_ns));
+            std::string_view frac(frac_buf);
+            while (!frac.empty() && frac.back() == '0') {
+              frac.remove_suffix(1);
+            }
+            if (!frac.empty()) {
+              adjusted_text.push_back('.');
+              adjusted_text.append(frac);
+            }
+          }
+          adjusted_text.push_back('Z');
+          value_to_quote = adjusted_text;
+        }
+      } else if (lower_type.find("timestamp") != std::string::npos ||
+                 lower_type.find("datetime") != std::string::npos) {
+        if (detail::AdbcParseNaiveDateTime(text, adjusted_text)) {
+          value_to_quote = adjusted_text;
+        }
+      } else if (lower_type.find("date") != std::string::npos) {
+        std::int32_t days = 0;
+        if (detail::AdbcParseDateDays(text, days)) {
+          adjusted_text = detail::AdbcFormatDate(std::chrono::sys_days{std::chrono::days{days}});
+          value_to_quote = adjusted_text;
+        }
+      }
+    }
+  }
+
   std::string result;
-  result.reserve(text.size() + 2);
+  result.reserve(value_to_quote.size() + 2);
   result.push_back('\'');
-  for (const char c : text) {
+  for (const char c : value_to_quote) {
     if (dialect == Dialect::Mysql && c == '\\') {
       result.push_back('\\');
     }

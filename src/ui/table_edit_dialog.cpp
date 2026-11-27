@@ -659,8 +659,16 @@ void HandleTableEditSubmitted(
           if (cur_tab->table.columns[ci].name == edit.cell_id.column_id) {
             const CellValue& cv = cur_tab->table.snapshot->rows[ridx].values[ci];
             const ColumnMeta& cm = cur_tab->table.columns[ci];
-            const std::string norm =
-                NormalizeTimestampForWrite(edit.text, cv.text, cm.name, cm.type);
+            Dialect dialect = Dialect::Generic;
+            for (const auto& s : app.Get().sessions) {
+              if (s.id == cur_tab->session_id && s.session) {
+                dialect = s.session->dialect;
+                break;
+              }
+            }
+            const std::string norm = NormalizeTimestampForWrite(
+                edit.text, cv.is_null ? std::string_view{} : std::string_view(cv.text), cm.name,
+                cm.type, dialect);
             if ((!cv.is_null && cv.text == norm) || (cv.is_null && norm == "NULL")) {
               changed = false;
             }

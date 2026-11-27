@@ -334,8 +334,9 @@ void RequestSaveCell(const State<AppModel>& app, const State<WorkspaceModel>& wo
   }
   const CellValue& current = table_value.snapshot->rows[row_index].values[column_index];
   const ColumnMeta& target_col = table_value.columns[column_index];
-  const std::string normalized_text =
-      NormalizeTimestampForWrite(edit.text, current.text, target_col.name, target_col.type);
+  const std::string normalized_text = NormalizeTimestampForWrite(
+      edit.text, current.is_null ? std::string_view{} : std::string_view(current.text),
+      target_col.name, target_col.type, session->session->dialect);
   if (!current.is_null && current.text == normalized_text) {
     return;
   }
@@ -464,8 +465,8 @@ void RequestCommitPendingInserts(const State<AppModel>& app,
          col_idx < row.values.size() && col_idx < table_copy.columns.size(); ++col_idx) {
       if (!row.values[col_idx].empty()) {
         const ColumnMeta& col = table_copy.columns[col_idx];
-        row.values[col_idx] =
-            NormalizeTimestampForWrite(row.values[col_idx], {}, col.name, col.type);
+        row.values[col_idx] = NormalizeTimestampForWrite(
+            row.values[col_idx], {}, col.name, col.type, adbc->dialect);
       }
     }
   }

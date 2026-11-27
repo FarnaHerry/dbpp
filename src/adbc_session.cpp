@@ -788,7 +788,8 @@ std::string AdbcFormatTimestampTz(std::int64_t value, int time_unit, std::string
   }
   const auto time = std::chrono::sys_seconds{std::chrono::seconds{sec_val}};
   const auto days = std::chrono::floor<std::chrono::days>(time);
-  std::string out = FormatDate(days) + " " +
+  const bool zoned = !tz.empty();
+  std::string out = FormatDate(days) + (zoned ? "T" : " ") +
                     FormatTime(std::chrono::floor<std::chrono::seconds>(time) - days);
   if (width > 0 && sub_val > 0) {
     char frac_buf[32];
@@ -802,9 +803,8 @@ std::string AdbcFormatTimestampTz(std::int64_t value, int time_unit, std::string
       out.append(frac);
     }
   }
-  if (!tz.empty()) {
-    out.push_back(' ');
-    out.append(tz);
+  if (zoned) {
+    out.push_back('Z');
   }
   return out;
 }

@@ -727,6 +727,94 @@ void RunAdbcCapabilitiesTests(const fs::path& dir, const std::string& driver_pat
     Expect(view_id.kind == dbpp::RowLocatorKind::None,
            "View must resolve RowLocatorKind::None");
   }
+
+  // 19. Dialect-aware timestamp/datetime/date/time write normalization & SqlLiteral
+  {
+    const std::string mysql_ts_epoch = dbpp::NormalizeTimestampForWrite(
+        "1704067200", "", "created_at", "timestamp", dbpp::Dialect::Mysql);
+    Expect(mysql_ts_epoch == "2024-01-01T00:00:00Z",
+           "MySQL TIMESTAMP from epoch mismatch: " + mysql_ts_epoch);
+
+    const std::string mysql_ts_from_legacy_utc = dbpp::NormalizeTimestampForWrite(
+        "2024-01-01T00:00:00Z", "2024-01-01 00:00:00 UTC", "created_at", "timestamp",
+        dbpp::Dialect::Mysql);
+    Expect(mysql_ts_from_legacy_utc == "2024-01-01T00:00:00Z",
+           "MySQL TIMESTAMP must normalize to ISO UTC without trailing UTC label: " +
+               mysql_ts_from_legacy_utc);
+
+    const std::string mysql_ts_local = dbpp::NormalizeTimestampForWrite(
+        "2024-01-01 08:00:00", "", "created_at", "timestamp", dbpp::Dialect::Mysql);
+    const auto back_local =
+        dbpp::LocalizeTimestampValue(mysql_ts_local, "created_at", "timestamp");
+    Expect(back_local.has_value() && *back_local == "2024-01-01 08:00:00",
+           "MySQL TIMESTAMP local round-trip mismatch: " + mysql_ts_local);
+
+    const std::string mysql_ts_now = dbpp::NormalizeTimestampForWrite(
+        "now", "", "created_at", "timestamp", dbpp::Dialect::Mysql);
+    Expect(mysql_ts_now.size() >= 20 && mysql_ts_now.back() == 'Z' &&
+               mysql_ts_now.find('T') == 10,
+           "MySQL TIMESTAMP 'now' must produce ISO-8601 UTC: " + mysql_ts_now);
+
+    const std::string mysql_dt_local = dbpp::NormalizeTimestampForWrite(
+        "2024-01-01 08:30:00", "", "dt", "datetime", dbpp::Dialect::Mysql);
+    Expect(mysql_dt_local == "2024-01-01 08:30:00",
+           "MySQL DATETIME must preserve wall-clock time without UTC shift: " + mysql_dt_local);
+
+    const std::string mysql_dt_slash = dbpp::NormalizeTimestampForWrite(
+        "2024/01/02 09:15:30", "", "dt", "datetime", dbpp::Dialect::Mysql);
+    Expect(mysql_dt_slash == "2024-01-02 09:15:30",
+           "MySQL DATETIME slash normalization mismatch: " + mysql_dt_slash);
+
+    const std::string mysql_dt_t_hm = dbpp::NormalizeTimestampForWrite(
+        "2024-01-02T09:15", "", "dt", "datetime(3)", dbpp::Dialect::Mysql);
+    Expect(mysql_dt_t_hm == "2024-01-02 09:15:00",
+           "MySQL DATETIME T/HM normalization mismatch: " + mysql_dt_t_hm);
+
+    const std::string mysql_dt_now = dbpp::NormalizeTimestampForWrite(
+        "now", "", "dt", "datetime", dbpp::Dialect::Mysql);
+    Expect(mysql_dt_now.size() == 19 && mysql_dt_now[10] == ' ' && mysql_dt_now.back() != 'Z',
+           "MySQL DATETIME 'now' must produce naive wall-clock datetime: " + mysql_dt_now);
+
+    const std::string mysql_date_slash = dbpp::NormalizeTimestampForWrite(
+        "2024/02/29", "", "d", "date", dbpp::Dialect::Mysql);
+    Expect(mysql_date_slash == "2024-02-29",
+           "DATE slash normalization mismatch: " + mysql_date_slash);
+
+    const std::string mysql_date_now = dbpp::NormalizeTimestampForWrite(
+        "now", "", "d", "date", dbpp::Dialect::Mysql);
+    Expect(mysql_date_now.size() == 10 && mysql_date_now[4] == '-' && mysql_date_now[7] == '-',
+           "DATE 'now' mismatch: " + mysql_date_now);
+
+    const std::string mysql_time_now = dbpp::NormalizeTimestampForWrite(
+        "now", "", "t", "time", dbpp::Dialect::Mysql);
+    Expect(mysql_time_now.size() == 8 && mysql_time_now[2] == ':' && mysql_time_now[5] == ':',
+           "TIME 'now' mismatch: " + mysql_time_now);
+
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Mysql, "2024-01-01T00:00:00Z", "timestamp", false) ==
+               "FROM_UNIXTIME(1704067200)",
+           "MySQL TIMESTAMP SqlLiteral must emit FROM_UNIXTIME");
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Mysql, "2024-01-01T00:00:00.123456Z", "timestamp(6)",
+                            false) == "FROM_UNIXTIME(1704067200.123456)",
+           "MySQL TIMESTAMP fractional SqlLiteral mismatch");
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Mysql, "2024-01-01T00:00:00.005Z", "timestamp(3)",
+                            false) == "FROM_UNIXTIME(1704067200.005)",
+           "MySQL TIMESTAMP leading-zero fractional SqlLiteral mismatch");
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Mysql, "2024-01-01 08:00:00", "datetime", false) ==
+               "'2024-01-01 08:00:00'",
+           "MySQL DATETIME SqlLiteral mismatch");
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Mysql, "2024/01/02", "date", false) == "'2024-01-02'",
+           "MySQL DATE SqlLiteral mismatch");
+
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Postgresql, "2024-01-01 00:00:00 UTC", "timestamptz",
+                            false) == "'2024-01-01T00:00:00Z'",
+           "PostgreSQL TIMESTAMPTZ SqlLiteral mismatch");
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Postgresql, "2024-01-01 08:00:00", "timestamp",
+                            false) == "'2024-01-01 08:00:00'",
+           "PostgreSQL TIMESTAMP SqlLiteral mismatch");
+    Expect(dbpp::SqlLiteral(dbpp::Dialect::Postgresql, "2024/01/02", "date", false) ==
+               "'2024-01-02'",
+           "PostgreSQL DATE SqlLiteral mismatch");
+  }
 }
 
 } // namespace dbpp_test

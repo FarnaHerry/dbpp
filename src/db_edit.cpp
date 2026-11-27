@@ -46,6 +46,31 @@ bool IsCellNullInput(const ColumnMeta& column, std::string_view text) {
   return column.nullable || !IsTextualColumnType(column.type);
 }
 
+bool ShouldBypassPreparedForTemporal(Dialect dialect,
+                                     const std::vector<PreparedParamValue>& params,
+                                     const std::vector<std::string>& param_types) {
+  if (dialect != Dialect::Mysql) {
+    return false;
+  }
+  const std::size_t count = std::min(params.size(), param_types.size());
+  for (std::size_t i = 0; i < count; ++i) {
+    if (params[i].is_null) {
+      continue;
+    }
+    const std::string lower = detail::DbLowerAscii(param_types[i]);
+    if (lower.find("int") != std::string::npos) {
+      continue;
+    }
+    if (lower.find("timestamp") != std::string::npos ||
+        lower.find("datetime") != std::string::npos ||
+        lower.find("date") != std::string::npos ||
+        lower.find("time") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ShouldReportPreparedErrorDirectly(int prep_status, const AdbcQueryResult& prep_res) {
   if (prep_res.connection_lost || IsConnectionLostError(prep_status, prep_res.error, prep_res.sqlstate)) {
     return true;
@@ -167,7 +192,8 @@ AdbcQueryResult UpdateRowInternal(AdbcSession& session, const TableModel& model,
 
   std::string param_where;
   if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
-                              next_idx)) {
+                              next_idx) &&
+      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
     const std::string param_sql = "UPDATE " + model.qualified_name + " SET " + param_set +
                                   " WHERE " + param_where + limit_suffix;
     int prep_status = 0;
@@ -236,7 +262,8 @@ AdbcQueryResult InsertRowBlocking(AdbcSession& session, const TableModel& model,
         SqlLiteral(session.dialect, values[index], model.columns[index].type, is_null);
   }
 
-  if (!columns.empty()) {
+  if (!columns.empty() &&
+      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
     const std::string param_sql = "INSERT INTO " + model.qualified_name + " (" + columns +
                                   ") VALUES (" + param_placeholders + ")";
     int prep_status = 0;
@@ -387,7 +414,8 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
   std::vector<std::string> param_types;
   std::string param_where;
   if (BuildParameterizedWhere(session.dialect, model, row, param_where, params, param_types,
-                              next_idx)) {
+                              next_idx) &&
+      !ShouldBypassPreparedForTemporal(session.dialect, params, param_types)) {
     const std::string param_sql =
         "DELETE FROM " + model.qualified_name + " WHERE " + param_where + limit_suffix;
     int prep_status = 0;

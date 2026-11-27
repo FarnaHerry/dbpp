@@ -274,7 +274,8 @@ SqlScriptImportResult ImportSqlScriptPathBlocking(AdbcSession& session,
     std::string_view column_type = {});
 [[nodiscard]] std::string NormalizeTimestampForWrite(
     std::string_view input, std::string_view raw_original = {},
-    std::string_view column_name = {}, std::string_view column_type = {});
+    std::string_view column_name = {}, std::string_view column_type = {},
+    Dialect dialect = Dialect::Generic);
 void ApplyResultTimestampLocalization(const std::vector<std::string>& columns,
                                       const std::vector<ColumnMeta>* meta,
                                       std::vector<GridRow>& rows);
@@ -343,6 +344,10 @@ void AdbcReleaseNativeHandles(AdbcSession& session) noexcept;
 std::string AdbcFormatTimestampTz(std::int64_t value, int time_unit, std::string_view tz);
 std::string AdbcFormatLocalTimestamp(std::int64_t value, int time_unit);
 std::string AdbcFormatTimeUnit(std::int64_t value, int time_unit);
+bool AdbcParseTimestampInstant(std::string_view text, bool assume_local_if_naive,
+                               std::int64_t& utc_sec_out, std::int64_t& sub_ns_out);
+bool AdbcParseNaiveDateTime(std::string_view text, std::string& formatted_out);
+bool AdbcParseDateDays(std::string_view text, std::int32_t& days_since_epoch_out);
 bool AdbcConsumeStreamRows(ArrowArrayStream& stream, std::size_t max_rows,
                            AdbcSession* cancel_session, AdbcQueryResult& out);
 void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObject* hint_object,
