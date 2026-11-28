@@ -279,18 +279,16 @@
     }
 
     .copyable {
-      display: flex;
-      align-items: start;
-      gap: 0.5rem;
+      position: relative;
+      display: block;
       margin: 0.65rem 0;
       min-width: 0;
       max-width: 100%;
     }
 
     .copyable pre {
-      flex: 1 1 auto;
-      min-width: 0;
       margin: 0;
+      padding-inline-end: 3.25rem;
     }
 
     pre {
@@ -315,8 +313,10 @@
     }
 
     .copy {
-      position: relative;
-      flex: none;
+      position: absolute;
+      inset-block-start: 0.45rem;
+      inset-inline-end: 0.45rem;
+      z-index: 2;
       display: inline-flex;
       align-items: center;
     }
@@ -330,9 +330,19 @@
       padding: 4px;
       border-radius: 6px;
       border: 1px solid var(--code-border);
-      background: #1b222c;
+      background: rgba(27, 34, 44, 0.94);
       color: #e6edf3;
       cursor: pointer;
+      opacity: 0.9;
+      transition: opacity 0.15s ease;
+    }
+
+    .copyable:hover .copy-button,
+    .copyable:focus-within .copy-button,
+    .copyable .copy-button:focus-visible,
+    .copyable .copy-button[data-copied],
+    .copyable .copy-button[data-failed] {
+      opacity: 1;
     }
 
     .copy-button .icon-check { display: none; }
@@ -362,38 +372,13 @@
       opacity: 1;
     }
 
-    @media (hover: hover) {
-      .copyable {
-        display: block;
-        position: relative;
-      }
-      .copyable pre {
-        padding-inline-end: 3rem;
-      }
-      .copyable .copy {
-        position: absolute;
-        inset-block-start: 0.5rem;
-        inset-inline-end: 0.5rem;
-      }
-      .copyable .copy-button {
-        opacity: 0.85;
-        transition: opacity 0.15s ease;
-      }
-      .copyable:hover .copy-button,
-      .copyable:focus-within .copy-button,
-      .copyable .copy-button:focus-visible,
-      .copyable .copy-button[data-copied],
-      .copyable .copy-button[data-failed] {
-        opacity: 1;
-      }
-    }
-
     @media (max-width: 640px) {
       .wrap { padding: 1rem 0.9rem 2.5rem; }
       .hero { padding: 1.35rem 0 1rem; }
       [role="tab"] { padding: 0.7rem 0.75rem; font-size: 0.86rem; }
       .panel-card { padding: 0.9rem 0.95rem 1rem; }
       pre { padding: 0.75rem 0.85rem; font-size: 0.8rem; }
+      .copyable pre { padding-inline-end: 3rem; }
       .grid { grid-template-columns: minmax(0, 1fr); }
     }
 
