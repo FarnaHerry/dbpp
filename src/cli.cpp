@@ -13,7 +13,7 @@ module;
 #endif
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.9"
+#define DBPP_VERSION "0.4.10"
 #endif
 
 #include <cstdlib>

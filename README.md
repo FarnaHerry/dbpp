@@ -42,8 +42,8 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/FarnaHerry/dbpp/re
 ```
 
 常用环境变量 / 参数：
-- 指定版本：`DBPP_VERSION=0.4.9`（或传 `--version 0.4.9` / `-Version 0.4.9`）
-- 镜像/代理前缀：`DBPP_DOWNLOAD_BASE=https://mirror.example.com/dbpp/v0.4.9`
+- 指定版本：`DBPP_VERSION=0.4.10`（或传 `--version 0.4.10` / `-Version 0.4.10`）
+- 镜像/代理前缀：`DBPP_DOWNLOAD_BASE=https://mirror.example.com/dbpp/v0.4.10`
 - Windows 拉起图形安装器：`DBPP_USE_INSTALLER=1`（或 `-UseInstaller`）
 - 卸载（保留用户数据 `dbpp.sqlite3` 与已安装的 ADBC 驱动）：
   - Linux / macOS：`curl -fsSL https://github.com/FarnaHerry/dbpp/releases/latest/download/install.sh | bash -s -- --uninstall`
