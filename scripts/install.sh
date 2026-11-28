@@ -262,6 +262,22 @@ print_path_hint_if_needed() {
       printf '  export PATH="%s:$PATH"\n' "$bin_dir"
       ;;
   esac
+
+  local resolved=""
+  resolved="$(command -v dbpp 2>/dev/null || true)"
+  if [[ -n "$resolved" ]]; then
+    local resolved_canon expected_canon
+    resolved_canon="$(resolve_canonical_dir "$(dirname "$resolved")")/$(basename "$resolved")"
+    expected_canon="$(resolve_canonical_dir "$bin_dir")/dbpp"
+    if [[ "$resolved_canon" != "$expected_canon" ]]; then
+      warn "'${resolved}' precedes '${bin_dir}/dbpp' in PATH and will be invoked by default."
+      if [[ "$resolved" == "/usr/bin/dbpp" ]]; then
+        warn "Remove any old system package (e.g. 'sudo apt remove dbpp' or 'sudo dnf remove dbpp'), or put '${bin_dir}' earlier in PATH."
+      else
+        warn "Ensure '${bin_dir}' appears before '$(dirname "$resolved")' in PATH."
+      fi
+    fi
+  fi
 }
 
 install_linux() {

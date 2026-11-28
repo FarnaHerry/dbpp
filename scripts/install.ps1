@@ -331,10 +331,16 @@ function Main {
     if (-not $effNoShortcut) { Install-StartMenuShortcut $safeInstallDir }
     if (-not $effNoUninstallEntry) { Write-UninstallScript $safeInstallDir; Register-UninstallEntry $safeInstallDir $effVersion }
 
-    $versionOut = & (Join-Path $safeInstallDir 'dbpp.exe') --version 2>&1
+    $installedExe = Join-Path $safeInstallDir 'dbpp.exe'
+    $versionOut = & $installedExe --version 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Installed dbpp.exe failed self-check (--version): $versionOut" }
     Write-DbppLog "Installed: $versionOut"
     Write-DbppLog "Location: $safeInstallDir"
+
+    $resolvedCmd = Get-Command 'dbpp' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($resolvedCmd -and $resolvedCmd.Source -and ($resolvedCmd.Source.ToLowerInvariant() -ne $installedExe.ToLowerInvariant())) {
+      Write-DbppWarn "'$($resolvedCmd.Source)' precedes '$installedExe' in PATH and will be invoked by default (e.g. an older system installer in Program Files\db++)."
+    }
   } finally {
     if (Test-Path -LiteralPath $tempDir) { Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue }
   }
