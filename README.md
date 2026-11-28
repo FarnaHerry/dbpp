@@ -51,6 +51,16 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/FarnaHerry/dbpp/re
 
 也可直接在 [GitHub Releases](https://github.com/FarnaHerry/dbpp/releases) 手动下载各平台安装包：Windows `.exe` 安装器 / `.zip`、Linux `.deb` / `.rpm` / `.tar.xz`、macOS `.dmg`（均附带 `SHA256SUMS.txt`）。
 
+### Linux 系统软件源（RPM / APT，支持 `dnf` / `apt` 自动更新）
+
+如果希望将 `db++` 纳入系统包管理器（安装到 `/opt/dbpp` 并支持 `sudo dnf upgrade` / `sudo apt upgrade` 自动更新，与上面的免 `sudo` 用户级安装互不影响）：
+
+```sh
+curl -fsSL https://farnaherry.github.io/dbpp/setup-repo.sh | sudo bash
+```
+
+仅添加源时可加 `--repo-only`（`... | sudo bash -s -- --repo-only`），移除源配置可传 `--uninstall`。也可以直接在软件源首页 <https://farnaherry.github.io/dbpp/> 查看手动添加 `dnf` / `apt` 源的配置命令。
+
 ## 构建与测试
 
 依赖：CMake ≥ 4.4、Ninja、支持 C++23 模块与 `import std` 的现代编译器（GCC ≥ 16 / Clang ≥ 21 + libc++ / MSVC）；Linux 源码构建需要 GTK4 ≥ 4.14、

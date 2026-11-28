@@ -1,0 +1,117 @@
+# publish-linux-repo.yml — 可复用的 Linux RPM + APT 静态软件源发布工作流（GitHub Pages）。
+# 从对应 GitHub Release 下载 .rpm 与 .deb，GPG 签名后生成 repodata/ 与 apt/ 索引并通过 deploy-pages 发布，
+# 不向 git 历史提交任何二进制包文件。
+
+name: publish-linux-repo
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to publish (defaults to latest release)'
+        required: false
+        type: string
+        default: ''
+      pkg_name:
+        description: 'Package name'
+        required: false
+        type: string
+        default: 'dbpp'
+      display_name:
+        description: 'Human-readable display name'
+        required: false
+        type: string
+        default: 'db++'
+    secrets:
+      GPG_PRIVATE_KEY:
+        required: true
+      GPG_PASSPHRASE:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (leave empty for latest release)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish-linux-repo:
+    name: publish-linux-repo
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            rpm createrepo-c dpkg-dev apt-utils gnupg ca-certificates curl
+
+      - name: Download release RPM & DEB packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')"
+          fi
+          test -n "$tag"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          mkdir -p pkg-in
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.rpm' \
+            --pattern '*.deb' \
+            --dir pkg-in
+          ls -lh pkg-in
+
+      - name: Sign packages and generate RPM & APT repositories
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          PKG_NAME: ${{ inputs.pkg_name || 'dbpp' }}
+          DISPLAY_NAME: ${{ inputs.display_name || 'db++' }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          base_url="https://${owner}.github.io/${repo}"
+          chmod +x scripts/build-linux-repo.sh scripts/setup-repo.sh
+          scripts/build-linux-repo.sh \
+            --input-dir pkg-in \
+            --output-dir site \
+            --pkg-name "$PKG_NAME" \
+            --display-name "$DISPLAY_NAME" \
+            --version "${RELEASE_TAG#v}" \
+            --base-url "$base_url" \
+            --setup-script scripts/setup-repo.sh \
+            --require-apt
+          ls -la site site/rpm site/apt/dists/stable
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
