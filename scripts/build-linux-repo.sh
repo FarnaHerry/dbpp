@@ -241,7 +241,7 @@ name=${DISPLAY_NAME} Repository
 baseurl=${BASE_URL}/rpm/\$basearch/
 enabled=1
 gpgcheck=1
-repo_gpgcheck=1
+repo_gpgcheck=0
 gpgkey=${BASE_URL}/gpg.key
 REPO
 sudo dnf install -y ${PKG_NAME}</code></pre>

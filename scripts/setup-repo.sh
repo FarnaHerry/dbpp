@@ -142,7 +142,7 @@ name=${DISPLAY_NAME} Repository
 baseurl=${BASE_URL}/rpm/\$basearch/
 enabled=1
 gpgcheck=1
-repo_gpgcheck=1
+repo_gpgcheck=0
 gpgkey=${BASE_URL}/gpg.key
 metadata_expire=300
 EOF
@@ -174,7 +174,7 @@ baseurl=${BASE_URL}/rpm/\$basearch/
 enabled=1
 autorefresh=1
 gpgcheck=1
-repo_gpgcheck=1
+repo_gpgcheck=0
 gpgkey=${BASE_URL}/gpg.key
 EOF
   chmod 0644 "$REPO_FILE"
