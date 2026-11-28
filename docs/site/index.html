@@ -561,7 +561,7 @@ sudo apt update &amp;&amp; sudo apt install -y dbpp</code></pre>
               <div class="panel-card">
                 <p class="panel-desc" data-i18n="descWin">在 PowerShell 下免管理员权限安装到 %LOCALAPPDATA%\Programs\dbpp（自动写入用户 PATH 与开始菜单）：</p>
                 <div class="copyable">
-                  <pre><code id="cmd-win">powershell -ExecutionPolicy ByPass -c "irm {{REPO_URL}}/releases/latest/download/install.ps1 | iex"</code></pre>
+                  <pre><code id="cmd-win">irm {{REPO_URL}}/releases/latest/download/install.ps1 | iex</code></pre>
                   <span class="copy">
                     <button type="button" class="copy-button" command="--copy" commandfor="cmd-win" aria-label="复制 Windows 安装命令">
                       <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>

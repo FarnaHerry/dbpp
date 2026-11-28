@@ -38,7 +38,7 @@ curl -fsSL https://github.com/FarnaHerry/dbpp/releases/latest/download/install.s
 **Windows (`x86_64` PowerShell)：**
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex"
+irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex
 ```
 
 常用环境变量 / 参数：
@@ -47,7 +47,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/FarnaHerry/dbpp/re
 - Windows 拉起图形安装器：`DBPP_USE_INSTALLER=1`（或 `-UseInstaller`）
 - 卸载（保留用户数据 `dbpp.sqlite3` 与已安装的 ADBC 驱动）：
   - Linux / macOS：`curl -fsSL https://github.com/FarnaHerry/dbpp/releases/latest/download/install.sh | bash -s -- --uninstall`
-  - Windows：`powershell -ExecutionPolicy ByPass -c "$env:DBPP_UNINSTALL='1'; irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex"`
+  - Windows：`$env:DBPP_UNINSTALL='1'; irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex`
 
 也可直接在 [GitHub Releases](https://github.com/FarnaHerry/dbpp/releases) 手动下载各平台安装包：Windows `.exe` 安装器 / `.zip`、Linux `.deb` / `.rpm` / `.tar.xz`、macOS `.dmg`（均附带 `SHA256SUMS.txt`）。
 
