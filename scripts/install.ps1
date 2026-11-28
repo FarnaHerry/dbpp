@@ -267,6 +267,42 @@ function Uninstall-Dbpp([string]$TargetDir, [bool]$AllowForce) {
   Write-DbppLog "Uninstalled db++. User data in '$dataDir' and ADBC drivers were preserved."
 }
 
+function Invoke-DbppSelfCheck([string]$ExePath) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $ExePath
+  $psi.Arguments = '--version'
+  $psi.WorkingDirectory = Split-Path -Parent $ExePath
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  $proc = New-Object System.Diagnostics.Process
+  $proc.StartInfo = $psi
+  try {
+    if (-not $proc.Start()) { throw "Failed to start $ExePath." }
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit(15000)) {
+      try { $proc.Kill() } catch { }
+      throw "Timed out waiting for '$ExePath --version' to exit."
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+    $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+    $code = $proc.ExitCode
+    if ($code -ne 0) {
+      $hex = '0x{0:X8}' -f ([int]$code)
+      $detail = (@($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+      throw "Installed dbpp.exe failed self-check (--version), exit code $code ($hex): $detail"
+    }
+    if ([string]::IsNullOrWhiteSpace($stdout)) {
+      throw "Installed dbpp.exe self-check (--version) exited 0 with empty output. stderr: $stderr"
+    }
+    return $stdout
+  } finally {
+    $proc.Dispose()
+  }
+}
+
 function Main {
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
@@ -332,8 +368,7 @@ function Main {
     if (-not $effNoUninstallEntry) { Write-UninstallScript $safeInstallDir; Register-UninstallEntry $safeInstallDir $effVersion }
 
     $installedExe = Join-Path $safeInstallDir 'dbpp.exe'
-    $versionOut = & $installedExe --version 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Installed dbpp.exe failed self-check (--version): $versionOut" }
+    $versionOut = Invoke-DbppSelfCheck $installedExe
     Write-DbppLog "Installed: $versionOut"
     Write-DbppLog "Location: $safeInstallDir"
 

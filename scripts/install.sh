@@ -286,7 +286,18 @@ install_linux() {
 
   local extract_dir="$TEMP_DIR/extract"
   mkdir -p "$extract_dir"
-  tar -xzf "$archive" -C "$extract_dir"
+  case "$archive" in
+    *.tar.xz)
+      command -v xz >/dev/null 2>&1 || die "xz is required to extract ${archive}. Install xz (e.g. xz-utils) and retry."
+      tar -xJf "$archive" -C "$extract_dir"
+      ;;
+    *.tar.gz|*.tgz)
+      tar -xzf "$archive" -C "$extract_dir"
+      ;;
+    *)
+      tar -xf "$archive" -C "$extract_dir"
+      ;;
+  esac
 
   local payload_dir="" candidate=""
   if [[ -f "${extract_dir}/dbpp" && ! -d "${extract_dir}/dbpp" ]]; then
@@ -431,19 +442,39 @@ main() {
     version="$(resolve_latest_version "$repo")"
   fi
 
-  local asset_name=""
-  if [[ "$OS" == "linux" ]]; then
-    asset_name="dbpp-${version}-linux-${ARCH}.tar.gz"
-  else
-    asset_name="dbpp-${version}-macos-${ARCH}.dmg"
-  fi
+  local asset_name="" asset_path=""
   download_base="${download_base:-https://github.com/${repo}/releases/download/v${version}}"
   download_base="${download_base%/}"
-
   TEMP_DIR="$(mktemp -d)"
-  local asset_path="${TEMP_DIR}/${asset_name}"
-  log "Downloading ${asset_name} (${OS}/${ARCH})..."
-  download_file "${download_base}/${asset_name}" "$asset_path" || die "Failed to download ${download_base}/${asset_name}"
+
+  if [[ "$OS" == "linux" ]]; then
+    local xz_asset="dbpp-${version}-linux-${ARCH}.tar.xz"
+    local gz_asset="dbpp-${version}-linux-${ARCH}.tar.gz"
+    if command -v xz >/dev/null 2>&1; then
+      asset_name="$xz_asset"
+      asset_path="${TEMP_DIR}/${asset_name}"
+      log "Downloading ${asset_name} (${OS}/${ARCH})..."
+      if ! download_file "${download_base}/${asset_name}" "$asset_path"; then
+        rm -f "$asset_path"
+        warn "${xz_asset} not available; falling back to ${gz_asset}."
+        asset_name="$gz_asset"
+        asset_path="${TEMP_DIR}/${asset_name}"
+        log "Downloading ${asset_name} (${OS}/${ARCH})..."
+        download_file "${download_base}/${asset_name}" "$asset_path" || die "Failed to download ${download_base}/${asset_name}"
+      fi
+    else
+      asset_name="$gz_asset"
+      asset_path="${TEMP_DIR}/${asset_name}"
+      warn "xz is not installed; attempting ${gz_asset}."
+      log "Downloading ${asset_name} (${OS}/${ARCH})..."
+      download_file "${download_base}/${asset_name}" "$asset_path" || die "Failed to download ${download_base}/${asset_name}. Newer releases distribute ${xz_asset} which requires xz (xz-utils)."
+    fi
+  else
+    asset_name="dbpp-${version}-macos-${ARCH}.dmg"
+    asset_path="${TEMP_DIR}/${asset_name}"
+    log "Downloading ${asset_name} (${OS}/${ARCH})..."
+    download_file "${download_base}/${asset_name}" "$asset_path" || die "Failed to download ${download_base}/${asset_name}"
+  fi
   verify_checksum "$asset_path" "$asset_name" "${download_base}/SHA256SUMS.txt" "$require_checksum" "$skip_checksum"
 
   if [[ "$OS" == "linux" ]]; then

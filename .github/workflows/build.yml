@@ -73,7 +73,7 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get install -y --no-install-recommends \
-            clang-21 libc++-21-dev g++ ninja-build pkg-config file binutils gzip \
+            clang-21 libc++-21-dev g++ ninja-build pkg-config file binutils gzip xz-utils \
             python3 python3-pip libgtk-4-dev libepoxy-dev libsoup-3.0-dev dpkg-dev rpm
           python3 -m pip install --break-system-packages -q cmake==4.4.2
           cmake --version | head -1
@@ -146,8 +146,16 @@ jobs:
           mkdir -p dist-src/lib
           cp -a dist-root/opt/dbpp/. dist-src/
           for lib in libc++.so.1 libc++abi.so.1 libunwind.so.1; do
-            p="$(find /usr/lib -name "$lib" -print -quit 2>/dev/null || true)"
-            if [ -n "$p" ]; then cp -L "$p" "dist-src/lib/$lib"; fi
+            if [ ! -e "dist-src/lib/$lib" ]; then
+              p="$(find /usr/lib -name "$lib" -print -quit 2>/dev/null || true)"
+              if [ -n "$p" ]; then cp -L "$p" "dist-src/lib/$lib"; fi
+            fi
+          done
+          for bin in dist-src/dbpp dist-src/lib/*.so*; do
+            if [ -f "$bin" ] && [ ! -L "$bin" ]; then
+              chmod u+w "$bin"
+              strip --strip-unneeded "$bin"
+            fi
           done
           patchelf --set-rpath '$ORIGIN/lib' dist-src/dbpp
           mkdir -p dist-src/share/applications dist-src/share/icons/hicolor/256x256/apps
@@ -168,6 +176,58 @@ jobs:
           done
           ls -la dist-src dist-src/lib
 
+      - name: Package Linux archives (tar.xz, DEB, RPM)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist-packages
+          mkdir -p dist-packages
+          tar_arch="${{ matrix.arch }}"
+          [[ "$tar_arch" == "arm64" ]] && tar_arch="aarch64"
+          tarball="dist-packages/dbpp-linux-${tar_arch}.tar.xz"
+          tar_stage="$(mktemp -d)"
+          trap 'rm -rf "$tar_stage"' EXIT
+          mkdir -p "$tar_stage/dbpp"
+          cp -a dist-src/. "$tar_stage/dbpp/"
+          tar -C "$tar_stage" -cf - dbpp | xz -T0 -6 > "$tarball"
+
+          cpack --config build/CPackConfig.cmake -G DEB -B dist-packages
+          cpack --config build/CPackConfig.cmake -G RPM -B dist-packages
+          packages=(dist-packages/*.deb dist-packages/*.rpm)
+          test "${#packages[@]}" -eq 2
+
+          tar_list="$(tar -tvJf "$tarball")"
+          grep -Eq '^-rwx[^ ]* .* dbpp/dbpp$' <<<"$tar_list"
+          for soname in libc++.so.1 libc++abi.so.1 libadbc_driver_manager.so.113; do
+            if [ -L "dist-src/lib/$soname" ]; then
+              grep -Eq "^l.* dbpp/lib/${soname//./\\.} -> " <<<"$tar_list"
+            fi
+          done
+
+          tar_size="$(stat -c '%s' "$tarball")"
+          deb_size="$(stat -c '%s' dist-packages/*.deb)"
+          rpm_size="$(stat -c '%s' dist-packages/*.rpm)"
+          test "$tar_size" -lt "$deb_size"
+          test "$tar_size" -lt "$rpm_size"
+
+          expected_rpm_arch="${{ matrix.arch }}"
+          [[ "$expected_rpm_arch" == "arm64" ]] && expected_rpm_arch="aarch64"
+          rpm_files=(dist-packages/*.rpm)
+          test "${#rpm_files[@]}" -eq 1
+          rpm_arch="$(rpm -qp --qf '%{ARCH}' "${rpm_files[0]}")"
+          test "$rpm_arch" = "$expected_rpm_arch"
+          if rpm -qpl "${rpm_files[0]}" | grep -q '/usr/lib/\.build-id/'; then
+            echo "RPM must not ship global /usr/lib/.build-id/ links" >&2
+            exit 1
+          fi
+          elf_info="$(file dist-src/dbpp)"
+          if [[ "$expected_rpm_arch" == "aarch64" ]]; then
+            [[ "$elf_info" == *"ARM aarch64"* ]]
+          else
+            [[ "$elf_info" == *"x86-64"* ]]
+          fi
+          ls -lh dist-packages/
+
       - name: Test install.sh
         shell: bash
         run: |
@@ -178,12 +238,10 @@ jobs:
           tmp_root="$(mktemp -d)"
           trap 'rm -rf "$tmp_root"' EXIT
           tmp_rel="$tmp_root/rel"
-          tmp_stage="$tmp_root/stage"
           tmp_home="$tmp_root/home"
-          mkdir -p "$tmp_rel" "$tmp_stage/dbpp" "$tmp_home/.local/share/dbpp"
-          cp -a dist-src/. "$tmp_stage/dbpp/"
-          tar -C "$tmp_stage" -czf "$tmp_rel/dbpp-0.0.0-linux-${tar_arch}.tar.gz" dbpp
-          (cd "$tmp_rel" && sha256sum "dbpp-0.0.0-linux-${tar_arch}.tar.gz" > SHA256SUMS.txt)
+          mkdir -p "$tmp_rel" "$tmp_home/.local/share/dbpp"
+          cp "dist-packages/dbpp-linux-${tar_arch}.tar.xz" "$tmp_rel/dbpp-0.0.0-linux-${tar_arch}.tar.xz"
+          (cd "$tmp_rel" && sha256sum "dbpp-0.0.0-linux-${tar_arch}.tar.xz" > SHA256SUMS.txt)
           printf 'keep-me' > "$tmp_home/.local/share/dbpp/dbpp.sqlite3"
           HOME="$tmp_home" XDG_DATA_HOME="$tmp_home/.local/share" \
             scripts/install.sh --version 0.0.0 --download-base "file://$tmp_rel" --require-checksum
@@ -201,39 +259,24 @@ jobs:
           test ! -e "$tmp_home/.local/share/icons/hicolor/256x256/apps/dbpp.png"
           test "$(cat "$tmp_home/.local/share/dbpp/dbpp.sqlite3")" = "keep-me"
 
-      - name: Package Linux DEB and RPM
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist-packages
-          cpack --config build/CPackConfig.cmake -G DEB -B dist-packages
-          cpack --config build/CPackConfig.cmake -G RPM -B dist-packages
-          packages=(dist-packages/*.deb dist-packages/*.rpm)
-          test "${#packages[@]}" -eq 2
-          cp "${packages[@]}" dist-src/
-          expected_rpm_arch="${{ matrix.arch }}"
-          [[ "$expected_rpm_arch" == "arm64" ]] && expected_rpm_arch="aarch64"
-          rpm_files=(dist-packages/*.rpm)
-          test "${#rpm_files[@]}" -eq 1
-          rpm_arch="$(rpm -qp --qf '%{ARCH}' "${rpm_files[0]}")"
-          test "$rpm_arch" = "$expected_rpm_arch"
-          if rpm -qpl "${rpm_files[0]}" | grep -q '/usr/lib/\.build-id/'; then
-            echo "RPM must not ship global /usr/lib/.build-id/ links" >&2
-            exit 1
-          fi
-          elf_info="$(file dist-src/dbpp)"
-          if [[ "$expected_rpm_arch" == "aarch64" ]]; then
-            [[ "$elf_info" == *"ARM aarch64"* ]]
-          else
-            [[ "$elf_info" == *"x86-64"* ]]
-          fi
-          ls -lh dist-src/*.deb dist-src/*.rpm
+          # Fallback check for legacy .tar.gz releases
+          tmp_rel_gz="$tmp_root/rel-gz"
+          tmp_stage_gz="$tmp_root/stage-gz"
+          mkdir -p "$tmp_rel_gz" "$tmp_stage_gz/dbpp"
+          cp -a dist-src/. "$tmp_stage_gz/dbpp/"
+          tar -C "$tmp_stage_gz" -czf "$tmp_rel_gz/dbpp-0.0.1-linux-${tar_arch}.tar.gz" dbpp
+          (cd "$tmp_rel_gz" && sha256sum "dbpp-0.0.1-linux-${tar_arch}.tar.gz" > SHA256SUMS.txt)
+          HOME="$tmp_home" XDG_DATA_HOME="$tmp_home/.local/share" \
+            scripts/install.sh --version 0.0.1 --download-base "file://$tmp_rel_gz" --require-checksum
+          "$tmp_home/.local/bin/dbpp" --version
+          HOME="$tmp_home" XDG_DATA_HOME="$tmp_home/.local/share" \
+            scripts/install.sh --uninstall
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: build-linux-${{ matrix.arch }}
-          path: dist-src
+          path: dist-packages
           if-no-files-found: error
           retention-days: 14
 
@@ -373,8 +416,24 @@ jobs:
             Set-Content -LiteralPath (Join-Path $tmpRel 'SHA256SUMS.txt') -Value "$hash  dbpp-0.0.0-windows-x86_64.zip"
             & .\scripts\install.ps1 -Version 0.0.0 -DownloadBase $tmpRel -InstallDir $tmpInstall -NoModifyPath -NoShortcut -NoUninstallEntry -RequireChecksum
             & .\scripts\install.ps1 -Version 0.0.0 -DownloadBase $tmpRel -InstallDir $tmpInstall -NoModifyPath -NoShortcut -NoUninstallEntry -RequireChecksum
-            $verOut = & (Join-Path $tmpInstall 'dbpp.exe') --version
-            if ($LASTEXITCODE -ne 0) { throw "dbpp.exe --version failed: $verOut" }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Join-Path $tmpInstall 'dbpp.exe'
+            $psi.Arguments = '--version'
+            $psi.WorkingDirectory = $tmpInstall
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+            $stderrTask = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit(15000)) { $proc.Kill(); throw 'dbpp.exe --version timed out' }
+            $verOut = $stdoutTask.GetAwaiter().GetResult().Trim()
+            $verErr = $stderrTask.GetAwaiter().GetResult().Trim()
+            if ($proc.ExitCode -ne 0 -or $verOut -notmatch '^dbpp ') {
+              throw ("dbpp.exe --version failed (exit {0} / 0x{1:X8}): out='{2}' err='{3}'" -f $proc.ExitCode, [int]$proc.ExitCode, $verOut, $verErr)
+            }
+            $proc.Dispose()
             if ((Get-Content -LiteralPath $dataMarker -Raw) -ne 'keep-me') { throw 'User data marker modified during install' }
             & .\scripts\install.ps1 -Uninstall -InstallDir $tmpInstall
             if (Test-Path -LiteralPath $tmpInstall) { throw "Install directory was not removed: $tmpInstall" }
@@ -648,13 +707,9 @@ jobs:
             elif [[ "$name" == build-linux-* ]]; then
               arch="${name#build-linux-}"
               [[ "$arch" == "arm64" ]] && arch="aarch64"
-              stage_dir="$(mktemp -d)"
-              mkdir -p "${stage_dir}/dbpp"
-              cp -a "$artifact"/. "${stage_dir}/dbpp/"
-              rm -f "${stage_dir}/dbpp"/*.deb "${stage_dir}/dbpp"/*.rpm
-              tar -C "$stage_dir" -czf \
-                "release/dbpp-${release_version}-linux-${arch}.tar.gz" dbpp
-              rm -rf "$stage_dir"
+              tarball="$artifact/dbpp-linux-${arch}.tar.xz"
+              test -s "$tarball"
+              cp "$tarball" "release/dbpp-${release_version}-linux-${arch}.tar.xz"
               shopt -s nullglob
               for extension in deb rpm; do
                 packages=("$artifact"/*."$extension")
@@ -686,7 +741,7 @@ jobs:
           test -s "release/install.ps1"
           test -s "release/SHA256SUMS.txt"
           for arch in x86_64 aarch64; do
-            test -s "release/dbpp-${release_version}-linux-${arch}.tar.gz"
+            test -s "release/dbpp-${release_version}-linux-${arch}.tar.xz"
             test -s "release/dbpp-${release_version}-linux-${arch}.deb"
             test -s "release/dbpp-${release_version}-linux-${arch}.rpm"
           done

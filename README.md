@@ -49,7 +49,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/FarnaHerry/dbpp/re
   - Linux / macOS：`curl -fsSL https://github.com/FarnaHerry/dbpp/releases/latest/download/install.sh | bash -s -- --uninstall`
   - Windows：`powershell -ExecutionPolicy ByPass -c "$env:DBPP_UNINSTALL='1'; irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex"`
 
-也可直接在 [GitHub Releases](https://github.com/FarnaHerry/dbpp/releases) 手动下载各平台安装包：Windows `.exe` 安装器 / `.zip`、Linux `.deb` / `.rpm` / `.tar.gz`、macOS `.dmg`（均附带 `SHA256SUMS.txt`）。
+也可直接在 [GitHub Releases](https://github.com/FarnaHerry/dbpp/releases) 手动下载各平台安装包：Windows `.exe` 安装器 / `.zip`、Linux `.deb` / `.rpm` / `.tar.xz`、macOS `.dmg`（均附带 `SHA256SUMS.txt`）。
 
 ## 构建与测试
 
