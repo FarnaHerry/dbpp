@@ -253,6 +253,16 @@
 
     [role="tabpanel"] {
       grid-area: 1 / 1;
+      position: relative;
+      z-index: 1;
+    }
+
+    [role="tabpanel"][hidden] {
+      z-index: 0;
+      pointer-events: none;
+      align-self: start;
+      max-block-size: 0;
+      overflow: hidden;
     }
 
     .panel-card {
@@ -289,6 +299,8 @@
       overflow-x: auto;
       font-size: 0.86rem;
       line-height: 1.5;
+      user-select: text;
+      pointer-events: auto;
     }
 
     code {
@@ -357,7 +369,7 @@
         inset-inline-end: 0.5rem;
       }
       .copyable .copy-button {
-        opacity: 0;
+        opacity: 0.78;
         transition: opacity 0.15s ease;
       }
       .copyable:hover .copy-button,
@@ -797,6 +809,21 @@ dbpp import --sqlite ./app.sqlite items items.xlsx --mode create_append</code></
         }, 2000));
       };
 
+      const legacyCopy = (text) => {
+        const previousFocus = document.activeElement;
+        const field = Object.assign(document.createElement('textarea'), { value: text });
+        field.setAttribute('readonly', '');
+        field.style.cssText = 'position:fixed;inset-block-start:0;opacity:0';
+        document.body.append(field);
+        field.select();
+        try {
+          return document.execCommand('copy');
+        } finally {
+          field.remove();
+          previousFocus?.focus({ preventScroll: true });
+        }
+      };
+
       const copy = async (button, target) => {
         const text = target.innerText.trim();
         if (!text) return;
@@ -804,7 +831,7 @@ dbpp import --sqlite ./app.sqlite items items.xlsx --mode create_append</code></
           await navigator.clipboard.writeText(text);
           report(button, true);
         } catch {
-          report(button, false);
+          report(button, legacyCopy(text));
         }
       };
 
