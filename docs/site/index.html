@@ -249,12 +249,14 @@
 
     .panels {
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
     }
 
     [role="tabpanel"] {
       grid-area: 1 / 1;
       position: relative;
       z-index: 1;
+      min-width: 0;
     }
 
     [role="tabpanel"][hidden] {
@@ -267,6 +269,7 @@
 
     .panel-card {
       padding: 1.15rem 1.25rem 1.25rem;
+      min-width: 0;
     }
 
     .panel-desc {
@@ -280,6 +283,8 @@
       align-items: start;
       gap: 0.5rem;
       margin: 0.65rem 0;
+      min-width: 0;
+      max-width: 100%;
     }
 
     .copyable pre {
@@ -296,7 +301,9 @@
       border: 1px solid var(--code-border);
       border-radius: 8px;
       padding: 0.85rem 1rem;
+      max-width: 100%;
       overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
       font-size: 0.86rem;
       line-height: 1.5;
       user-select: text;
@@ -369,7 +376,7 @@
         inset-inline-end: 0.5rem;
       }
       .copyable .copy-button {
-        opacity: 0.78;
+        opacity: 0.85;
         transition: opacity 0.15s ease;
       }
       .copyable:hover .copy-button,
@@ -379,6 +386,15 @@
       .copyable .copy-button[data-failed] {
         opacity: 1;
       }
+    }
+
+    @media (max-width: 640px) {
+      .wrap { padding: 1rem 0.9rem 2.5rem; }
+      .hero { padding: 1.35rem 0 1rem; }
+      [role="tab"] { padding: 0.7rem 0.75rem; font-size: 0.86rem; }
+      .panel-card { padding: 0.9rem 0.95rem 1rem; }
+      pre { padding: 0.75rem 0.85rem; font-size: 0.8rem; }
+      .grid { grid-template-columns: minmax(0, 1fr); }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -391,6 +407,8 @@
       border-radius: 8px;
       padding: 0.6rem 0.9rem;
       background: var(--surface-alt);
+      min-width: 0;
+      max-width: 100%;
     }
 
     summary {
@@ -490,7 +508,7 @@
               <div class="panel-card">
                 <p class="panel-desc" data-i18n="descUnix">免管理员权限安装到 ~/.local/opt/dbpp（macOS 为 /Applications/dbpp.app），自动校验 SHA-256 与注册桌面图标：</p>
                 <div class="copyable">
-                  <pre><code id="cmd-unix">curl -fsSL {{REPO_URL}}/releases/latest/download/install.sh | bash</code></pre>
+                  <pre tabindex="0"><code id="cmd-unix">curl -fsSL {{REPO_URL}}/releases/latest/download/install.sh | bash</code></pre>
                   <span class="copy">
                     <button type="button" class="copy-button" command="--copy" commandfor="cmd-unix" aria-label="复制 Linux/macOS 安装命令">
                       <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
@@ -507,7 +525,7 @@
               <div class="panel-card">
                 <p class="panel-desc" data-i18n="descRepo">配置官方 GPG 签名软件源（安装到 /opt/dbpp，支持 dnf / apt / zypper 随系统自动更新）：</p>
                 <div class="copyable">
-                  <pre><code id="cmd-repo">curl -fsSL {{BASE_URL}}/setup-repo.sh | sudo bash</code></pre>
+                  <pre tabindex="0"><code id="cmd-repo">curl -fsSL {{BASE_URL}}/setup-repo.sh | sudo bash</code></pre>
                   <span class="copy">
                     <button type="button" class="copy-button" command="--copy" commandfor="cmd-repo" aria-label="复制系统软件源安装命令">
                       <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
@@ -520,7 +538,7 @@
                 <details>
                   <summary data-i18n="manualRepoSummary">查看手动配置 Fedora/RHEL (dnf) 与 Debian/Ubuntu (apt) 命令</summary>
                   <div class="copyable">
-                    <pre><code id="cmd-dnf"># Fedora / RHEL (x86_64 &amp; aarch64)
+                    <pre tabindex="0"><code id="cmd-dnf"># Fedora / RHEL (x86_64 &amp; aarch64)
 sudo rpm --import {{BASE_URL}}/gpg.key
 sudo tee /etc/yum.repos.d/dbpp.repo &lt;&lt;'REPO'
 [dbpp]
@@ -541,7 +559,7 @@ sudo dnf install -y dbpp</code></pre>
                     </span>
                   </div>
                   <div class="copyable">
-                    <pre><code id="cmd-apt"># Debian / Ubuntu (amd64 &amp; arm64)
+                    <pre tabindex="0"><code id="cmd-apt"># Debian / Ubuntu (amd64 &amp; arm64)
 curl -fsSL {{BASE_URL}}/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/dbpp.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/dbpp.gpg] {{BASE_URL}}/apt stable main" | sudo tee /etc/apt/sources.list.d/dbpp.list
 sudo apt update &amp;&amp; sudo apt install -y dbpp</code></pre>
@@ -561,7 +579,7 @@ sudo apt update &amp;&amp; sudo apt install -y dbpp</code></pre>
               <div class="panel-card">
                 <p class="panel-desc" data-i18n="descWin">在 PowerShell 下免管理员权限安装到 %LOCALAPPDATA%\Programs\dbpp（自动写入用户 PATH 与开始菜单）：</p>
                 <div class="copyable">
-                  <pre><code id="cmd-win">irm {{REPO_URL}}/releases/latest/download/install.ps1 | iex</code></pre>
+                  <pre tabindex="0"><code id="cmd-win">irm {{REPO_URL}}/releases/latest/download/install.ps1 | iex</code></pre>
                   <span class="copy">
                     <button type="button" class="copy-button" command="--copy" commandfor="cmd-win" aria-label="复制 Windows 安装命令">
                       <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
@@ -578,7 +596,7 @@ sudo apt update &amp;&amp; sudo apt install -y dbpp</code></pre>
               <div class="panel-card">
                 <p class="panel-desc" data-i18n="descCli">无需图形界面即可查询、导出/导入、在线管理 ADBC 驱动，支持 --json 结构化输出：</p>
                 <div class="copyable">
-                  <pre><code id="cmd-cli">dbpp doctor --json
+                  <pre tabindex="0"><code id="cmd-cli">dbpp doctor --json
 dbpp tables --sqlite ./app.sqlite --json
 dbpp query  --sqlite ./app.sqlite "SELECT * FROM items LIMIT 20" --json
 dbpp export --sqlite ./app.sqlite "SELECT * FROM items" --out items.xlsx
