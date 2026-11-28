@@ -92,6 +92,10 @@ jobs:
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           repo="${GITHUB_REPOSITORY#*/}"
           base_url="https://${owner}.github.io/${repo}"
+          repo_url="https://github.com/${GITHUB_REPOSITORY}"
+          extra_args=()
+          [ -f docs/site/index.html ] && extra_args+=(--template docs/site/index.html)
+          [ -f assets/icon.png ] && extra_args+=(--logo assets/icon.png)
           chmod +x scripts/build-linux-repo.sh scripts/setup-repo.sh
           scripts/build-linux-repo.sh \
             --input-dir pkg-in \
@@ -100,7 +104,9 @@ jobs:
             --display-name "$DISPLAY_NAME" \
             --version "${RELEASE_TAG#v}" \
             --base-url "$base_url" \
+            --repo-url "$repo_url" \
             --setup-script scripts/setup-repo.sh \
+            "${extra_args[@]}" \
             --require-apt
           ls -la site site/rpm site/apt/dists/stable
 

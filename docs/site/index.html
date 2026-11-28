@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>db++ — SQLite-first ADBC 桌面数据库管理器</title>
+  <link rel="icon" type="image/png" href="icon.png">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg-light: #f8fafc;
+      --bg-dark: #0d1117;
+      --surface-light: #ffffff;
+      --surface-dark: #161b22;
+      --surface-alt-light: #f1f5f9;
+      --surface-alt-dark: #1f2630;
+      --border-light: #e2e8f0;
+      --border-dark: #30363d;
+      --text-light: #0f172a;
+      --text-dark: #e6edf3;
+      --muted-light: #475569;
+      --muted-dark: #94a3b8;
+      --accent-light: #2563eb;
+      --accent-dark: #6aa6ff;
+      --accent-soft-light: rgba(37, 99, 235, 0.1);
+      --accent-soft-dark: rgba(106, 166, 255, 0.14);
+      --scrollbar-track-light: #e2e8f0;
+      --scrollbar-track-dark: #1f2630;
+      --scrollbar-thumb-light: #64748b;
+      --scrollbar-thumb-dark: #8b949e;
+
+      --bg: var(--bg-light);
+      --surface: var(--surface-light);
+      --surface-alt: var(--surface-alt-light);
+      --border: var(--border-light);
+      --text: var(--text-light);
+      --muted: var(--muted-light);
+      --accent: var(--accent-light);
+      --accent-soft: var(--accent-soft-light);
+      --scrollbar-track: var(--scrollbar-track-light);
+      --scrollbar-thumb: var(--scrollbar-thumb-light);
+      --code-bg: #11161d;
+      --code-border: #2a3340;
+      --code-text: #e6edf3;
+
+      accent-color: var(--accent);
+      scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: var(--bg-dark);
+        --surface: var(--surface-dark);
+        --surface-alt: var(--surface-alt-dark);
+        --border: var(--border-dark);
+        --text: var(--text-dark);
+        --muted: var(--muted-dark);
+        --accent: var(--accent-dark);
+        --accent-soft: var(--accent-soft-dark);
+        --scrollbar-track: var(--scrollbar-track-dark);
+        --scrollbar-thumb: var(--scrollbar-thumb-dark);
+      }
+    }
+
+    @supports (color: light-dark(white, black)) {
+      :root {
+        --bg: light-dark(var(--bg-light), var(--bg-dark));
+        --surface: light-dark(var(--surface-light), var(--surface-dark));
+        --surface-alt: light-dark(var(--surface-alt-light), var(--surface-alt-dark));
+        --border: light-dark(var(--border-light), var(--border-dark));
+        --text: light-dark(var(--text-light), var(--text-dark));
+        --muted: light-dark(var(--muted-light), var(--muted-dark));
+        --accent: light-dark(var(--accent-light), var(--accent-dark));
+        --accent-soft: light-dark(var(--accent-soft-light), var(--accent-soft-dark));
+        --scrollbar-track: light-dark(var(--scrollbar-track-light), var(--scrollbar-track-dark));
+        --scrollbar-thumb: light-dark(var(--scrollbar-thumb-light), var(--scrollbar-thumb-dark));
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    .spark-bar {
+      height: 4px;
+      background: linear-gradient(90deg, #4285F4 0%, #EA4335 34%, #FBBC05 67%, #34A853 100%);
+    }
+
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 1.5rem 1.25rem 3.5rem;
+    }
+
+    header.topbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem 1rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .brand img {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+    }
+
+    .brand-title {
+      font-size: 1.2rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid var(--border);
+    }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    a { color: var(--accent); }
+
+    .btn-link, .lang-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-block-size: 32px;
+      padding: 0.35rem 0.8rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.875rem;
+      font-weight: 500;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    .btn-link.primary {
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+    }
+
+    .hero {
+      padding: 2rem 0 1.5rem;
+    }
+
+    .hero h1 {
+      margin: 0 0 0.65rem;
+      font-size: clamp(1.75rem, 3vw, 2.3rem);
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+    }
+
+    .hero p {
+      margin: 0 0 1.15rem;
+      max-width: 72ch;
+      color: var(--muted);
+      font-size: 1.03rem;
+    }
+
+    .hero-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+    }
+
+    section { margin-top: 2.25rem; }
+
+    section > h2 {
+      margin: 0 0 0.9rem;
+      font-size: 1.25rem;
+      letter-spacing: -0.01em;
+    }
+
+    .tabs-shell {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .tablist {
+      display: flex;
+      overflow-x: auto;
+      gap: 0.25rem;
+      padding: 0 0.75rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-alt);
+      scroll-snap-type: inline proximity;
+    }
+
+    [role="tab"] {
+      position: relative;
+      flex: none;
+      scroll-snap-align: start;
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.92rem;
+      font-weight: 600;
+      padding: 0.8rem 0.9rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    [role="tab"][aria-selected="true"] {
+      color: var(--accent);
+    }
+
+    [role="tab"][aria-selected="true"]::after {
+      content: "";
+      position: absolute;
+      inset: auto 0 0;
+      border-block-end: 3px solid var(--accent);
+    }
+
+    .panels {
+      display: grid;
+    }
+
+    [role="tabpanel"] {
+      grid-area: 1 / 1;
+    }
+
+    .panel-card {
+      padding: 1.15rem 1.25rem 1.25rem;
+    }
+
+    .panel-desc {
+      margin: 0 0 0.85rem;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    .copyable {
+      display: flex;
+      align-items: start;
+      gap: 0.5rem;
+      margin: 0.65rem 0;
+    }
+
+    .copyable pre {
+      flex: 1 1 auto;
+      min-width: 0;
+      margin: 0;
+    }
+
+    pre {
+      color-scheme: dark;
+      accent-color: var(--accent-dark);
+      background: var(--code-bg);
+      color: var(--code-text);
+      border: 1px solid var(--code-border);
+      border-radius: 8px;
+      padding: 0.85rem 1rem;
+      overflow-x: auto;
+      font-size: 0.86rem;
+      line-height: 1.5;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .copy {
+      position: relative;
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    .copy-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-inline-size: 30px;
+      min-block-size: 30px;
+      padding: 4px;
+      border-radius: 6px;
+      border: 1px solid var(--code-border);
+      background: #1b222c;
+      color: #e6edf3;
+      cursor: pointer;
+    }
+
+    .copy-button .icon-check { display: none; }
+    .copy-button[data-copied] .icon-copy { display: none; }
+    .copy-button[data-copied] .icon-check { display: block; color: #34a853; }
+    .copy-button[data-failed] { border-color: #ea4335; color: #f26c60; }
+
+    .tip {
+      position: absolute;
+      inset-inline-end: calc(100% + 0.45rem);
+      inset-block-start: 50%;
+      transform: translateY(-50%);
+      padding: 0.18rem 0.5rem;
+      border-radius: 6px;
+      background: #0f172a;
+      color: #ffffff;
+      border: 1px solid var(--code-border);
+      font-size: 0.76rem;
+      white-space: nowrap;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+
+    .copy-button[data-copied] + .tip,
+    .copy-button[data-failed] + .tip {
+      opacity: 1;
+    }
+
+    @media (hover: hover) {
+      .copyable {
+        display: block;
+        position: relative;
+      }
+      .copyable pre {
+        padding-inline-end: 3rem;
+      }
+      .copyable .copy {
+        position: absolute;
+        inset-block-start: 0.5rem;
+        inset-inline-end: 0.5rem;
+      }
+      .copyable .copy-button {
+        opacity: 0;
+        transition: opacity 0.15s ease;
+      }
+      .copyable:hover .copy-button,
+      .copyable:focus-within .copy-button,
+      .copyable .copy-button:focus-visible,
+      .copyable .copy-button[data-copied],
+      .copyable .copy-button[data-failed] {
+        opacity: 1;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .tip, .copy-button { transition: none; }
+    }
+
+    details {
+      margin-top: 0.85rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem 0.9rem;
+      background: var(--surface-alt);
+    }
+
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.92rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 0.9rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+    }
+
+    .card h3 {
+      margin: 0 0 0.4rem;
+      font-size: 1rem;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .meta-row {
+      margin-top: 0.8rem;
+      font-size: 0.86rem;
+      color: var(--muted);
+      word-break: break-all;
+    }
+
+    footer {
+      margin-top: 2.5rem;
+      padding-top: 1.25rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.86rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 1.25rem;
+      justify-content: space-between;
+    }
+
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="spark-bar"></div>
+  <div class="wrap">
+    <header class="topbar">
+      <a class="brand" href="{{REPO_URL}}">
+        <img src="icon.png" alt="db++ logo" width="36" height="36">
+        <span class="brand-title">db++</span>
+        <span class="badge">v{{VERSION}}</span>
+      </a>
+      <div class="top-actions">
+        <a class="btn-link" href="{{REPO_URL}}" target="_blank" rel="noopener">GitHub</a>
+        <a class="btn-link" href="{{REPO_URL}}/releases/latest" target="_blank" rel="noopener" data-i18n="releasesBtn">发行版下载</a>
+        <button type="button" class="lang-btn" id="lang-toggle" aria-label="Switch language">EN</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <h1 data-i18n="heroTitle">SQLite 优先的轻量级多数据库桌面端 &amp; 无头 CLI</h1>
+        <p data-i18n="heroDesc">基于 C++23 模块与 HuxerUI 原生界面打造，内置 Apache Arrow ADBC 驱动管理、零外部依赖 Redis 客户端与 9 种格式导入/导出，同时提供适配 AI Agent 与脚本自动化的无头 CLI。</p>
+        <div class="hero-links">
+          <a class="btn-link primary" href="#install" data-i18n="ctaInstall">安装与软件源</a>
+          <a class="btn-link" href="gpg.key" data-i18n="ctaGpg">GPG 公钥</a>
+          <a class="btn-link" href="setup-repo.sh">setup-repo.sh</a>
+        </div>
+      </section>
+
+      <section id="install">
+        <h2 data-i18n="installHeading">安装与软件源</h2>
+        <div class="tabs-shell">
+          <div class="tablist" role="tablist" aria-label="Installation options">
+            <button type="button" role="tab" id="tab-unix" aria-selected="true" tabindex="0" data-i18n="tabUnix">Linux / macOS（免 sudo）</button>
+            <button type="button" role="tab" id="tab-repo" aria-selected="false" tabindex="-1" data-i18n="tabRepo">Linux RPM / APT 源</button>
+            <button type="button" role="tab" id="tab-win" aria-selected="false" tabindex="-1" data-i18n="tabWin">Windows</button>
+            <button type="button" role="tab" id="tab-cli" aria-selected="false" tabindex="-1" data-i18n="tabCli">CLI &amp; MCP 示例</button>
+          </div>
+          <div class="panels">
+            <div role="tabpanel" id="panel-unix" aria-labelledby="tab-unix" tabindex="0">
+              <div class="panel-card">
+                <p class="panel-desc" data-i18n="descUnix">免管理员权限安装到 ~/.local/opt/dbpp（macOS 为 /Applications/dbpp.app），自动校验 SHA-256 与注册桌面图标：</p>
+                <div class="copyable">
+                  <pre><code id="cmd-unix">curl -fsSL {{REPO_URL}}/releases/latest/download/install.sh | bash</code></pre>
+                  <span class="copy">
+                    <button type="button" class="copy-button" command="--copy" commandfor="cmd-unix" aria-label="复制 Linux/macOS 安装命令">
+                      <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
+                      <svg class="icon-check" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>
+                    </button>
+                    <span class="tip" role="status"></span>
+                  </span>
+                </div>
+                <p class="meta-row" data-i18n="uninstallUnix">卸载（保留 dbpp.sqlite3 与已装驱动）：<code>install.sh --uninstall</code></p>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-repo" aria-labelledby="tab-repo" hidden="until-found">
+              <div class="panel-card">
+                <p class="panel-desc" data-i18n="descRepo">配置官方 GPG 签名软件源（安装到 /opt/dbpp，支持 dnf / apt / zypper 随系统自动更新）：</p>
+                <div class="copyable">
+                  <pre><code id="cmd-repo">curl -fsSL {{BASE_URL}}/setup-repo.sh | sudo bash</code></pre>
+                  <span class="copy">
+                    <button type="button" class="copy-button" command="--copy" commandfor="cmd-repo" aria-label="复制系统软件源安装命令">
+                      <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
+                      <svg class="icon-check" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>
+                    </button>
+                    <span class="tip" role="status"></span>
+                  </span>
+                </div>
+                <p class="meta-row"><span data-i18n="gpgLabel">GPG 公钥指纹：</span><code>{{GPG_FPR}}</code> &middot; <a href="gpg.key">gpg.key</a></p>
+                <details>
+                  <summary data-i18n="manualRepoSummary">查看手动配置 Fedora/RHEL (dnf) 与 Debian/Ubuntu (apt) 命令</summary>
+                  <div class="copyable">
+                    <pre><code id="cmd-dnf"># Fedora / RHEL (x86_64 &amp; aarch64)
+sudo rpm --import {{BASE_URL}}/gpg.key
+sudo tee /etc/yum.repos.d/dbpp.repo &lt;&lt;'REPO'
+[dbpp]
+name=db++ Repository
+baseurl={{BASE_URL}}/rpm/$basearch/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey={{BASE_URL}}/gpg.key
+REPO
+sudo dnf install -y dbpp</code></pre>
+                    <span class="copy">
+                      <button type="button" class="copy-button" command="--copy" commandfor="cmd-dnf" aria-label="复制 dnf 手动源配置命令">
+                        <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
+                        <svg class="icon-check" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>
+                      </button>
+                      <span class="tip" role="status"></span>
+                    </span>
+                  </div>
+                  <div class="copyable">
+                    <pre><code id="cmd-apt"># Debian / Ubuntu (amd64 &amp; arm64)
+curl -fsSL {{BASE_URL}}/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/dbpp.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/dbpp.gpg] {{BASE_URL}}/apt stable main" | sudo tee /etc/apt/sources.list.d/dbpp.list
+sudo apt update &amp;&amp; sudo apt install -y dbpp</code></pre>
+                    <span class="copy">
+                      <button type="button" class="copy-button" command="--copy" commandfor="cmd-apt" aria-label="复制 apt 手动源配置命令">
+                        <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
+                        <svg class="icon-check" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>
+                      </button>
+                      <span class="tip" role="status"></span>
+                    </span>
+                  </div>
+                </details>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-win" aria-labelledby="tab-win" hidden="until-found">
+              <div class="panel-card">
+                <p class="panel-desc" data-i18n="descWin">在 PowerShell 下免管理员权限安装到 %LOCALAPPDATA%\Programs\dbpp（自动写入用户 PATH 与开始菜单）：</p>
+                <div class="copyable">
+                  <pre><code id="cmd-win">powershell -ExecutionPolicy ByPass -c "irm {{REPO_URL}}/releases/latest/download/install.ps1 | iex"</code></pre>
+                  <span class="copy">
+                    <button type="button" class="copy-button" command="--copy" commandfor="cmd-win" aria-label="复制 Windows 安装命令">
+                      <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
+                      <svg class="icon-check" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>
+                    </button>
+                    <span class="tip" role="status"></span>
+                  </span>
+                </div>
+                <p class="meta-row" data-i18n="winExtras">加 <code>$env:DBPP_USE_INSTALLER='1'</code> 可改用 WiX 图形安装向导；卸载设 <code>$env:DBPP_UNINSTALL='1'</code>。</p>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" hidden="until-found">
+              <div class="panel-card">
+                <p class="panel-desc" data-i18n="descCli">无需图形界面即可查询、导出/导入、在线管理 ADBC 驱动，支持 --json 结构化输出：</p>
+                <div class="copyable">
+                  <pre><code id="cmd-cli">dbpp doctor --json
+dbpp tables --sqlite ./app.sqlite --json
+dbpp query  --sqlite ./app.sqlite "SELECT * FROM items LIMIT 20" --json
+dbpp export --sqlite ./app.sqlite "SELECT * FROM items" --out items.xlsx
+dbpp import --sqlite ./app.sqlite items items.xlsx --mode create_append</code></pre>
+                  <span class="copy">
+                    <button type="button" class="copy-button" command="--copy" commandfor="cmd-cli" aria-label="复制 CLI 示例命令">
+                      <svg class="icon-copy" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V2zm2-1a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H6zM2 5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-1H8v1H2V6h1V5H2z"/></svg>
+                      <svg class="icon-check" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>
+                    </button>
+                    <span class="tip" role="status"></span>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="features">
+        <h2 data-i18n="featHeading">核心特性</h2>
+        <div class="grid">
+          <article class="card">
+            <h3 data-i18n="f1Title">SQLite 优先 &amp; ADBC 多数据库</h3>
+            <p data-i18n="f1Body">开箱内置 SQLite 驱动，统一通过 Apache Arrow ADBC 接入 PostgreSQL、MySQL、DuckDB、FlightSQL 等，并支持应用内浏览和在线安装驱动。</p>
+          </article>
+          <article class="card">
+            <h3 data-i18n="f2Title">零依赖内置 Redis 客户端</h3>
+            <p data-i18n="f2Body">原生 RESP2/RESP3 TCP 客户端，按 db0..db15 分类浏览，支持树状/表格双视图、String/Hash/List/Set/ZSet 编辑、TTL 管理与命令控制台。</p>
+          </article>
+          <article class="card">
+            <h3 data-i18n="f3Title">9 种格式导入 / 导出对称支持</h3>
+            <p data-i18n="f3Body">全面支持 CSV、TSV、Excel (.xlsx)、JSON、JSONL、SQL INSERT、Markdown、HTML、XML，GUI 右键菜单与 CLI 一体化零外部依赖读写。</p>
+          </article>
+          <article class="card">
+            <h3 data-i18n="f4Title">虚拟化表格 &amp; 多标签 SQL 页</h3>
+            <p data-i18n="f4Body">Lib-DataTable 单行高密度虚拟表格、内联编辑、空白草稿行事务提交/回滚、底部分页与排序筛选，同屏保留多个表与 SQL 查询标签页。</p>
+          </article>
+          <article class="card">
+            <h3 data-i18n="f5Title">无头 CLI &amp; MCP 就绪</h3>
+            <p data-i18n="f5Body">无显示环境也可直接执行查询、管理 dbpp.sqlite3 连接配置与驱动，所有指令提供结构化 --json 输出并内置 MCP 服务能力。</p>
+          </article>
+          <article class="card">
+            <h3 data-i18n="f6Title">轻量级托盘 · 5 套主题 · 双语界面</h3>
+            <p data-i18n="f6Body">单实例唤醒、关闭最小化托盘或轻量级模式释放窗口与连接、5 套主题预设（含 Gemini 星光）深浅色同步及中/英实时切换。</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>db++ &middot; v{{VERSION}}</span>
+      <div class="footer-links">
+        <a href="{{REPO_URL}}">Source</a>
+        <a href="{{REPO_URL}}/releases">Releases</a>
+        <a href="gpg.key">gpg.key</a>
+        <a href="setup-repo.sh">setup-repo.sh</a>
+        <a href="rpm/x86_64/repodata/repomd.xml">RPM (x86_64)</a>
+        <a href="rpm/aarch64/repodata/repomd.xml">RPM (aarch64)</a>
+        <a href="apt/dists/stable/InRelease">APT (InRelease)</a>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      const i18n = {
+        zh: {
+          releasesBtn: '发行版下载',
+          heroTitle: 'SQLite 优先的轻量级多数据库桌面端 & 无头 CLI',
+          heroDesc: '基于 C++23 模块与 HuxerUI 原生界面打造，内置 Apache Arrow ADBC 驱动管理、零外部依赖 Redis 客户端与 9 种格式导入/导出，同时提供适配 AI Agent 与脚本自动化的无头 CLI。',
+          ctaInstall: '安装与软件源',
+          ctaGpg: 'GPG 公钥',
+          installHeading: '安装与软件源',
+          tabUnix: 'Linux / macOS（免 sudo）',
+          tabRepo: 'Linux RPM / APT 源',
+          tabWin: 'Windows',
+          tabCli: 'CLI & MCP 示例',
+          descUnix: '免管理员权限安装到 ~/.local/opt/dbpp（macOS 为 /Applications/dbpp.app），自动校验 SHA-256 与注册桌面图标：',
+          uninstallUnix: '卸载（保留 dbpp.sqlite3 与已装驱动）：<code>install.sh --uninstall</code>',
+          descRepo: '配置官方 GPG 签名软件源（安装到 /opt/dbpp，支持 dnf / apt / zypper 随系统自动更新）：',
+          gpgLabel: 'GPG 公钥指纹：',
+          manualRepoSummary: '查看手动配置 Fedora/RHEL (dnf) 与 Debian/Ubuntu (apt) 命令',
+          descWin: '在 PowerShell 下免管理员权限安装到 %LOCALAPPDATA%\\Programs\\dbpp（自动写入用户 PATH 与开始菜单）：',
+          winExtras: '加 <code>$env:DBPP_USE_INSTALLER=\'1\'</code> 可改用 WiX 图形安装向导；卸载设 <code>$env:DBPP_UNINSTALL=\'1\'</code>。',
+          descCli: '无需图形界面即可查询、导出/导入、在线管理 ADBC 驱动，支持 --json 结构化输出：',
+          featHeading: '核心特性',
+          f1Title: 'SQLite 优先 & ADBC 多数据库',
+          f1Body: '开箱内置 SQLite 驱动，统一通过 Apache Arrow ADBC 接入 PostgreSQL、MySQL、DuckDB、FlightSQL 等，并支持应用内浏览和在线安装驱动。',
+          f2Title: '零依赖内置 Redis 客户端',
+          f2Body: '原生 RESP2/RESP3 TCP 客户端，按 db0..db15 分类浏览，支持树状/表格双视图、String/Hash/List/Set/ZSet 编辑、TTL 管理与命令控制台。',
+          f3Title: '9 种格式导入 / 导出对称支持',
+          f3Body: '全面支持 CSV、TSV、Excel (.xlsx)、JSON、JSONL、SQL INSERT、Markdown、HTML、XML，GUI 右键菜单与 CLI 一体化零外部依赖读写。',
+          f4Title: '虚拟化表格 & 多标签 SQL 页',
+          f4Body: 'Lib-DataTable 单行高密度虚拟表格、内联编辑、空白草稿行事务提交/回滚、底部分页与排序筛选，同屏保留多个表与 SQL 查询标签页。',
+          f5Title: '无头 CLI & MCP 就绪',
+          f5Body: '无显示环境也可直接执行查询、管理 dbpp.sqlite3 连接配置与驱动，所有指令提供结构化 --json 输出并内置 MCP 服务能力。',
+          f6Title: '轻量级托盘 · 5 套主题 · 双语界面',
+          f6Body: '单实例唤醒、关闭最小化托盘或轻量级模式释放窗口与连接、5 套主题预设（含 Gemini 星光）深浅色同步及中/英实时切换。',
+          copied: '已复制',
+          copyFailed: '复制失败',
+          langBtn: 'EN'
+        },
+        en: {
+          releasesBtn: 'Releases',
+          heroTitle: 'SQLite-first ADBC Desktop Data Manager & Headless CLI',
+          heroDesc: 'Built with C++23 modules and native HuxerUI. Ships with bundled SQLite ADBC support, multi-database driver management, a zero-dependency Redis client, 9-format import/export, and a scriptable JSON CLI.',
+          ctaInstall: 'Install & Packages',
+          ctaGpg: 'GPG Key',
+          installHeading: 'Install & Linux Packages',
+          tabUnix: 'Linux / macOS (Rootless)',
+          tabRepo: 'Linux RPM / APT Repo',
+          tabWin: 'Windows',
+          tabCli: 'CLI & MCP Examples',
+          descUnix: 'Installs without sudo to ~/.local/opt/dbpp (or /Applications/dbpp.app on macOS) with SHA-256 verification and desktop integration:',
+          uninstallUnix: 'Uninstall (preserves dbpp.sqlite3 and installed drivers): <code>install.sh --uninstall</code>',
+          descRepo: 'Configure the GPG-signed system repository (installs to /opt/dbpp; auto-updates via dnf / apt / zypper):',
+          gpgLabel: 'GPG key fingerprint: ',
+          manualRepoSummary: 'Show manual Fedora/RHEL (dnf) and Debian/Ubuntu (apt) repository commands',
+          descWin: 'Installs without admin rights to %LOCALAPPDATA%\\Programs\\dbpp with user PATH and Start Menu shortcut:',
+          winExtras: 'Set <code>$env:DBPP_USE_INSTALLER=\'1\'</code> for the graphical WiX installer, or <code>$env:DBPP_UNINSTALL=\'1\'</code> to uninstall.',
+          descCli: 'Run queries, import/export data, or inspect drivers headlessly with structured --json output:',
+          featHeading: 'Key Features',
+          f1Title: 'SQLite-first & ADBC Multi-Database',
+          f1Body: 'Bundled SQLite driver out of the box plus Apache Arrow ADBC support for PostgreSQL, MySQL, DuckDB, FlightSQL, and in-app driver registry installs.',
+          f2Title: 'Built-in Zero-Dep Redis Client',
+          f2Body: 'Native RESP2/RESP3 TCP client with db0..db15 navigation, table/tree dual views, String/Hash/List/Set/ZSet editing, TTL management, and command console.',
+          f3Title: '9 Symmetric Export & Import Formats',
+          f3Body: 'Zero-dependency read/write for CSV, TSV, Excel (.xlsx), JSON, JSONL, SQL INSERT, Markdown, HTML, and XML across GUI menus and CLI.',
+          f4Title: 'Virtualized Grid & Multi-Tab SQL',
+          f4Body: 'Compact virtualized Lib-DataTable grid with inline editing, draft row transactions, pagination/filtering/sorting, and persistent SQL console tabs.',
+          f5Title: 'Headless CLI & MCP Ready',
+          f5Body: 'Manage dbpp.sqlite3 profiles, drivers, and queries from scripts or AI agents with clean --json schemas and built-in MCP server support.',
+          f6Title: 'Lightweight Tray · 5 Themes · Bilingual UI',
+          f6Body: 'Single-instance activation, optional lightweight close-to-tray mode, 5 theme presets with system light/dark sync, and instant English/Chinese UI.',
+          copied: 'Copied',
+          copyFailed: 'Copy failed',
+          langBtn: '中文'
+        }
+      };
+
+      let lang = new URLSearchParams(location.search).get('lang') === 'en' ? 'en' : 'zh';
+      const langBtn = document.getElementById('lang-toggle');
+      const applyLang = (next) => {
+        lang = next;
+        document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
+        const dict = i18n[lang];
+        for (const el of document.querySelectorAll('[data-i18n]')) {
+          const key = el.getAttribute('data-i18n');
+          if (!(key in dict)) continue;
+          if (key === 'uninstallUnix' || key === 'winExtras') {
+            el.innerHTML = dict[key];
+          } else {
+            el.textContent = dict[key];
+          }
+        }
+        langBtn.textContent = dict.langBtn;
+      };
+      langBtn.addEventListener('click', () => applyLang(lang === 'zh' ? 'en' : 'zh'));
+      applyLang(lang);
+
+      // Accessible tablist (selection follows focus, arrow keys, hidden=until-found sync)
+      const tablist = document.querySelector('[role="tablist"]');
+      const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+      const panels = Array.from(document.querySelectorAll('[role="tabpanel"]'));
+
+      const selectTab = (targetTab, moveFocus = false) => {
+        for (const tab of tabs) {
+          const active = tab === targetTab;
+          tab.setAttribute('aria-selected', String(active));
+          tab.tabIndex = active ? 0 : -1;
+        }
+        for (const panel of panels) {
+          const active = panel.getAttribute('aria-labelledby') === targetTab.id;
+          if (active) {
+            panel.removeAttribute('hidden');
+            panel.tabIndex = 0;
+          } else {
+            panel.setAttribute('hidden', 'until-found');
+            panel.removeAttribute('tabindex');
+          }
+        }
+        targetTab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        if (moveFocus) targetTab.focus();
+      };
+
+      for (const tab of tabs) {
+        tab.addEventListener('click', () => selectTab(tab));
+      }
+      tablist.addEventListener('keydown', (e) => {
+        const idx = tabs.indexOf(document.activeElement);
+        if (idx === -1) return;
+        let next = -1;
+        if (e.key === 'ArrowRight') next = (idx + 1) % tabs.length;
+        else if (e.key === 'ArrowLeft') next = (idx - 1 + tabs.length) % tabs.length;
+        else if (e.key === 'Home') next = 0;
+        else if (e.key === 'End') next = tabs.length - 1;
+        if (next !== -1) {
+          e.preventDefault();
+          selectTab(tabs[next], true);
+        }
+      });
+      for (const panel of panels) {
+        panel.addEventListener('beforematch', () => {
+          const tab = document.getElementById(panel.getAttribute('aria-labelledby'));
+          if (tab) selectTab(tab);
+        });
+      }
+
+      // Copy button using Invoker Commands + progressive click fallback
+      const timers = new WeakMap();
+      let lastMessage = '';
+      const report = (button, ok) => {
+        const tip = button.nextElementSibling;
+        clearTimeout(timers.get(button));
+        button.removeAttribute('data-copied');
+        button.removeAttribute('data-failed');
+        let message = ok ? i18n[lang].copied : i18n[lang].copyFailed;
+        if (message === lastMessage) message += '\u00A0';
+        lastMessage = message;
+        tip.textContent = '';
+        void button.offsetWidth;
+        button.setAttribute(ok ? 'data-copied' : 'data-failed', '');
+        requestAnimationFrame(() => { tip.textContent = message; });
+        timers.set(button, setTimeout(() => {
+          button.removeAttribute('data-copied');
+          button.removeAttribute('data-failed');
+          tip.textContent = '';
+        }, 2000));
+      };
+
+      const copy = async (button, target) => {
+        const text = target.innerText.trim();
+        if (!text) return;
+        try {
+          await navigator.clipboard.writeText(text);
+          report(button, true);
+        } catch {
+          report(button, false);
+        }
+      };
+
+      document.addEventListener('command', (event) => {
+        if (event.command === '--copy' && event.source && event.target) {
+          copy(event.source, event.target);
+        }
+      }, true);
+
+      if (!('CommandEvent' in window)) {
+        document.addEventListener('click', (event) => {
+          if (event.defaultPrevented) return;
+          const button = event.target.closest('button[command="--copy"]');
+          if (!button) return;
+          const target = document.getElementById(button.getAttribute('commandfor'));
+          if (target) copy(button, target);
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

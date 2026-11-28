@@ -8,7 +8,10 @@ PKG_NAME="dbpp"
 DISPLAY_NAME="db++"
 VERSION=""
 BASE_URL="https://farnaherry.github.io/dbpp"
+REPO_URL="https://github.com/FarnaHerry/dbpp"
 SETUP_SCRIPT=""
+TEMPLATE_HTML=""
+LOGO_PATH=""
 REQUIRE_APT="0"
 
 die() { printf '[build-linux-repo] error: %s\n' "$*" >&2; exit 1; }
@@ -25,7 +28,10 @@ Options:
   --display-name <name>  Display name (default: db++)
   --version <ver>        Release version string (e.g. 0.4.10)
   --base-url <url>       Published base URL (default: https://farnaherry.github.io/dbpp)
+  --repo-url <url>       Source repository URL (default: https://github.com/FarnaHerry/dbpp)
   --setup-script <path>  Optional setup-repo.sh to copy to <output-dir>/setup-repo.sh
+  --template <path>      Optional index.html template with {{VERSION}}/{{BASE_URL}}/{{GPG_FPR}}/{{REPO_URL}}
+  --logo <path>          Optional PNG logo copied to <output-dir>/icon.png
   --require-apt          Fail if dpkg-scanpackages / apt-ftparchive are unavailable
 EOF
 }
@@ -38,7 +44,10 @@ while [[ $# -gt 0 ]]; do
     --display-name) DISPLAY_NAME="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --base-url) BASE_URL="${2%/}"; shift 2 ;;
+    --repo-url) REPO_URL="${2%/}"; shift 2 ;;
     --setup-script) SETUP_SCRIPT="$2"; shift 2 ;;
+    --template) TEMPLATE_HTML="$2"; shift 2 ;;
+    --logo) LOGO_PATH="$2"; shift 2 ;;
     --require-apt) REQUIRE_APT="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
@@ -216,7 +225,26 @@ if [[ -n "$SETUP_SCRIPT" ]]; then
   chmod 0755 "${OUTPUT_DIR}/setup-repo.sh"
 fi
 
-cat > "${OUTPUT_DIR}/index.html" <<EOF
+if [[ -n "$LOGO_PATH" ]]; then
+  [[ -f "$LOGO_PATH" ]] || die "Logo file not found: $LOGO_PATH"
+  cp -f "$LOGO_PATH" "${OUTPUT_DIR}/icon.png"
+  chmod 0644 "${OUTPUT_DIR}/icon.png"
+fi
+
+if [[ -n "$TEMPLATE_HTML" ]]; then
+  [[ -f "$TEMPLATE_HTML" ]] || die "HTML template not found: $TEMPLATE_HTML"
+  python3 - "$TEMPLATE_HTML" "${OUTPUT_DIR}/index.html" "${VERSION:-latest}" "$BASE_URL" "$FPR" "$REPO_URL" <<'PY'
+import sys
+src, dst, ver, base_url, fpr, repo_url = sys.argv[1:7]
+with open(src, 'r', encoding='utf-8') as f:
+    html = f.read()
+for k, v in (('{{VERSION}}', ver), ('{{BASE_URL}}', base_url), ('{{GPG_FPR}}', fpr), ('{{REPO_URL}}', repo_url)):
+    html = html.replace(k, v)
+with open(dst, 'w', encoding='utf-8') as f:
+    f.write(html)
+PY
+else
+  cat > "${OUTPUT_DIR}/index.html" <<EOF
 <!doctype html>
 <html lang="en">
 <head>
@@ -252,5 +280,6 @@ sudo apt update &amp;&amp; sudo apt install -y ${PKG_NAME}</code></pre>
 </body>
 </html>
 EOF
+fi
 
 log "Repository site built at ${OUTPUT_DIR} (RPM arches: ${!rpm_arches[*]}; APT: ${APT_STATUS})"
