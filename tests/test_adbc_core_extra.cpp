@@ -339,10 +339,30 @@ void TestMcpSettingsPersistence(const fs::path& dir) {
 
   dbpp::TraySettings page_saved = loaded;
   page_saved.default_page_size = 250000;
+  page_saved.redis_view_mode = dbpp::RedisBrowserViewMode::Tree;
   Expect(dbpp::SaveTraySettings(cfg_db.string(), page_saved),
-         "SaveTraySettings default_page_size failed");
+         "SaveTraySettings default_page_size and redis_view_mode failed");
   const dbpp::TraySettings page_loaded = dbpp::LoadTraySettings(cfg_db.string());
   Expect(page_loaded.default_page_size == 250000, "LoadTraySettings default_page_size mismatch");
+  Expect(page_loaded.redis_view_mode == dbpp::RedisBrowserViewMode::Tree,
+         "LoadTraySettings redis_view_mode Tree mismatch");
+
+  Expect(dbpp::RedisViewModeKey(dbpp::RedisBrowserViewMode::Tree) == "tree" &&
+             dbpp::RedisViewModeKey(dbpp::RedisBrowserViewMode::Table) == "table",
+         "RedisViewModeKey mismatch");
+  Expect(dbpp::RedisViewModeFromKey("tree") == dbpp::RedisBrowserViewMode::Tree &&
+             dbpp::RedisViewModeFromKey(" TREE ") == dbpp::RedisBrowserViewMode::Tree &&
+             dbpp::RedisViewModeFromKey("table") == dbpp::RedisBrowserViewMode::Table &&
+             dbpp::RedisViewModeFromKey("unknown") == dbpp::RedisBrowserViewMode::Table,
+         "RedisViewModeFromKey mismatch");
+
+  dbpp::TraySettings table_saved = page_loaded;
+  table_saved.redis_view_mode = dbpp::RedisBrowserViewMode::Table;
+  Expect(dbpp::SaveTraySettings(cfg_db.string(), table_saved),
+         "SaveTraySettings redis_view_mode Table failed");
+  const dbpp::TraySettings table_loaded = dbpp::LoadTraySettings(cfg_db.string());
+  Expect(table_loaded.redis_view_mode == dbpp::RedisBrowserViewMode::Table,
+         "LoadTraySettings redis_view_mode Table roundtrip mismatch");
 }
 
 void TestSqlDatabaseContextHelpers() {

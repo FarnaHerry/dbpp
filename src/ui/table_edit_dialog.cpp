@@ -449,7 +449,7 @@ void ShowTableCellContextMenu(
 }
 
 void LaunchTableFileImport(
-    bool is_jsonl, const std::shared_ptr<FilePicker>& picker,
+    ExportFormat format, const std::shared_ptr<FilePicker>& picker,
     const std::shared_ptr<AdbcSession>& adbc_ptr, std::string target_table_name,
     std::string target_catalog, std::string target_schema, bool is_production,
     std::string prod_conn_name, const DialogHandle& dialogs, const TaskScope& tasks,
@@ -458,15 +458,19 @@ void LaunchTableFileImport(
   if (!picker || !picker->CanOpenFiles() || !adbc_ptr) {
     return;
   }
+  const ExportFormatInfo info = GetExportFormatInfo(format);
   const auto run_ingest = [picker, adbc_ptr, target_table_name, target_catalog, target_schema,
-                           tasks, notify, loc, on_done, is_jsonl]() {
+                           tasks, notify, loc, on_done, format, info]() {
     tasks.Launch([picker, adbc_ptr, target_table_name, target_catalog, target_schema, notify, loc,
-                  on_done, is_jsonl]() -> Task<void> {
+                  on_done, format, info]() -> Task<void> {
+      std::vector<std::string> exts{std::string(info.extension)};
+      if (format == ExportFormat::Jsonl) exts.push_back("ndjson");
+      else if (format == ExportFormat::Markdown) exts.push_back("markdown");
+      else if (format == ExportFormat::Html) exts.push_back("htm");
       FilePickerFilter filter{
-          .name = is_jsonl ? "JSONL" : "CSV",
-          .extensions = is_jsonl ? std::vector<std::string>{"jsonl", "ndjson"}
-                                 : std::vector<std::string>{"csv", "tsv"},
-          .content_types = {is_jsonl ? "application/x-ndjson" : "text/csv"},
+          .name = std::string(info.filter_name),
+          .extensions = std::move(exts),
+          .content_types = {std::string(info.content_type)},
       };
       auto selected = co_await picker->OpenFileAsync(std::move(filter));
       if (!selected) co_return;
@@ -477,13 +481,9 @@ void LaunchTableFileImport(
       }
       const std::string p = file->Path();
       const BulkIngestResult res = co_await adbc_ptr->sequence.Run(
-          [adbc_ptr, p, target_table_name, target_catalog, target_schema,
-           is_jsonl](std::stop_token) {
-            return is_jsonl
-                       ? IngestJsonlPathBlocking(*adbc_ptr, p, target_table_name,
-                                                 IngestMode::Append, target_catalog, target_schema)
-                       : IngestCsvPathBlocking(*adbc_ptr, p, target_table_name,
-                                               IngestMode::Append, target_catalog, target_schema);
+          [adbc_ptr, p, format, target_table_name, target_catalog, target_schema](std::stop_token) {
+            return IngestPathBlocking(*adbc_ptr, p, format, target_table_name, IngestMode::Append,
+                                      target_catalog, target_schema);
           });
       if (!res.error.empty()) {
         if (notify) notify(loc.Fmt(app::strings::table_import_failed, res.error));
@@ -511,8 +511,7 @@ void LaunchTableFileImport(
           .language_mode = language_mode,
           .system_dark = system_dark,
       },
-      std::string(is_jsonl ? "IMPORT JSONL -> " : "IMPORT CSV -> ") + target_table_name,
-      run_ingest);
+      "IMPORT " + std::string(info.filter_name) + " -> " + target_table_name, run_ingest);
 }
 
 namespace {
@@ -757,18 +756,8 @@ void AppendTableIoMenuEntries(
         }));
   }
   export_children.emplace_back(MenuSection{});
-  export_children.emplace_back(MenuItem(
-      app::images::external_link, loc.Get(app::strings::sql_export_csv),
-      [adbc_ptr, export_sql, base, picker, tasks, notify, loc] {
-        ExportSqlWithPicker(adbc_ptr, export_sql, ExportFormat::Csv, base + ".csv", picker, tasks,
-                            notify, loc);
-      }));
-  export_children.emplace_back(MenuItem(
-      app::images::external_link, loc.Get(app::strings::sql_export_jsonl),
-      [adbc_ptr, export_sql, base, picker, tasks, notify, loc] {
-        ExportSqlWithPicker(adbc_ptr, export_sql, ExportFormat::Jsonl, base + ".jsonl", picker,
-                            tasks, notify, loc);
-      }));
+  AppendDataExportMenuEntries(export_children, adbc_ptr, export_sql, base,
+                              QualifiedName(dialect, object), picker, tasks, notify, loc);
 
   entries.emplace_back(MenuSection{});
   entries.emplace_back(MenuItem(app::images::external_link,
@@ -776,22 +765,9 @@ void AppendTableIoMenuEntries(
                                 std::move(export_children)));
   if (!read_only && !object.is_view) {
     std::vector<MenuEntry> import_children;
-    import_children.emplace_back(MenuItem(
-        app::images::add, loc.Get(app::strings::table_import_csv),
-        [picker, adbc_ptr, object, is_production, prod_conn_name, dialogs, tasks, notify, loc,
-         on_done, theme_config, language_mode, system_dark] {
-          LaunchTableFileImport(false, picker, adbc_ptr, object.name, object.catalog,
+    AppendDataImportMenuEntries(import_children, picker, adbc_ptr, object.name, object.catalog,
                                 object.db_schema, is_production, prod_conn_name, dialogs, tasks,
                                 notify, loc, on_done, theme_config, language_mode, system_dark);
-        }));
-    import_children.emplace_back(MenuItem(
-        app::images::add, loc.Get(app::strings::table_import_jsonl),
-        [picker, adbc_ptr, object, is_production, prod_conn_name, dialogs, tasks, notify, loc,
-         on_done, theme_config, language_mode, system_dark] {
-          LaunchTableFileImport(true, picker, adbc_ptr, object.name, object.catalog,
-                                object.db_schema, is_production, prod_conn_name, dialogs, tasks,
-                                notify, loc, on_done, theme_config, language_mode, system_dark);
-        }));
     entries.emplace_back(MenuItem(app::images::add,
                                   loc.Get(app::strings::sidebar_ctx_import_table),
                                   std::move(import_children)));

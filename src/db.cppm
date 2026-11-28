@@ -46,6 +46,7 @@ struct AppModel {
   std::unordered_map<std::string, std::string> failed_connections;
   std::uint64_t next_session_id = 1;
   std::int64_t default_page_size = kPageSize;
+  RedisBrowserViewMode default_redis_view_mode = RedisBrowserViewMode::Table;
   int revision = 0;
 
   [[nodiscard]] const DbSession* ActiveSession() const {

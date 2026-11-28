@@ -29,6 +29,9 @@ struct DecodedValueResult {
 [[nodiscard]] ValueDecoderKind DetectSuggestedDecoder(std::string_view raw) noexcept;
 [[nodiscard]] DecodedValueResult DecodeValue(std::string_view raw, ValueDecoderKind kind);
 [[nodiscard]] DecodedValueResult MinifyJsonValue(std::string_view raw);
+[[nodiscard]] bool InflateRawDeflateBytes(std::string_view compressed, std::string& out,
+                                          std::string& error_out,
+                                          std::size_t max_output_bytes = 64u * 1024u * 1024u);
 
 } // namespace dbpp
 

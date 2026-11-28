@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.4.7 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.4.8 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -139,10 +139,12 @@ set(DBPP_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_design_page.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_edit_dialog.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/redis_tree_view.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/redis_dialogs.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/value_decoder_view.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/theme.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/tray.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/ui_common.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/export_helpers.cpp"
 )
 
 if (WIN32)
@@ -217,11 +219,15 @@ add_library(dbpp_core STATIC
         src/adbc_session.cpp
         src/adbc_session_exec.cpp
         src/adbc_arrow.cpp
+        src/adbc_export.cpp
+        src/adbc_xlsx.cpp
         src/adbc_metadata.cpp
         src/adbc_catalog_extras.cpp
         src/adbc_table_identity.cpp
         src/adbc_prepared.cpp
         src/adbc_ingest.cpp
+        src/adbc_ingest_formats.cpp
+        src/adbc_ingest_xlsx.cpp
         src/adbc_dump.cpp
         src/adbc_sql_format.cpp
         src/adbc_time.cpp
@@ -479,6 +485,7 @@ if (DBPP_BUILD_TESTS)
     dbpp_add_module_test(test_redis redis tests/test_redis.cpp tests/test_redis_mock.cpp)
     dbpp_add_module_test(test_mcp mcp tests/test_mcp.cpp)
     dbpp_add_module_test(test_decoder decoder tests/test_decoder.cpp)
+    dbpp_add_module_test(test_export export tests/test_export_formats.cpp)
 endif ()
 
 add_custom_target(dbpp-run

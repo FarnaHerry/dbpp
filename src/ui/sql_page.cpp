@@ -522,7 +522,7 @@ using namespace dbpp::ui;
 
   Views sql_footer_items;
   sql_footer_items.Add(AuditDurationBadge(sql_model.last_elapsed_us));
-  sql_footer_items.Add(AuditSqlBadge(sql_model.last_executed_sql, notify));
+  sql_footer_items.Add(AuditCommandBadge(sql_model.last_executed_sql, notify));
   sql_footer_items.Add(Spacer());
   sql_footer_items.Add(Text(status_display)
                            .Style(TextStyle{Font::System(font_size::kCaption),
@@ -677,18 +677,8 @@ using namespace dbpp::ui;
                     return;
                   }
                   std::vector<MenuEntry> entries;
-                  entries.emplace_back(MenuItem(
-                      app::images::external_link, loc.Get(app::strings::sql_export_csv),
-                      [live_adbc, sql_text, picker, tasks, notify, loc] {
-                        ExportSqlWithPicker(live_adbc, sql_text, ExportFormat::Csv, "query.csv",
-                                            picker, tasks, notify, loc);
-                      }));
-                  entries.emplace_back(MenuItem(
-                      app::images::external_link, loc.Get(app::strings::sql_export_jsonl),
-                      [live_adbc, sql_text, picker, tasks, notify, loc] {
-                        ExportSqlWithPicker(live_adbc, sql_text, ExportFormat::Jsonl,
-                                            "query.jsonl", picker, tasks, notify, loc);
-                      }));
+                  AppendDataExportMenuEntries(entries, live_adbc, sql_text, "query", {}, picker,
+                                              tasks, notify, loc);
                   menu.Show(export_anchor, std::move(entries),
                             MenuOptions{.placement = {.side = AnchorSide::Below,
                                                       .alignment = AnchorAlignment::End},

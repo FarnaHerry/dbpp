@@ -612,6 +612,67 @@ void RunCliCommandTests(const fs::path& dir, const std::string& driver_path) {
                           exp.out.find("\"rows_written\":2") != std::string::npos,
                       "CLI export failed: " + exp.err);
 
+    const fs::path exp_json = dir / "cli_export.json";
+    const auto exp_j = dbpp_test::InvokeCli(
+        {"export", "--sqlite", cli_db.string(), "SELECT id, label FROM ext_items ORDER BY id",
+         "--type", "json", "--out", exp_json.string(), "--json"});
+    dbpp_test::Expect(exp_j.code == dbpp::kCliExitOk &&
+                          dbpp_test::ReadBinaryFile(exp_json).starts_with("[\n"),
+                      "CLI export --type json failed: " + exp_j.err);
+
+    const fs::path exp_sql = dir / "cli_export.sql";
+    const auto exp_s = dbpp_test::InvokeCli(
+        {"export", "--sqlite", cli_db.string(), "SELECT id, label FROM ext_items ORDER BY id",
+         "--type", "sql", "--table", "custom_tbl", "--out", exp_sql.string(), "--json"});
+    dbpp_test::Expect(exp_s.code == dbpp::kCliExitOk &&
+                          dbpp_test::ReadBinaryFile(exp_sql).find("INSERT INTO \"custom_tbl\"") !=
+                              std::string::npos,
+                      "CLI export --type sql --table failed: " + exp_s.err);
+
+    for (const char* ext : {".tsv", ".md", ".html", ".xml", ".xlsx"}) {
+      const fs::path p = dir / (std::string("cli_auto") + ext);
+      const auto r = dbpp_test::InvokeCli(
+          {"export", "--sqlite", cli_db.string(), "SELECT id, label FROM ext_items ORDER BY id",
+           "--out", p.string(), "--json"});
+      dbpp_test::Expect(r.code == dbpp::kCliExitOk &&
+                            r.out.find("\"rows_written\":2") != std::string::npos &&
+                            fs::file_size(p) > 0,
+                        std::string("CLI export extension auto-detect failed for ") + ext);
+    }
+
+    const auto bad_type = dbpp_test::InvokeCli(
+        {"export", "--sqlite", cli_db.string(), "SELECT 1", "--type", "parquet", "--json"});
+    dbpp_test::Expect(bad_type.code == dbpp::kCliExitUsage,
+                      "CLI export invalid --type should exit with usage code 2");
+
+    // Aligned CLI import across exported formats (auto-detected by extension + --type sql)
+    for (const auto& [src, tbl] : std::vector<std::pair<fs::path, std::string>>{
+             {exp_json, "imp_json"},
+             {dir / "cli_auto.tsv", "imp_tsv"},
+             {dir / "cli_auto.md", "imp_md"},
+             {dir / "cli_auto.html", "imp_html"},
+             {dir / "cli_auto.xml", "imp_xml"},
+             {dir / "cli_auto.xlsx", "imp_xlsx"},
+         }) {
+      const auto ri = dbpp_test::InvokeCli(
+          {"import", "--sqlite", cli_db.string(), tbl, src.string(), "--mode", "create", "--json"});
+      dbpp_test::Expect(ri.code == dbpp::kCliExitOk &&
+                            ri.out.find("\"rows_affected\":2") != std::string::npos,
+                        "CLI import failed for " + src.filename().string() + ": " + ri.err);
+    }
+    const auto prep_sql = dbpp_test::InvokeCli(
+        {"exec", "--sqlite", cli_db.string(), "CREATE TABLE custom_tbl (id INTEGER, label TEXT);",
+         "--json"});
+    dbpp_test::Expect(prep_sql.code == dbpp::kCliExitOk, "Prepare custom_tbl failed");
+    const auto imp_sql = dbpp_test::InvokeCli(
+        {"import", "--sqlite", cli_db.string(), "custom_tbl", exp_sql.string(), "--json"});
+    dbpp_test::Expect(imp_sql.code == dbpp::kCliExitOk, "CLI import .sql failed: " + imp_sql.err);
+    const auto bad_imp = dbpp_test::InvokeCli(
+        {"import", "--sqlite", cli_db.string(), "t", csv_file.string(), "--type", "parquet",
+         "--json"});
+    dbpp_test::Expect(bad_imp.code == dbpp::kCliExitUsage,
+                      "CLI import invalid --type should exit with usage code 2");
+
     const fs::path copy_dst = dir / "cli_copy_dst.sqlite";
     const auto cp = dbpp_test::InvokeCli(
         {"copy", "--src-sqlite", cli_db.string(), "--dst-sqlite", copy_dst.string(),

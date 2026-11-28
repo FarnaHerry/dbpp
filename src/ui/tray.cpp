@@ -311,6 +311,7 @@ void InstallTrayRuntime(ApplicationContext& context) {
   settings->mcp_port = startup.mcp_port;
   settings->mcp_read_only = startup.mcp_read_only;
   settings->default_page_size = startup.default_page_size;
+  settings->redis_view_mode = startup.redis_view_mode;
   settings->persist_setting = [config_db](std::string key, std::string value) {
     config_db->PersistSetting(std::move(key), std::move(value));
   };

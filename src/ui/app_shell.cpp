@@ -74,14 +74,16 @@ using namespace dbpp::ui;
   const AppThemeConfig theme_config = settings_model->ThemeConfig();
   const LanguageMode language_mode = settings_model->language.Get();
   const std::int64_t default_page_size = settings_model->default_page_size.Get();
+  const RedisBrowserViewMode default_redis_view_mode = settings_model->redis_view_mode.Get();
   Lifecycle(
-      [app, default_page_size] {
-        app.Update([default_page_size](AppModel& model) {
+      [app, default_page_size, default_redis_view_mode] {
+        app.Update([default_page_size, default_redis_view_mode](AppModel& model) {
           model.default_page_size = default_page_size;
+          model.default_redis_view_mode = default_redis_view_mode;
         });
         return [] {};
       },
-      default_page_size);
+      std::pair{default_page_size, default_redis_view_mode});
   const ResolvedTheme resolved = ResolveTheme(theme_config, system_dark);
   const ThemeSpec& spec = resolved.spec;
   const SemanticColors& semantic = resolved.semantic;

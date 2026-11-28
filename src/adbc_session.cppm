@@ -173,18 +173,25 @@ bool ExecutePreparedNonQuery(AdbcSession& session, std::string_view sql,
                              const std::vector<std::string>& declared_types,
                              AdbcQueryResult& out, int& status_out);
 
+[[nodiscard]] ExportFormatInfo GetExportFormatInfo(ExportFormat format);
+[[nodiscard]] std::optional<ExportFormat> ParseExportFormatName(std::string_view text);
+[[nodiscard]] std::optional<ExportFormat> InferExportFormatFromExtension(std::string_view ext);
+
 ExportStreamResult ExportQueryStreamBlocking(AdbcSession& session, std::string sql,
                                              ExportFormat format, std::ostream& out,
-                                             std::size_t max_rows = 0);
+                                             std::size_t max_rows = 0,
+                                             std::string_view sql_table_name = {});
 ExportStreamResult ExportQueryToFileBlocking(AdbcSession& session, std::string sql,
                                              ExportFormat format,
                                              const std::filesystem::path& path,
-                                             std::size_t max_rows = 0);
+                                             std::size_t max_rows = 0,
+                                             std::string_view sql_table_name = {});
 std::string MakeTempExportPath(ExportFormat format);
 void RemoveFileQuietly(std::string_view path);
 ExportStreamResult ExportQueryToFilePathBlocking(AdbcSession& session, std::string sql,
                                                  ExportFormat format, std::string_view path,
-                                                 std::size_t max_rows = 0);
+                                                 std::size_t max_rows = 0,
+                                                 std::string_view sql_table_name = {});
 
 BulkIngestResult IngestCsvFileBlocking(AdbcSession& session, const std::filesystem::path& path,
                                        std::string_view target_table, IngestMode mode,
@@ -204,6 +211,16 @@ BulkIngestResult IngestJsonlPathBlocking(AdbcSession& session, std::string_view 
                                          std::string_view target_table, IngestMode mode,
                                          std::string_view target_catalog = {},
                                          std::string_view target_schema = {});
+BulkIngestResult IngestFileBlocking(AdbcSession& session, const std::filesystem::path& path,
+                                    ExportFormat format, std::string_view target_table,
+                                    IngestMode mode, std::string_view target_catalog = {},
+                                    std::string_view target_schema = {}, char delimiter = '\0',
+                                    bool has_header = true);
+BulkIngestResult IngestPathBlocking(AdbcSession& session, std::string_view path,
+                                    ExportFormat format, std::string_view target_table,
+                                    IngestMode mode, std::string_view target_catalog = {},
+                                    std::string_view target_schema = {}, char delimiter = '\0',
+                                    bool has_header = true);
 BulkIngestResult CopyQueryToTableBlocking(AdbcSession& source, std::string source_sql,
                                           AdbcSession& target, std::string_view target_table,
                                           IngestMode mode,
@@ -359,6 +376,35 @@ void AdbcPopulateColumnsFromArrowSchema(const ArrowSchema& schema, const DbObjec
 std::string AdbcFormatArrowSqlLiteral(const ArrowArrayView& view, std::int64_t row,
                                       const ArrowSchema* schema, Dialect dialect,
                                       std::string_view declared_type);
+CellValue AdbcExtractArrowCell(const ArrowArrayView& view, std::int64_t row,
+                               const ArrowSchema* schema, int depth, bool nested);
+void AdbcAppendJsonEscapedString(std::string& out, std::string_view text);
+void AdbcAppendJsonValue(std::string& out, const ArrowArrayView& view, std::int64_t row,
+                         const ArrowSchema* schema, int depth);
+ExportStreamResult AdbcExportArrowStreamAsXlsx(AdbcSession& session, ArrowArrayStream& stream,
+                                               const ArrowSchema& schema,
+                                               const std::vector<std::string>& column_names,
+                                               std::ostream& out, std::size_t max_rows,
+                                               std::string_view sheet_name);
+
+struct AdbcTabularDataset {
+  std::vector<std::string> columns;
+  std::vector<ArrowType> types;
+  std::vector<std::vector<std::optional<std::string>>> rows;
+};
+void AdbcFinalizeTabularDatasetTypes(AdbcTabularDataset& dataset);
+bool AdbcParseJsonFile(const std::filesystem::path& path, AdbcTabularDataset& out,
+                       std::string& error_out);
+bool AdbcParseJsonlFile(const std::filesystem::path& path, AdbcTabularDataset& out,
+                        std::string& error_out);
+bool AdbcParseMarkdownTableFile(const std::filesystem::path& path, AdbcTabularDataset& out,
+                                std::string& error_out);
+bool AdbcParseHtmlTableFile(const std::filesystem::path& path, bool has_header,
+                            AdbcTabularDataset& out, std::string& error_out);
+bool AdbcParseXmlRowsFile(const std::filesystem::path& path, AdbcTabularDataset& out,
+                          std::string& error_out);
+bool AdbcParseXlsxFile(const std::filesystem::path& path, bool has_header, AdbcTabularDataset& out,
+                       std::string& error_out);
 AdbcObjectsResult AdbcLoadObjectsBlockingOnce(AdbcSession& session, AdbcStatusCode& status_out);
 void AdbcEnrichCatalogObjects(AdbcSession& session, AdbcObjectsResult& result);
 AdbcQueryResult AdbcExecuteBlockingRaw(AdbcSession& session, std::string sql, bool want_rows,

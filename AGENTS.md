@@ -20,7 +20,7 @@ ADBC 兼容其它数据库），规模不大，规则直接索引到源文件；
 | 国际化（中/英、语言切换） | src/i18n.*、resources/strings/{default,zh}.properties、src/settings.*（GUI 走 ProvideEnvironment/UseString，Worker/后端走 Tr/TrFmt） |
 | 主题/配色 | src/ui/theme.h、src/ui/theme_palette.h、src/ui/theme_palette.cpp、src/ui/theme.cpp（预设 + SemanticColors Token，禁止散落硬编码色值） |
 | 图标与打包 | resources/（运行时资源包，app::images::* / app::strings::*）、assets/（平台二进制图标）、platform/ 与 CMakeLists.txt |
-| CI、安装器与发版 | .github/workflows/build.yml、cmake/{CxxImportStdGate,FindSQLite3}.cmake、platform/{windows,macos}/ 与 tests/ |
+| CI、安装器与发版 | .github/workflows/build.yml、scripts/、cmake/{CxxImportStdGate,FindSQLite3}.cmake、platform/{windows,macos}/ 与 tests/ |
 
 ## 全局底线
 

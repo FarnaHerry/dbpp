@@ -34,10 +34,17 @@
       <RegistryValue Root="HKLM" Key="Software\dev.farna.dbpp\db++" Name="desktopShortcut"
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>
+    <Component Id="ApplicationPath" Directory="INSTALLFOLDER">
+      <Environment Id="ApplicationPathEnv" Name="PATH" Value="[INSTALLFOLDER]"
+                   Permanent="no" Part="last" Action="set" System="yes" />
+      <RegistryValue Root="HKLM" Key="Software\dev.farna.dbpp\db++" Name="path"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
 
     <Feature Id="Application" Title="db++" Level="1">
       <ComponentGroupRef Id="ApplicationFiles" />
       <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="ApplicationPath" />
     </Feature>
     <Feature Id="DesktopShortcut" Title="Desktop shortcut" Level="2" AllowAbsent="yes">
       <Level Value="1" Condition="CREATE_DESKTOP_SHORTCUT = 1" />

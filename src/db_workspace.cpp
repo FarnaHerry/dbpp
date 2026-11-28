@@ -413,6 +413,9 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
 
   const std::int64_t initial_page_size =
       app.Get().default_page_size > 0 ? app.Get().default_page_size : kPageSize;
+  const bool is_redis_session = session->dialect == Dialect::Redis;
+  const RedisBrowserViewMode initial_redis_mode =
+      is_redis_session ? app.Get().default_redis_view_mode : RedisBrowserViewMode::Table;
   std::uint64_t created_id = 0;
   workspace.Update([&](WorkspaceModel& ws) {
     WorkspaceTab tab;
@@ -426,7 +429,9 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
     tab.object_name = std::move(object);
     tab.object_schema = std::move(db_schema);
     tab.is_view = is_view;
+    tab.table.object = tab.object_name;
     tab.table.page_size = initial_page_size;
+    tab.redis_view_mode = initial_redis_mode;
     ws.tabs.push_back(std::move(tab));
     ws.active_tab_id = created_id;
   });
@@ -435,8 +440,10 @@ void SelectObject(const State<AppModel>& app, const State<WorkspaceModel>& works
     detail::DbSyncAppFromActiveTab(model, ws_now);
     model.error.clear();
   });
-  RequestLoadTable(app, workspace, tasks, created_id, 0, std::nullopt, {}, false,
-                   std::move(notify), initial_page_size);
+  if (!(is_redis_session && initial_redis_mode == RedisBrowserViewMode::Tree)) {
+    RequestLoadTable(app, workspace, tasks, created_id, 0, std::nullopt, {}, false,
+                     std::move(notify), initial_page_size);
+  }
 }
 
 namespace {

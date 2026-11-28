@@ -18,6 +18,7 @@ inline constexpr std::string_view kSettingMcpHost = "mcp.host";
 inline constexpr std::string_view kSettingMcpPort = "mcp.port";
 inline constexpr std::string_view kSettingMcpReadOnly = "mcp.read_only";
 inline constexpr std::string_view kSettingDefaultPageSize = "query.page_size";
+inline constexpr std::string_view kSettingRedisViewMode = "redis.view_mode";
 inline constexpr std::uint16_t kDefaultMcpPort = 18765;
 inline constexpr std::int64_t kDefaultPageSize = 100;
 inline constexpr std::int64_t kMinPageSize = 1;
@@ -44,6 +45,11 @@ enum class LanguageMode {
   En = 2,
 };
 
+enum class RedisBrowserViewMode {
+  Table = 0,
+  Tree = 1,
+};
+
 struct AppThemeConfig {
   ThemeMode mode = ThemeMode::System;
   ThemePreset preset = ThemePreset::GeminiSpark;
@@ -57,6 +63,8 @@ struct AppThemeConfig {
 [[nodiscard]] ThemePreset ThemePresetFromKey(std::string_view key);
 [[nodiscard]] std::string_view LanguageModeKey(LanguageMode mode);
 [[nodiscard]] LanguageMode LanguageModeFromKey(std::string_view key);
+[[nodiscard]] std::string_view RedisViewModeKey(RedisBrowserViewMode mode);
+[[nodiscard]] RedisBrowserViewMode RedisViewModeFromKey(std::string_view key);
 
 /// Persisted tray, theme, language, and MCP server preferences. Stored as key/value rows in SQLite
 /// (`dbpp.sqlite3` `settings` table, automatically migrating legacy `settings.tsv`).
@@ -71,6 +79,7 @@ struct TraySettings {
   std::uint16_t mcp_port = kDefaultMcpPort;
   bool mcp_read_only = true;
   std::int64_t default_page_size = kDefaultPageSize;
+  RedisBrowserViewMode redis_view_mode = RedisBrowserViewMode::Table;
 
   bool operator==(const TraySettings&) const = default;
 };
@@ -100,6 +109,7 @@ struct SettingsModel {
   huxerui::State<std::uint16_t> mcp_port{kDefaultMcpPort};
   huxerui::State<bool> mcp_read_only{true};
   huxerui::State<std::int64_t> default_page_size{kDefaultPageSize};
+  huxerui::State<RedisBrowserViewMode> redis_view_mode{RedisBrowserViewMode::Table};
   std::string path;
   std::function<void(std::string, std::string)> persist_setting;
 
@@ -114,6 +124,7 @@ struct SettingsModel {
   bool SetMcpPort(std::uint16_t port);
   bool SetMcpReadOnly(bool read_only);
   bool SetDefaultPageSize(std::int64_t page_size);
+  bool SetRedisViewMode(RedisBrowserViewMode mode);
 
   [[nodiscard]] TraySettings Snapshot() const;
   [[nodiscard]] AppThemeConfig ThemeConfig() const;

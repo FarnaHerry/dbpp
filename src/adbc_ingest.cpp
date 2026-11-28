@@ -24,12 +24,6 @@ const char* IngestModeOptionValue(IngestMode mode) {
   return ADBC_INGEST_OPTION_MODE_CREATE;
 }
 
-struct TabularDataset {
-  std::vector<std::string> columns;
-  std::vector<ArrowType> types;
-  std::vector<std::vector<std::optional<std::string>>> rows;
-};
-
 ArrowType InferColumnTypeFromSamples(const std::vector<std::vector<std::optional<std::string>>>& rows,
                                      std::size_t col_idx) {
   bool saw_value = false;
@@ -76,10 +70,11 @@ ArrowType InferColumnTypeFromSamples(const std::vector<std::vector<std::optional
 }
 
 bool ParseCsvFile(const std::filesystem::path& path, char delimiter, bool has_header,
-                  TabularDataset& out, std::string& error_out) {
+                  detail::AdbcTabularDataset& out, std::string& error_out) {
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) {
-    error_out = TrFmt("Failed to open CSV file: {0}", "无法打开 CSV 文件: {0}", {path.string()});
+    error_out = TrFmt("Failed to open delimited file: {0}", "无法打开分隔符文件: {0}",
+                      {path.string()});
     return false;
   }
   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -190,200 +185,11 @@ bool ParseCsvFile(const std::filesystem::path& path, char delimiter, bool has_he
     row.resize(num_cols);
     out.rows.push_back(std::move(row));
   }
-  out.types.resize(num_cols, NANOARROW_TYPE_STRING);
-  for (std::size_t c = 0; c < num_cols; ++c) {
-    out.types[c] = InferColumnTypeFromSamples(out.rows, c);
-  }
+  detail::AdbcFinalizeTabularDatasetTypes(out);
   return true;
 }
 
-bool ParseJsonlObjectLine(std::string_view line,
-                          std::vector<std::pair<std::string, std::optional<std::string>>>& fields,
-                          std::string& error_out) {
-  fields.clear();
-  std::size_t pos = 0;
-  const auto skip_ws = [&] {
-    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t' || line[pos] == '\r')) {
-      ++pos;
-    }
-  };
-  const auto parse_str = [&](std::string& s) -> bool {
-    if (pos >= line.size() || line[pos] != '"') return false;
-    ++pos;
-    s.clear();
-    while (pos < line.size()) {
-      const char c = line[pos++];
-      if (c == '"') return true;
-      if (c == '\\') {
-        if (pos >= line.size()) return false;
-        const char e = line[pos++];
-        switch (e) {
-          case '"': s.push_back('"'); break;
-          case '\\': s.push_back('\\'); break;
-          case '/': s.push_back('/'); break;
-          case 'b': s.push_back('\b'); break;
-          case 'f': s.push_back('\f'); break;
-          case 'n': s.push_back('\n'); break;
-          case 'r': s.push_back('\r'); break;
-          case 't': s.push_back('\t'); break;
-          default: s.push_back(e); break;
-        }
-      } else {
-        s.push_back(c);
-      }
-    }
-    return false;
-  };
-
-  skip_ws();
-  if (pos >= line.size() || line[pos] != '{') {
-    error_out = Tr("JSONL line must be a JSON object", "JSONL 每行必须是 JSON 对象");
-    return false;
-  }
-  ++pos;
-  skip_ws();
-  if (pos < line.size() && line[pos] == '}') {
-    ++pos;
-    skip_ws();
-    return pos == line.size();
-  }
-  while (pos < line.size()) {
-    skip_ws();
-    std::string key;
-    if (!parse_str(key)) {
-      error_out = Tr("Invalid JSONL key", "JSONL 键格式无效");
-      return false;
-    }
-    skip_ws();
-    if (pos >= line.size() || line[pos] != ':') {
-      error_out = Tr("Expected ':' in JSONL object", "JSONL 对象缺少冒号");
-      return false;
-    }
-    ++pos;
-    skip_ws();
-    if (pos >= line.size()) {
-      return false;
-    }
-    std::optional<std::string> val;
-    if (line[pos] == '"') {
-      std::string sv;
-      if (!parse_str(sv)) {
-        error_out = Tr("Invalid JSONL string value", "JSONL 字符串值格式无效");
-        return false;
-      }
-      val = std::move(sv);
-    } else if (line.substr(pos, 4) == "null") {
-      pos += 4;
-      val = std::nullopt;
-    } else if (line.substr(pos, 4) == "true") {
-      pos += 4;
-      val = "true";
-    } else if (line.substr(pos, 5) == "false") {
-      pos += 5;
-      val = "false";
-    } else if (line[pos] == '{' || line[pos] == '[') {
-      const std::size_t start = pos;
-      int depth = 0;
-      bool in_q = false;
-      while (pos < line.size()) {
-        const char ch = line[pos++];
-        if (in_q) {
-          if (ch == '\\' && pos < line.size()) ++pos;
-          else if (ch == '"') in_q = false;
-        } else {
-          if (ch == '"') in_q = true;
-          else if (ch == '{' || ch == '[') ++depth;
-          else if (ch == '}' || ch == ']') {
-            --depth;
-            if (depth == 0) break;
-          }
-        }
-      }
-      if (depth != 0) {
-        error_out = Tr("Unterminated nested JSON value", "JSON 嵌套值未闭合");
-        return false;
-      }
-      val = std::string(line.substr(start, pos - start));
-    } else {
-      const std::size_t start = pos;
-      while (pos < line.size() && line[pos] != ',' && line[pos] != '}' &&
-             line[pos] != ' ' && line[pos] != '\t' && line[pos] != '\r') {
-        ++pos;
-      }
-      if (pos == start) {
-        error_out = Tr("Invalid JSONL value", "JSONL 值无效");
-        return false;
-      }
-      val = std::string(line.substr(start, pos - start));
-    }
-    fields.emplace_back(std::move(key), std::move(val));
-    skip_ws();
-    if (pos < line.size() && line[pos] == ',') {
-      ++pos;
-      continue;
-    }
-    if (pos < line.size() && line[pos] == '}') {
-      ++pos;
-      skip_ws();
-      return pos == line.size();
-    }
-    error_out = Tr("Malformed JSONL object", "JSONL 对象格式错误");
-    return false;
-  }
-  return false;
-}
-
-bool ParseJsonlFile(const std::filesystem::path& path, TabularDataset& out,
-                    std::string& error_out) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in.is_open()) {
-    error_out = TrFmt("Failed to open JSONL file: {0}", "无法打开 JSONL 文件: {0}", {path.string()});
-    return false;
-  }
-  std::unordered_map<std::string, std::size_t> col_index;
-  std::vector<std::vector<std::pair<std::string, std::optional<std::string>>>> raw_lines;
-  std::string line;
-  std::size_t line_no = 0;
-  while (std::getline(in, line)) {
-    ++line_no;
-    const std::string_view trimmed = detail::AdbcTrimAscii(line);
-    if (trimmed.empty()) {
-      continue;
-    }
-    std::vector<std::pair<std::string, std::optional<std::string>>> fields;
-    std::string line_err;
-    if (!ParseJsonlObjectLine(trimmed, fields, line_err)) {
-      error_out = "Line " + std::to_string(line_no) + ": " + line_err;
-      return false;
-    }
-    for (const auto& [k, _] : fields) {
-      if (!col_index.contains(k)) {
-        const std::size_t idx = out.columns.size();
-        col_index.emplace(k, idx);
-        out.columns.push_back(k);
-      }
-    }
-    raw_lines.push_back(std::move(fields));
-  }
-  if (raw_lines.empty() || out.columns.empty()) {
-    error_out = Tr("JSONL file contains no records", "JSONL 文件没有有效记录");
-    return false;
-  }
-  out.rows.resize(raw_lines.size());
-  for (std::size_t r = 0; r < raw_lines.size(); ++r) {
-    out.rows[r].resize(out.columns.size());
-    for (auto& [k, v] : raw_lines[r]) {
-      out.rows[r][col_index[k]] = std::move(v);
-    }
-  }
-  out.types.resize(out.columns.size(), NANOARROW_TYPE_STRING);
-  for (std::size_t c = 0; c < out.columns.size(); ++c) {
-    out.types[c] = InferColumnTypeFromSamples(out.rows, c);
-  }
-  return true;
-}
-
-bool BuildDatasetStream(const TabularDataset& dataset, ArrowArrayStream& stream_out,
+bool BuildDatasetStream(const detail::AdbcTabularDataset& dataset, ArrowArrayStream& stream_out,
                         std::string& error_out) {
   stream_out = ArrowArrayStream{};
   detail::AdbcSchemaHolder schema;
@@ -581,14 +387,65 @@ BulkIngestResult ExecuteBulkIngestStream(AdbcSession& session, ArrowArrayStream&
 
 } // namespace
 
-BulkIngestResult IngestCsvFileBlocking(AdbcSession& session, const std::filesystem::path& path,
-                                       std::string_view target_table, IngestMode mode,
-                                       std::string_view target_catalog,
-                                       std::string_view target_schema, char delimiter,
-                                       bool has_header) {
-  TabularDataset dataset;
+namespace detail {
+
+void AdbcFinalizeTabularDatasetTypes(AdbcTabularDataset& dataset) {
+  dataset.types.resize(dataset.columns.size(), NANOARROW_TYPE_STRING);
+  for (std::size_t c = 0; c < dataset.columns.size(); ++c) {
+    dataset.types[c] = InferColumnTypeFromSamples(dataset.rows, c);
+  }
+}
+
+} // namespace detail
+
+BulkIngestResult IngestFileBlocking(AdbcSession& session, const std::filesystem::path& path,
+                                    ExportFormat format, std::string_view target_table,
+                                    IngestMode mode, std::string_view target_catalog,
+                                    std::string_view target_schema, char delimiter,
+                                    bool has_header) {
+  if (format == ExportFormat::SqlInsert) {
+    const SqlScriptImportResult sql_res = ImportSqlScriptFileBlocking(session, path, target_schema);
+    BulkIngestResult out;
+    out.connection_lost = sql_res.connection_lost;
+    out.error = sql_res.error;
+    out.rows_affected = sql_res.rows_affected >= 0
+                            ? sql_res.rows_affected
+                            : static_cast<std::int64_t>(sql_res.statements_executed);
+    return out;
+  }
+
+  detail::AdbcTabularDataset dataset;
   std::string err;
-  if (!ParseCsvFile(path, delimiter, has_header, dataset, err)) {
+  bool parsed = false;
+  switch (format) {
+    case ExportFormat::Csv:
+      parsed = ParseCsvFile(path, delimiter == '\0' ? ',' : delimiter, has_header, dataset, err);
+      break;
+    case ExportFormat::Tsv:
+      parsed = ParseCsvFile(path, delimiter == '\0' ? '\t' : delimiter, has_header, dataset, err);
+      break;
+    case ExportFormat::Json:
+      parsed = detail::AdbcParseJsonFile(path, dataset, err);
+      break;
+    case ExportFormat::Jsonl:
+      parsed = detail::AdbcParseJsonlFile(path, dataset, err);
+      break;
+    case ExportFormat::Markdown:
+      parsed = detail::AdbcParseMarkdownTableFile(path, dataset, err);
+      break;
+    case ExportFormat::Html:
+      parsed = detail::AdbcParseHtmlTableFile(path, has_header, dataset, err);
+      break;
+    case ExportFormat::Xml:
+      parsed = detail::AdbcParseXmlRowsFile(path, dataset, err);
+      break;
+    case ExportFormat::Xlsx:
+      parsed = detail::AdbcParseXlsxFile(path, has_header, dataset, err);
+      break;
+    case ExportFormat::SqlInsert:
+      break;
+  }
+  if (!parsed) {
     return BulkIngestResult{.error = std::move(err)};
   }
   ArrowArrayStream stream{};
@@ -597,6 +454,24 @@ BulkIngestResult IngestCsvFileBlocking(AdbcSession& session, const std::filesyst
   }
   return ExecuteBulkIngestStream(session, stream, target_table, mode, target_catalog,
                                  target_schema);
+}
+
+BulkIngestResult IngestPathBlocking(AdbcSession& session, std::string_view path,
+                                    ExportFormat format, std::string_view target_table,
+                                    IngestMode mode, std::string_view target_catalog,
+                                    std::string_view target_schema, char delimiter,
+                                    bool has_header) {
+  return IngestFileBlocking(session, std::filesystem::path(path), format, target_table, mode,
+                            target_catalog, target_schema, delimiter, has_header);
+}
+
+BulkIngestResult IngestCsvFileBlocking(AdbcSession& session, const std::filesystem::path& path,
+                                       std::string_view target_table, IngestMode mode,
+                                       std::string_view target_catalog,
+                                       std::string_view target_schema, char delimiter,
+                                       bool has_header) {
+  return IngestFileBlocking(session, path, ExportFormat::Csv, target_table, mode, target_catalog,
+                            target_schema, delimiter, has_header);
 }
 
 BulkIngestResult IngestCsvPathBlocking(AdbcSession& session, std::string_view path,
@@ -612,17 +487,8 @@ BulkIngestResult IngestJsonlFileBlocking(AdbcSession& session, const std::filesy
                                          std::string_view target_table, IngestMode mode,
                                          std::string_view target_catalog,
                                          std::string_view target_schema) {
-  TabularDataset dataset;
-  std::string err;
-  if (!ParseJsonlFile(path, dataset, err)) {
-    return BulkIngestResult{.error = std::move(err)};
-  }
-  ArrowArrayStream stream{};
-  if (!BuildDatasetStream(dataset, stream, err)) {
-    return BulkIngestResult{.error = std::move(err)};
-  }
-  return ExecuteBulkIngestStream(session, stream, target_table, mode, target_catalog,
-                                 target_schema);
+  return IngestFileBlocking(session, path, ExportFormat::Jsonl, target_table, mode, target_catalog,
+                            target_schema);
 }
 
 BulkIngestResult IngestJsonlPathBlocking(AdbcSession& session, std::string_view path,

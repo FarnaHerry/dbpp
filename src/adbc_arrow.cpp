@@ -469,28 +469,6 @@ CellValue ExtractArrowCellImpl(const ArrowArrayView& view, std::int64_t row,
   return cell;
 }
 
-void WriteCsvField(std::ostream& out, std::string_view value) {
-  bool needs_quotes = false;
-  for (const char ch : value) {
-    if (ch == ',' || ch == '"' || ch == '\n' || ch == '\r') {
-      needs_quotes = true;
-      break;
-    }
-  }
-  if (!needs_quotes) {
-    out.write(value.data(), static_cast<std::streamsize>(value.size()));
-    return;
-  }
-  out.put('"');
-  for (const char ch : value) {
-    if (ch == '"') {
-      out.put('"');
-    }
-    out.put(ch);
-  }
-  out.put('"');
-}
-
 void ApplyStreamError(ArrowArrayStream& stream, AdbcQueryResult& out) {
   AdbcStatusCode stream_status = ADBC_STATUS_OK;
   const detail::AdbcCapturedError captured =
@@ -763,200 +741,20 @@ std::string AdbcFormatArrowSqlLiteral(const ArrowArrayView& view, std::int64_t r
   return SqlLiteral(dialect, cell.text, effective_type, false);
 }
 
+CellValue AdbcExtractArrowCell(const ArrowArrayView& view, std::int64_t row,
+                               const ArrowSchema* schema, int depth, bool nested) {
+  return ExtractArrowCellImpl(view, row, schema, depth, nested);
+}
+
+void AdbcAppendJsonEscapedString(std::string& out, std::string_view text) {
+  AppendJsonEscapedString(out, text);
+}
+
+void AdbcAppendJsonValue(std::string& out, const ArrowArrayView& view, std::int64_t row,
+                         const ArrowSchema* schema, int depth) {
+  AppendJsonValue(out, view, row, schema, depth);
+}
+
 } // namespace detail
-
-ExportStreamResult ExportQueryStreamBlocking(AdbcSession& session, std::string sql,
-                                             ExportFormat format, std::ostream& out,
-                                             std::size_t max_rows) {
-  ExportStreamResult result;
-  if (session.IsClosed()) {
-    result.connection_lost = true;
-    result.error = Tr("Connection is closed", "连接已关闭");
-    return result;
-  }
-  if (!session.connection_created) {
-    result.error = Tr("Connection is closed", "连接已关闭");
-    return result;
-  }
-
-  session.cancel_requested.store(false, std::memory_order_release);
-  detail::AdbcErrorGuard error;
-  detail::AdbcStatementGuard statement_guard;
-  AdbcStatusCode status =
-      AdbcStatementNew(&session.connection, &statement_guard.statement, error.Ptr());
-  if (status != ADBC_STATUS_OK) {
-    const auto cap = error.TakeDetailed();
-    result.error = cap.message;
-    result.connection_lost = IsConnectionLostError(status, cap.message, cap.sqlstate);
-    return result;
-  }
-  statement_guard.created = true;
-
-  status = AdbcStatementSetSqlQuery(&statement_guard.statement, sql.c_str(), error.Ptr());
-  if (status != ADBC_STATUS_OK) {
-    const auto cap = error.TakeDetailed();
-    result.error = cap.message;
-    result.connection_lost = IsConnectionLostError(status, cap.message, cap.sqlstate);
-    return result;
-  }
-
-  detail::AdbcStreamHolder stream;
-  detail::AdbcRegisterActiveStatement(session, &statement_guard.statement);
-  status = AdbcStatementExecuteQuery(&statement_guard.statement, &stream.stream, nullptr,
-                                     error.Ptr());
-  detail::AdbcClearActiveStatement(session, &statement_guard.statement);
-  if (status != ADBC_STATUS_OK) {
-    const auto cap = error.TakeDetailed();
-    result.error = cap.message;
-    result.cancelled = (status == ADBC_STATUS_CANCELLED) ||
-                       session.cancel_requested.load(std::memory_order_acquire);
-    result.connection_lost = IsConnectionLostError(status, cap.message, cap.sqlstate);
-    return result;
-  }
-
-  detail::AdbcSchemaHolder schema;
-  if (stream.stream.get_schema(&stream.stream, &schema.schema) != 0) {
-    AdbcStatusCode stream_status = ADBC_STATUS_OK;
-    const auto cap = detail::AdbcCaptureStreamError(stream.stream, &stream_status);
-    result.error = cap.message;
-    result.cancelled = (stream_status == ADBC_STATUS_CANCELLED);
-    result.connection_lost = IsConnectionLostError(stream_status, cap.message, cap.sqlstate);
-    return result;
-  }
-
-  const std::int64_t field_count = schema.schema.n_children;
-  std::vector<std::string> column_names;
-  column_names.reserve(static_cast<std::size_t>(field_count));
-  for (std::int64_t c = 0; c < field_count; ++c) {
-    const ArrowSchema* field = schema.schema.children[c];
-    column_names.push_back(field != nullptr && field->name != nullptr
-                               ? std::string(field->name)
-                               : ("column_" + std::to_string(c + 1)));
-  }
-
-  if (format == ExportFormat::Csv && field_count > 0) {
-    for (std::int64_t c = 0; c < field_count; ++c) {
-      if (c > 0) {
-        out.put(',');
-      }
-      WriteCsvField(out, column_names[static_cast<std::size_t>(c)]);
-    }
-    out.put('\n');
-  }
-
-  bool stop = false;
-  while (!stop) {
-    if (session.cancel_requested.load(std::memory_order_acquire)) {
-      result.cancelled = true;
-      result.error = Tr("Export cancelled", "导出已取消");
-      break;
-    }
-    detail::AdbcArrayHolder array;
-    if (stream.stream.get_next(&stream.stream, &array.array) != 0) {
-      AdbcStatusCode stream_status = ADBC_STATUS_OK;
-      const auto cap = detail::AdbcCaptureStreamError(stream.stream, &stream_status);
-      result.error = cap.message;
-      result.cancelled = (stream_status == ADBC_STATUS_CANCELLED);
-      result.connection_lost = IsConnectionLostError(stream_status, cap.message, cap.sqlstate);
-      break;
-    }
-    if (array.array.release == nullptr) {
-      break;
-    }
-
-    ArrayViewHolder root;
-    ArrowError arrow_error;
-    ArrowErrorInit(&arrow_error);
-    if (ArrowArrayViewInitFromSchema(&root.view, &schema.schema, &arrow_error) != NANOARROW_OK) {
-      result.error = detail::AdbcDecodeSystemTextToUtf8(arrow_error.message);
-      break;
-    }
-    root.initialized = true;
-    ArrowErrorInit(&arrow_error);
-    if (ArrowArrayViewSetArray(&root.view, &array.array, &arrow_error) != NANOARROW_OK) {
-      result.error = detail::AdbcDecodeSystemTextToUtf8(arrow_error.message);
-      break;
-    }
-
-    for (std::int64_t row = 0; row < array.array.length; ++row) {
-      if (max_rows > 0 && result.rows_written >= max_rows) {
-        result.truncated = true;
-        stop = true;
-        break;
-      }
-      if (format == ExportFormat::Csv) {
-        for (std::int64_t c = 0; c < field_count; ++c) {
-          if (c > 0) {
-            out.put(',');
-          }
-          const CellValue cell = ExtractArrowCellImpl(
-              *root.view.children[c], row, schema.schema.children[c], 0, true);
-          if (!cell.is_null) {
-            WriteCsvField(out, cell.text);
-          }
-        }
-        out.put('\n');
-      } else {
-        std::string line;
-        line.push_back('{');
-        for (std::int64_t c = 0; c < field_count; ++c) {
-          if (c > 0) {
-            line += ", ";
-          }
-          AppendJsonEscapedString(line, column_names[static_cast<std::size_t>(c)]);
-          line += ": ";
-          AppendJsonValue(line, *root.view.children[c], row, schema.schema.children[c], 0);
-        }
-        line += "}\n";
-        out.write(line.data(), static_cast<std::streamsize>(line.size()));
-      }
-      if (!out.good()) {
-        result.error = Tr("Failed while writing export stream", "写入导出流失败");
-        stop = true;
-        break;
-      }
-      ++result.rows_written;
-    }
-  }
-  out.flush();
-  return result;
-}
-
-ExportStreamResult ExportQueryToFileBlocking(AdbcSession& session, std::string sql,
-                                             ExportFormat format,
-                                             const std::filesystem::path& path,
-                                             std::size_t max_rows) {
-  std::error_code ec;
-  if (path.has_parent_path()) {
-    std::filesystem::create_directories(path.parent_path(), ec);
-  }
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  if (!file.is_open()) {
-    ExportStreamResult res;
-    res.error = TrFmt("Failed to open output file: {0}", "无法打开导出文件: {0}", {path.string()});
-    return res;
-  }
-  return ExportQueryStreamBlocking(session, std::move(sql), format, file, max_rows);
-}
-
-std::string MakeTempExportPath(ExportFormat format) {
-  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-  const std::string ext = (format == ExportFormat::Csv) ? ".csv" : ".jsonl";
-  return (std::filesystem::temp_directory_path() /
-          ("dbpp_export_" + std::to_string(stamp) + ext))
-      .string();
-}
-
-void RemoveFileQuietly(std::string_view path) {
-  std::error_code ec;
-  std::filesystem::remove(std::filesystem::path(path), ec);
-}
-
-ExportStreamResult ExportQueryToFilePathBlocking(AdbcSession& session, std::string sql,
-                                                 ExportFormat format, std::string_view path,
-                                                 std::size_t max_rows) {
-  return ExportQueryToFileBlocking(session, std::move(sql), format, std::filesystem::path(path),
-                                   max_rows);
-}
 
 } // namespace dbpp

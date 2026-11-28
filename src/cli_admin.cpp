@@ -3,7 +3,7 @@ module;
 #include <huxerui/datatable.h>
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.7"
+#define DBPP_VERSION "0.4.8"
 #endif
 
 module dbpp.cli;
@@ -50,9 +50,9 @@ void CliPrintTopLevelHelp(std::ostream& out) {
       << "  info     <conn>              Show ADBC driver/vendor metadata (GetInfo)\n"
       << "  stats    <conn> <table>      Show ADBC table/column statistics (GetStatistics)\n"
       << "  import   <conn> <table> <file>\n"
-      << "                               Bulk ingest CSV/JSONL into table via ADBC BindStream\n"
+      << "                               Bulk ingest CSV/TSV/JSON/JSONL/SQL/MD/HTML/XML/XLSX into table\n"
       << "  export   <conn> <sql|-|--file <path>> --out <file>\n"
-      << "                               Stream Arrow results to CSV or JSONL\n"
+      << "                               Stream Arrow results to CSV/TSV/JSON/JSONL/SQL/MD/HTML/XML/XLSX\n"
       << "  copy     <src_conn> <dst_conn> --sql <sql> --table <table>\n"
       << "                               Stream Arrow query results between connections\n"
       << "  version                      Print version\n"
@@ -145,12 +145,15 @@ bool CliPrintCommandHelp(std::string_view cmd, std::ostream& out) {
     return true;
   }
   if (cmd == "import") {
-    out << "Usage: dbpp import <conn> <table> <file> [--type csv|jsonl] [--mode create|append|replace|create_append]\n"
-        << "                   [--delimiter <char>] [--no-header] [--catalog <c>] [--schema <s>] [--json]\n";
+    out << "Usage: dbpp import <conn> <table> <file> [--type csv|tsv|json|jsonl|sql|markdown|html|xml|xlsx]\n"
+        << "                   [--mode create|append|replace|create_append] [--delimiter <char>]\n"
+        << "                   [--no-header] [--catalog <c>] [--schema <s>] [--json]\n";
     return true;
   }
   if (cmd == "export") {
-    out << "Usage: dbpp export <conn> [<sql> | --sql <sql> | --file <path> | -] [--out <file>] [--type csv|jsonl] [--max-rows N] [--json]\n";
+    out << "Usage: dbpp export <conn> [<sql> | --sql <sql> | --file <path> | -] [--out <file>]\n"
+        << "                   [--type csv|tsv|json|jsonl|sql|markdown|html|xml|xlsx]\n"
+        << "                   [--table <name>] [--max-rows N] [--json]\n";
     return true;
   }
   if (cmd == "copy") {

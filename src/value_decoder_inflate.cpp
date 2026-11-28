@@ -122,7 +122,7 @@ bool DecodeSymbol(BitReader& br, const HuffmanTable& h, int& sym_out, std::strin
 }
 
 bool DecodeCodesBlock(BitReader& br, const HuffmanTable& lencode, const HuffmanTable& distcode,
-                      std::string& out, std::string& err) {
+                      std::string& out, std::size_t max_output_bytes, std::string& err) {
   static constexpr std::array<std::uint16_t, 29> kLenBase = {
       3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
       31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
@@ -146,8 +146,8 @@ bool DecodeCodesBlock(BitReader& br, const HuffmanTable& lencode, const HuffmanT
       return false;
     }
     if (sym < 256) {
-      if (out.size() >= kMaxInflateOutputBytes) {
-        err = Tr("Decompressed payload exceeds 4 MiB safety limit", "解压后数据超过 4 MiB 安全上限");
+      if (out.size() >= max_output_bytes) {
+        err = Tr("Decompressed payload exceeds safety limit", "解压后数据超过安全上限");
         return false;
       }
       out.push_back(static_cast<char>(sym));
@@ -183,8 +183,8 @@ bool DecodeCodesBlock(BitReader& br, const HuffmanTable& lencode, const HuffmanT
       err = Tr("Invalid DEFLATE back-reference distance", "无效的 DEFLATE 回溯偏移距离");
       return false;
     }
-    if (out.size() + len > kMaxInflateOutputBytes) {
-      err = Tr("Decompressed payload exceeds 4 MiB safety limit", "解压后数据超过 4 MiB 安全上限");
+    if (out.size() + len > max_output_bytes) {
+      err = Tr("Decompressed payload exceeds safety limit", "解压后数据超过安全上限");
       return false;
     }
     for (std::size_t i = 0; i < len; ++i) {
@@ -193,7 +193,8 @@ bool DecodeCodesBlock(BitReader& br, const HuffmanTable& lencode, const HuffmanT
   }
 }
 
-bool InflateFixedBlock(BitReader& br, std::string& out, std::string& err) {
+bool InflateFixedBlock(BitReader& br, std::string& out, std::size_t max_output_bytes,
+                       std::string& err) {
   std::array<int, kFixLCodes> l_lens{};
   for (int i = 0; i <= 143; ++i) l_lens[static_cast<std::size_t>(i)] = 8;
   for (int i = 144; i <= 255; ++i) l_lens[static_cast<std::size_t>(i)] = 9;
@@ -208,10 +209,11 @@ bool InflateFixedBlock(BitReader& br, std::string& out, std::string& err) {
     err = Tr("Failed to initialize fixed Huffman table", "初始化固定 Huffman 表失败");
     return false;
   }
-  return DecodeCodesBlock(br, lencode, distcode, out, err);
+  return DecodeCodesBlock(br, lencode, distcode, out, max_output_bytes, err);
 }
 
-bool InflateDynamicBlock(BitReader& br, std::string& out, std::string& err) {
+bool InflateDynamicBlock(BitReader& br, std::string& out, std::size_t max_output_bytes,
+                         std::string& err) {
   static constexpr std::array<int, 19> kClOrder = {
       16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
   };
@@ -297,11 +299,12 @@ bool InflateDynamicBlock(BitReader& br, std::string& out, std::string& err) {
     err = Tr("Incomplete or invalid dynamic Huffman table", "动态 Huffman 码表无效");
     return false;
   }
-  return DecodeCodesBlock(br, lencode, distcode, out, err);
+  return DecodeCodesBlock(br, lencode, distcode, out, max_output_bytes, err);
 }
 
 bool InflateRawDeflate(std::span<const unsigned char> stream, std::size_t& consumed_out,
-                       std::string& out, std::string& err) {
+                       std::string& out, std::string& err,
+                       std::size_t max_output_bytes = kMaxInflateOutputBytes) {
   BitReader br{.data = stream};
   out.clear();
   for (;;) {
@@ -329,18 +332,18 @@ bool InflateRawDeflate(std::span<const unsigned char> stream, std::size_t& consu
         err = Tr("Truncated stored DEFLATE block payload", "未压缩块数据不完整");
         return false;
       }
-      if (out.size() + len > kMaxInflateOutputBytes) {
-        err = Tr("Decompressed payload exceeds 4 MiB safety limit", "解压后数据超过 4 MiB 安全上限");
+      if (out.size() + len > max_output_bytes) {
+        err = Tr("Decompressed payload exceeds safety limit", "解压后数据超过安全上限");
         return false;
       }
       out.append(reinterpret_cast<const char*>(br.data.data() + br.byte_pos), len);
       br.byte_pos += len;
     } else if (btype == 1) {
-      if (!InflateFixedBlock(br, out, err)) {
+      if (!InflateFixedBlock(br, out, max_output_bytes, err)) {
         return false;
       }
     } else if (btype == 2) {
-      if (!InflateDynamicBlock(br, out, err)) {
+      if (!InflateDynamicBlock(br, out, max_output_bytes, err)) {
         return false;
       }
     } else {
@@ -518,3 +521,15 @@ bool InflateGzipOrZlib(std::string_view bytes, InflateContainerKind& kind_out, s
 }
 
 } // namespace dbpp::detail
+
+namespace dbpp {
+
+bool InflateRawDeflateBytes(std::string_view compressed, std::string& out, std::string& error_out,
+                            std::size_t max_output_bytes) {
+  std::size_t consumed = 0;
+  const std::span<const unsigned char> span(
+      reinterpret_cast<const unsigned char*>(compressed.data()), compressed.size());
+  return detail::InflateRawDeflate(span, consumed, out, error_out, max_output_bytes);
+}
+
+} // namespace dbpp

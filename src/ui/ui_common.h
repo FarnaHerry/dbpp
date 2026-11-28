@@ -17,7 +17,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.7"
+#define DBPP_VERSION "0.4.8"
 #endif
 
 #include "ui/theme_palette.h"
@@ -176,7 +176,20 @@ void ExportSqlWithPicker(std::shared_ptr<AdbcSession> adbc, std::string sql,
                          ExportFormat format, std::string suggested_name,
                          std::shared_ptr<huxerui::FilePicker> picker,
                          huxerui::TaskScope tasks, NotifyFn notify,
-                         LocalizedCatalog loc);
+                         LocalizedCatalog loc, std::string sql_table_name = {});
+void AppendDataExportMenuEntries(std::vector<huxerui::MenuEntry>& entries,
+                                 std::shared_ptr<AdbcSession> adbc, std::string export_sql,
+                                 std::string base_name, std::string sql_table_name,
+                                 std::shared_ptr<huxerui::FilePicker> picker,
+                                 huxerui::TaskScope tasks, NotifyFn notify,
+                                 LocalizedCatalog loc);
+void AppendDataImportMenuEntries(
+    std::vector<huxerui::MenuEntry>& entries, const std::shared_ptr<huxerui::FilePicker>& picker,
+    const std::shared_ptr<AdbcSession>& adbc_ptr, std::string target_table_name,
+    std::string target_catalog, std::string target_schema, bool is_production,
+    std::string prod_conn_name, const huxerui::DialogHandle& dialogs, const huxerui::TaskScope& tasks,
+    NotifyFn notify, LocalizedCatalog loc, std::function<void()> on_done,
+    AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark);
 
 // Shared UI composables (src/ui/ui_common.cpp)
 huxerui::View TableEmptyState(huxerui::StringVariant text);
@@ -184,7 +197,7 @@ huxerui::View BigEmptyState(std::function<void()> open_new);
 huxerui::View PageSizePopup(huxerui::PopupContext popup, std::int64_t current_size,
                             std::function<void(std::int64_t)> on_apply);
 huxerui::View AuditDurationBadge(std::int64_t elapsed_us);
-huxerui::View AuditSqlBadge(std::string executed_sql, NotifyFn notify);
+huxerui::View AuditCommandBadge(std::string executed_command, NotifyFn notify);
 huxerui::View PageNumberInput(std::int64_t current_page_one_based,
                               std::optional<std::int64_t> max_page_one_based, bool enabled,
                               std::function<void(std::int64_t)> on_go_zero_based, NotifyFn notify);
@@ -247,7 +260,7 @@ void RunGuardedWrite(const WriteGuardContext& guard, std::string action_summary,
 
 // Record & cell edit dialogs (src/ui/table_edit_dialog.cpp)
 void LaunchTableFileImport(
-    bool is_jsonl, const std::shared_ptr<huxerui::FilePicker>& picker,
+    ExportFormat format, const std::shared_ptr<huxerui::FilePicker>& picker,
     const std::shared_ptr<AdbcSession>& adbc_ptr, std::string target_table_name,
     std::string target_catalog, std::string target_schema, bool is_production,
     std::string prod_conn_name, const huxerui::DialogHandle& dialogs,
@@ -323,6 +336,18 @@ huxerui::View RedisTreeWorkspace(
     huxerui::State<AppModel> app, huxerui::State<WorkspaceModel> workspace, std::uint64_t tab_id,
     std::uint64_t reload_token, huxerui::TaskScope tasks, NotifyFn notify,
     AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark);
+struct NewRedisKeyInput {
+  std::string key;
+  std::string type;
+  std::string value;
+  std::string ttl;
+};
+huxerui::View CustomDelimiterDialog(huxerui::DialogContext dialog, std::string initial_delim,
+                                    std::function<void(std::string)> on_apply);
+huxerui::View RenameKeyDialog(huxerui::DialogContext dialog, std::string old_key,
+                              std::function<void(std::string)> on_apply);
+huxerui::View AddRedisKeyDialog(huxerui::DialogContext dialog,
+                                std::function<void(NewRedisKeyInput)> on_submit);
 void ShowReadOnlyCellContextMenu(
     huxerui::Point position, const huxerui::MenuHandle& menu,
     const std::shared_ptr<huxerui::Clipboard>& clipboard, const std::string& cell_display,

@@ -472,6 +472,22 @@ LanguageMode LanguageModeFromKey(std::string_view key) {
   return LanguageMode::System;
 }
 
+std::string_view RedisViewModeKey(RedisBrowserViewMode mode) {
+  switch (mode) {
+    case RedisBrowserViewMode::Tree: return "tree";
+    case RedisBrowserViewMode::Table:
+    default: return "table";
+  }
+}
+
+RedisBrowserViewMode RedisViewModeFromKey(std::string_view key) {
+  const std::string lower = LowerAsciiCopy(TrimAsciiCopy(key));
+  if (lower == "tree") {
+    return RedisBrowserViewMode::Tree;
+  }
+  return RedisBrowserViewMode::Table;
+}
+
 std::uint16_t ParseMcpPort(std::string_view text, std::uint16_t fallback) noexcept {
   const std::string trimmed = TrimAsciiCopy(text);
   if (trimmed.empty()) {
@@ -542,6 +558,8 @@ TraySettings LoadTraySettings(const std::string& path) {
       settings.mcp_read_only = value != "false";
     } else if (key == kSettingDefaultPageSize) {
       settings.default_page_size = ParsePageSize(value);
+    } else if (key == kSettingRedisViewMode) {
+      settings.redis_view_mode = RedisViewModeFromKey(value);
     }
   };
 
@@ -575,7 +593,7 @@ TraySettings LoadTraySettings(const std::string& path) {
           "SELECT key, value FROM settings "
           "WHERE key IN ('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', "
           "'ui.language', 'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only', "
-          "'query.page_size');",
+          "'query.page_size', 'redis.view_mode');",
           -1, &stmt.stmt, nullptr) != SQLITE_OK) {
     return settings;
   }
@@ -620,7 +638,8 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
              << kSettingMcpPort << '\t' << settings.mcp_port << '\n'
              << kSettingMcpReadOnly << '\t' << FlagText(settings.mcp_read_only) << '\n'
              << kSettingDefaultPageSize << '\t'
-             << std::clamp(settings.default_page_size, kMinPageSize, kMaxPageSize) << '\n';
+             << std::clamp(settings.default_page_size, kMinPageSize, kMaxPageSize) << '\n'
+             << kSettingRedisViewMode << '\t' << RedisViewModeKey(settings.redis_view_mode) << '\n';
       stream.flush();
       if (!stream) {
         std::error_code cleanup_error;
@@ -669,6 +688,7 @@ bool SaveTraySettings(const std::string& path, const TraySettings& settings) {
       {kSettingMcpReadOnly, std::string(FlagText(settings.mcp_read_only))},
       {kSettingDefaultPageSize,
        std::to_string(std::clamp(settings.default_page_size, kMinPageSize, kMaxPageSize))},
+      {kSettingRedisViewMode, std::string(RedisViewModeKey(settings.redis_view_mode))},
   };
 
   StmtGuard upsert;
@@ -711,6 +731,7 @@ void SettingsModel::Load() {
   mcp_port = settings.mcp_port;
   mcp_read_only = settings.mcp_read_only;
   default_page_size = settings.default_page_size;
+  redis_view_mode = settings.redis_view_mode;
 }
 
 TraySettings SettingsModel::Snapshot() const {
@@ -725,6 +746,7 @@ TraySettings SettingsModel::Snapshot() const {
       .mcp_port = mcp_port.Get(),
       .mcp_read_only = mcp_read_only.Get(),
       .default_page_size = default_page_size.Get(),
+      .redis_view_mode = redis_view_mode.Get(),
   };
 }
 
@@ -823,6 +845,15 @@ bool SettingsModel::SetDefaultPageSize(std::int64_t page_size) {
   default_page_size = effective;
   if (persist_setting) {
     persist_setting(std::string(kSettingDefaultPageSize), std::to_string(effective));
+    return true;
+  }
+  return SaveTraySettings(path, Snapshot());
+}
+
+bool SettingsModel::SetRedisViewMode(RedisBrowserViewMode mode) {
+  redis_view_mode = mode;
+  if (persist_setting) {
+    persist_setting(std::string(kSettingRedisViewMode), std::string(RedisViewModeKey(mode)));
     return true;
   }
   return SaveTraySettings(path, Snapshot());

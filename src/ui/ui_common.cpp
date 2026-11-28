@@ -722,39 +722,39 @@ StringResource ObjectKindResource(const DbObject& object) {
          LayoutPriority(1.0F));
 }
 
-[[huxerui::composable]] View AuditSqlBadge(std::string executed_sql, NotifyFn notify) {
+[[huxerui::composable]] View AuditCommandBadge(std::string executed_command, NotifyFn notify) {
   const ThemeSpec& spec = UseTheme();
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto clipboard = UseApplication().Clipboard();
-  if (executed_sql.empty()) {
+  if (executed_command.empty()) {
     return View{};
   }
-  const std::string preview = CompactSqlPreview(executed_sql);
-  const auto copy_sql = [clipboard, notify, loc, full_sql = executed_sql] {
-    if (clipboard && clipboard->SupportsSynchronousText() && clipboard->WriteText(full_sql)) {
+  const std::string preview = CompactSqlPreview(executed_command);
+  const auto copy_command = [clipboard, notify, loc, full_command = executed_command] {
+    if (clipboard && clipboard->SupportsSynchronousText() && clipboard->WriteText(full_command)) {
       if (notify) {
         notify(loc.Fmt(app::strings::toast_copied,
-                       loc.Get(app::strings::audit_copy_sql_label)));
+                       loc.Get(app::strings::audit_copy_command_label)));
       }
     } else if (notify) {
       notify(loc.Get(app::strings::toast_clipboard_unsupported));
     }
   };
-  View sql_text =
+  View command_text =
       Text(preview)
           .Style(TextStyle{Font::Monospace(font_size::kCaption), spec.colors.on_surface_variant})
           .LineLimit(1)
           .Overflow(TextOverflow::Ellipsis)
-          .With(Tooltip(StringVariant(executed_sql)));
+          .With(Tooltip(StringVariant(executed_command)));
   View copy_btn =
       Row{TintedIcon(app::images::copy, spec.colors.on_surface_variant, 15.0F)}
           .With(Frame{.width = 24.0F, .height = 24.0F, .min_width = 24.0F, .max_width = 24.0F,
                       .min_height = 24.0F, .max_height = 24.0F},
                 MainAlign{MainAxisAlignment::Center}, CrossAlign{CrossAxisAlignment::Center},
                 CornerRadius{4.0F}, LayoutPriority(1.0F),
-                Tooltip(StringVariant(app::strings::audit_copy_sql_label)))
-          .OnClick(copy_sql);
-  return Row{std::move(sql_text), std::move(copy_btn)}.With(
+                Tooltip(StringVariant(app::strings::audit_copy_command_tooltip)))
+          .OnClick(copy_command);
+  return Row{std::move(command_text), std::move(copy_btn)}.With(
       Frame{.height = 24.0F, .min_height = 24.0F, .max_height = 24.0F},
       Padding{EdgeInsets::Symmetric(2.0F, 0.0F)}, Spacing{4.0F},
       CrossAlign{CrossAxisAlignment::Center});
@@ -881,60 +881,6 @@ StringResource ObjectKindResource(const DbObject& object) {
           },
           can_last, 24.0F, StringVariant(app::strings::table_last_page)),
   }.With(Spacing{3.0F}, CrossAlign{CrossAxisAlignment::Center}, LayoutPriority(1.0F));
-}
-
-void ExportSqlWithPicker(std::shared_ptr<AdbcSession> adbc, std::string sql,
-                         ExportFormat format, std::string suggested_name,
-                         std::shared_ptr<FilePicker> picker, TaskScope tasks,
-                         NotifyFn notify, LocalizedCatalog loc) {
-  if (!adbc || adbc->IsClosed()) {
-    if (notify) {
-      notify(loc.Get(app::strings::toast_connection_closed));
-    }
-    return;
-  }
-  if (!picker || !picker->CanSaveFiles()) {
-    if (notify) {
-      notify(loc.Fmt(app::strings::sql_export_failed, "FilePicker unavailable"));
-    }
-    return;
-  }
-
-  tasks.Launch([adbc = std::move(adbc), sql = std::move(sql), format,
-                suggested_name = std::move(suggested_name), picker = std::move(picker),
-                notify = std::move(notify), loc]() mutable -> Task<void> {
-    const std::string temp_path = MakeTempExportPath(format);
-
-    const ExportStreamResult res = co_await adbc->sequence.Run(
-        [adbc, sql = std::move(sql), format, temp_path](std::stop_token) mutable {
-          return ExportQueryToFilePathBlocking(*adbc, std::move(sql), format, temp_path, 0);
-        });
-
-    auto cleanup = [&temp_path] { RemoveFileQuietly(temp_path); };
-
-    if (!res.error.empty()) {
-      cleanup();
-      if (notify) {
-        notify(loc.Fmt(app::strings::sql_export_failed, res.error));
-      }
-      co_return;
-    }
-
-    SaveFileOptions options{
-        .suggested_name = suggested_name,
-        .filter = FilePickerFilter{
-            .name = (format == ExportFormat::Csv) ? "CSV" : "JSONL",
-            .extensions = {(format == ExportFormat::Csv) ? "csv" : "jsonl"},
-            .content_types = {(format == ExportFormat::Csv) ? "text/csv"
-                                                            : "application/x-ndjson"},
-        },
-    };
-    const bool saved = co_await picker->SaveFileAsync(File(temp_path), options);
-    cleanup();
-    if (saved && notify) {
-      notify(loc.Fmt(app::strings::sql_export_done, std::to_string(res.rows_written)));
-    }
-  });
 }
 
 [[huxerui::composable]] View BottomStatusBar(Views items) {

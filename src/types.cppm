@@ -426,11 +426,6 @@ enum class WorkspaceTabKind {
   TableDesign,
 };
 
-enum class RedisBrowserViewMode {
-  Table,
-  Tree,
-};
-
 struct WorkspaceTab {
   std::uint64_t id = 0;
   WorkspaceTabKind kind = WorkspaceTabKind::Table;
@@ -595,7 +590,22 @@ struct PreparedParamValue {
 
 enum class ExportFormat {
   Csv,
+  Tsv,
+  Json,
   Jsonl,
+  SqlInsert,
+  Markdown,
+  Html,
+  Xml,
+  Xlsx,
+};
+
+struct ExportFormatInfo {
+  ExportFormat format = ExportFormat::Csv;
+  std::string_view cli_name;
+  std::string_view extension;
+  std::string_view filter_name;
+  std::string_view content_type;
 };
 
 enum class IngestMode {

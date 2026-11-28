@@ -120,6 +120,8 @@ void ApplySettingPair(std::string_view key, std::string_view value, TraySettings
     out.mcp_read_only = (value != "false");
   } else if (key == kSettingDefaultPageSize) {
     out.default_page_size = ParsePageSize(value);
+  } else if (key == kSettingRedisViewMode) {
+    out.redis_view_mode = RedisViewModeFromKey(value);
   }
 }
 
@@ -190,7 +192,8 @@ TraySettings ConfigDbService::ReadStartupSettingsSync(const std::string& db_path
       huxerui::File{db_path},
       "SELECT key, value FROM settings WHERE key IN "
       "('tray.enabled', 'tray.lightweight', 'theme.mode', 'theme.preset', 'ui.language', "
-      "'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only', 'query.page_size')",
+      "'mcp.enabled', 'mcp.host', 'mcp.port', 'mcp.read_only', 'query.page_size', "
+      "'redis.view_mode')",
       [&result](const sqlite::RowView& row) -> sqlite::Result<void> {
         auto key = row.Get<std::string>("key");
         if (!key) {

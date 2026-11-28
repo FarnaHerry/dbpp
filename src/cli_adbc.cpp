@@ -35,19 +35,6 @@ bool ParseIngestModeArg(std::string_view val, IngestMode& out) {
   return false;
 }
 
-bool ParseExportFormatArg(std::string_view val, ExportFormat& out) {
-  const std::string lower = CliLowerAscii(val);
-  if (lower == "csv") {
-    out = ExportFormat::Csv;
-    return true;
-  }
-  if (lower == "jsonl" || lower == "ndjson") {
-    out = ExportFormat::Jsonl;
-    return true;
-  }
-  return false;
-}
-
 } // namespace
 
 int CliHandleTables(const std::vector<std::string>& args, std::ostream& out, std::ostream& err,
@@ -409,6 +396,7 @@ int CliHandleImport(const std::vector<std::string>& args, std::ostream& out, std
   std::string target_catalog;
   std::string target_schema;
   char delimiter = ',';
+  bool delimiter_explicit = false;
   bool has_header = true;
   std::string error;
 
@@ -460,6 +448,7 @@ int CliHandleImport(const std::vector<std::string>& args, std::ostream& out, std
                             kCliExitUsage);
       }
       delimiter = (val == "\\t" || val == "tab") ? '\t' : val[0];
+      delimiter_explicit = true;
       continue;
     }
     if (flag == "--no-header") {
@@ -498,16 +487,23 @@ int CliHandleImport(const std::vector<std::string>& args, std::ostream& out, std
   }
 
   const std::filesystem::path file_path(*file_arg);
-  const std::string ext = CliLowerAscii(file_path.extension().string());
-  const std::string kind = file_type.empty()
-                               ? ((ext == ".jsonl" || ext == ".ndjson") ? "jsonl" : "csv")
-                               : CliLowerAscii(file_type);
-  const BulkIngestResult res =
-      (kind == "jsonl" || kind == "ndjson")
-          ? IngestJsonlFileBlocking(*opened.session, file_path, *table_arg, mode,
-                                    target_catalog, target_schema)
-          : IngestCsvFileBlocking(*opened.session, file_path, *table_arg, mode,
-                                  target_catalog, target_schema, delimiter, has_header);
+  ExportFormat import_fmt = ExportFormat::Csv;
+  if (!file_type.empty()) {
+    const auto parsed = ParseExportFormatName(file_type);
+    if (!parsed.has_value()) {
+      return CliEmitError(
+          err, json_mode,
+          "无效的 --type (可选: csv, tsv, json, jsonl, sql, markdown, html, xml, xlsx)",
+          kCliExitUsage);
+    }
+    import_fmt = *parsed;
+  } else {
+    import_fmt =
+        InferExportFormatFromExtension(file_path.extension().string()).value_or(ExportFormat::Csv);
+  }
+  const BulkIngestResult res = IngestFileBlocking(
+      *opened.session, file_path, import_fmt, *table_arg, mode, target_catalog, target_schema,
+      delimiter_explicit ? delimiter : '\0', has_header);
   if (!res.error.empty()) {
     return CliEmitError(err, json_mode, res.error, kCliExitError);
   }
@@ -541,6 +537,7 @@ int CliHandleExport(const std::vector<std::string>& args, std::ostream& out, std
   std::optional<std::string> file_arg;
   std::optional<std::string> out_arg;
   std::string type_str;
+  std::string sql_table_name;
   std::size_t max_rows = 0;
   std::string error;
 
@@ -592,6 +589,12 @@ int CliHandleExport(const std::vector<std::string>& args, std::ostream& out, std
       }
       continue;
     }
+    if (flag == "--table") {
+      if (!CliConsumeFlagValue(args, i, inline_val, flag, sql_table_name, error)) {
+        return CliEmitError(err, early_json, error, kCliExitUsage);
+      }
+      continue;
+    }
     if (flag == "--max-rows") {
       std::string val;
       if (!CliConsumeFlagValue(args, i, inline_val, flag, val, error)) {
@@ -627,13 +630,18 @@ int CliHandleExport(const std::vector<std::string>& args, std::ostream& out, std
 
   ExportFormat export_fmt = ExportFormat::Csv;
   if (!type_str.empty()) {
-    if (!ParseExportFormatArg(type_str, export_fmt)) {
-      return CliEmitError(err, json_mode, "无效的 --type (可选: csv, jsonl)", kCliExitUsage);
+    const auto parsed = ParseExportFormatName(type_str);
+    if (!parsed.has_value()) {
+      return CliEmitError(
+          err, json_mode,
+          "无效的 --type (可选: csv, tsv, json, jsonl, sql, markdown, html, xml, xlsx)",
+          kCliExitUsage);
     }
+    export_fmt = *parsed;
   } else if (out_arg.has_value()) {
-    const std::string ext = CliLowerAscii(std::filesystem::path(*out_arg).extension().string());
-    if (ext == ".jsonl" || ext == ".ndjson") {
-      export_fmt = ExportFormat::Jsonl;
+    const std::string ext = std::filesystem::path(*out_arg).extension().string();
+    if (const auto inferred = InferExportFormatFromExtension(ext)) {
+      export_fmt = *inferred;
     }
   }
 
@@ -650,9 +658,11 @@ int CliHandleExport(const std::vector<std::string>& args, std::ostream& out, std
 
   ExportStreamResult res;
   if (out_arg.has_value()) {
-    res = ExportQueryToFileBlocking(*opened.session, sql_text, export_fmt, *out_arg, max_rows);
+    res = ExportQueryToFileBlocking(*opened.session, sql_text, export_fmt, *out_arg, max_rows,
+                                    sql_table_name);
   } else {
-    res = ExportQueryStreamBlocking(*opened.session, sql_text, export_fmt, out, max_rows);
+    res = ExportQueryStreamBlocking(*opened.session, sql_text, export_fmt, out, max_rows,
+                                    sql_table_name);
   }
   if (!res.error.empty()) {
     return CliEmitError(err, json_mode, res.error, kCliExitError);

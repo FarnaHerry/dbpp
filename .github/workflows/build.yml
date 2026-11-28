@@ -150,6 +150,9 @@ jobs:
             if [ -n "$p" ]; then cp -L "$p" "dist-src/lib/$lib"; fi
           done
           patchelf --set-rpath '$ORIGIN/lib' dist-src/dbpp
+          mkdir -p dist-src/share/applications dist-src/share/icons/hicolor/256x256/apps
+          cp platform/linux/dbpp.desktop dist-src/share/applications/dbpp.desktop
+          cp assets/icon.png dist-src/share/icons/hicolor/256x256/apps/dbpp.png
           test -x dist-src/dbpp
           test -f dist-src/dbpp.resources/huxerui/resources.bin
           test -f dist-src/lib/libhuxerui.so
@@ -164,6 +167,39 @@ jobs:
             fi
           done
           ls -la dist-src dist-src/lib
+
+      - name: Test install.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/install.sh
+          tar_arch="${{ matrix.arch }}"
+          [[ "$tar_arch" == "arm64" ]] && tar_arch="aarch64"
+          tmp_root="$(mktemp -d)"
+          trap 'rm -rf "$tmp_root"' EXIT
+          tmp_rel="$tmp_root/rel"
+          tmp_stage="$tmp_root/stage"
+          tmp_home="$tmp_root/home"
+          mkdir -p "$tmp_rel" "$tmp_stage/dbpp" "$tmp_home/.local/share/dbpp"
+          cp -a dist-src/. "$tmp_stage/dbpp/"
+          tar -C "$tmp_stage" -czf "$tmp_rel/dbpp-0.0.0-linux-${tar_arch}.tar.gz" dbpp
+          (cd "$tmp_rel" && sha256sum "dbpp-0.0.0-linux-${tar_arch}.tar.gz" > SHA256SUMS.txt)
+          printf 'keep-me' > "$tmp_home/.local/share/dbpp/dbpp.sqlite3"
+          HOME="$tmp_home" XDG_DATA_HOME="$tmp_home/.local/share" \
+            scripts/install.sh --version 0.0.0 --download-base "file://$tmp_rel" --require-checksum
+          HOME="$tmp_home" XDG_DATA_HOME="$tmp_home/.local/share" \
+            scripts/install.sh --version 0.0.0 --download-base "file://$tmp_rel" --require-checksum
+          "$tmp_home/.local/bin/dbpp" --version
+          test -f "$tmp_home/.local/share/applications/dbpp.desktop"
+          test -f "$tmp_home/.local/share/icons/hicolor/256x256/apps/dbpp.png"
+          test "$(cat "$tmp_home/.local/share/dbpp/dbpp.sqlite3")" = "keep-me"
+          HOME="$tmp_home" XDG_DATA_HOME="$tmp_home/.local/share" \
+            scripts/install.sh --uninstall
+          test ! -e "$tmp_home/.local/bin/dbpp"
+          test ! -e "$tmp_home/.local/opt/dbpp"
+          test ! -e "$tmp_home/.local/share/applications/dbpp.desktop"
+          test ! -e "$tmp_home/.local/share/icons/hicolor/256x256/apps/dbpp.png"
+          test "$(cat "$tmp_home/.local/share/dbpp/dbpp.sqlite3")" = "keep-me"
 
       - name: Package Linux DEB and RPM
         shell: bash
@@ -311,6 +347,42 @@ jobs:
             }
           }
           Get-Item dist-src/*
+
+      - name: Test install.ps1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/install.ps1').Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            throw "install.ps1 parse errors: $($errors | Out-String)"
+          }
+          $tmpRoot = Join-Path $env:RUNNER_TEMP 'dbpp-install-test'
+          $tmpRel = Join-Path $tmpRoot 'rel'
+          $tmpInstall = Join-Path $tmpRoot 'install'
+          $dataDir = Join-Path $env:LOCALAPPDATA 'dbpp\data'
+          $dataMarker = Join-Path $dataDir 'dbpp.sqlite3'
+          New-Item -ItemType Directory -Force $tmpRel, $dataDir | Out-Null
+          try {
+            Set-Content -LiteralPath $dataMarker -Value 'keep-me' -NoNewline
+            $zipPath = Join-Path $tmpRel 'dbpp-0.0.0-windows-x86_64.zip'
+            Compress-Archive -Path 'dist-src\*' -DestinationPath $zipPath -Force
+            $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Set-Content -LiteralPath (Join-Path $tmpRel 'SHA256SUMS.txt') -Value "$hash  dbpp-0.0.0-windows-x86_64.zip"
+            & .\scripts\install.ps1 -Version 0.0.0 -DownloadBase $tmpRel -InstallDir $tmpInstall -NoModifyPath -NoShortcut -NoUninstallEntry -RequireChecksum
+            & .\scripts\install.ps1 -Version 0.0.0 -DownloadBase $tmpRel -InstallDir $tmpInstall -NoModifyPath -NoShortcut -NoUninstallEntry -RequireChecksum
+            $verOut = & (Join-Path $tmpInstall 'dbpp.exe') --version
+            if ($LASTEXITCODE -ne 0) { throw "dbpp.exe --version failed: $verOut" }
+            if ((Get-Content -LiteralPath $dataMarker -Raw) -ne 'keep-me') { throw 'User data marker modified during install' }
+            & .\scripts\install.ps1 -Uninstall -InstallDir $tmpInstall
+            if (Test-Path -LiteralPath $tmpInstall) { throw "Install directory was not removed: $tmpInstall" }
+            if ((Get-Content -LiteralPath $dataMarker -Raw) -ne 'keep-me') { throw 'User data marker modified during uninstall' }
+          } finally {
+            Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $dataMarker -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
@@ -512,6 +584,23 @@ jobs:
           cp "$dmg_path" dist-src/
           ls -lh dist-src/
 
+      - name: Test install.sh
+        run: |
+          set -euo pipefail
+          bash -n scripts/install.sh
+          tmp_root="$(mktemp -d)"
+          trap 'rm -rf "$tmp_root"' EXIT
+          tmp_rel="$tmp_root/rel"
+          mkdir -p "$tmp_rel"
+          cp dist-src/*.dmg "$tmp_rel/dbpp-0.0.0-macos-arm64.dmg"
+          (cd "$tmp_rel" && shasum -a 256 "dbpp-0.0.0-macos-arm64.dmg" > SHA256SUMS.txt)
+          scripts/install.sh --version 0.0.0 --download-base "file://$tmp_rel" \
+            --install-dir "$RUNNER_TEMP/dbpp-apps" --bin-dir "$RUNNER_TEMP/dbpp-bin" --require-checksum
+          "$RUNNER_TEMP/dbpp-bin/dbpp" --version
+          scripts/install.sh --install-dir "$RUNNER_TEMP/dbpp-apps" --bin-dir "$RUNNER_TEMP/dbpp-bin" --uninstall
+          test ! -e "$RUNNER_TEMP/dbpp-apps/dbpp.app"
+          test ! -e "$RUNNER_TEMP/dbpp-bin/dbpp"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
@@ -559,8 +648,13 @@ jobs:
             elif [[ "$name" == build-linux-* ]]; then
               arch="${name#build-linux-}"
               [[ "$arch" == "arm64" ]] && arch="aarch64"
-              tar -C dist --exclude='*.deb' --exclude='*.rpm' -czf \
-                "release/dbpp-${release_version}-linux-${arch}.tar.gz" "$name"
+              stage_dir="$(mktemp -d)"
+              mkdir -p "${stage_dir}/dbpp"
+              cp -a "$artifact"/. "${stage_dir}/dbpp/"
+              rm -f "${stage_dir}/dbpp"/*.deb "${stage_dir}/dbpp"/*.rpm
+              tar -C "$stage_dir" -czf \
+                "release/dbpp-${release_version}-linux-${arch}.tar.gz" dbpp
+              rm -rf "$stage_dir"
               shopt -s nullglob
               for extension in deb rpm; do
                 packages=("$artifact"/*."$extension")
@@ -579,9 +673,18 @@ jobs:
               exit 1
             fi
           done
+          cp scripts/install.sh release/install.sh
+          cp scripts/install.ps1 release/install.ps1
+          (
+            cd release
+            LC_ALL=C sha256sum dbpp-* install.sh install.ps1 | sort -k2 > SHA256SUMS.txt
+          )
           test -s "release/dbpp-${release_version}-windows-x86_64.zip"
           test -s "release/dbpp-${release_version}-windows-x86_64.exe"
           test -s "release/dbpp-${release_version}-macos-arm64.dmg"
+          test -s "release/install.sh"
+          test -s "release/install.ps1"
+          test -s "release/SHA256SUMS.txt"
           for arch in x86_64 aarch64; do
             test -s "release/dbpp-${release_version}-linux-${arch}.tar.gz"
             test -s "release/dbpp-${release_version}-linux-${arch}.deb"

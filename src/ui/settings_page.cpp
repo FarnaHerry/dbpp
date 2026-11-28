@@ -330,6 +330,13 @@ using namespace dbpp::ui;
                                ButtonTone::Primary),
               }.With(Spacing{8.0F}, CrossAlign{CrossAxisAlignment::Center}),
               MutedText(UseString(app::strings::settings_default_page_size_hint)),
+              Caption(UseString(app::strings::settings_redis_view_mode_label)),
+              SegmentedButton({app::strings::table_view_table, app::strings::table_view_tree},
+                              static_cast<std::size_t>(settings->redis_view_mode.Get()))
+                  .OnChanged([settings](std::size_t index) {
+                    (void)settings->SetRedisViewMode(static_cast<RedisBrowserViewMode>(index));
+                  }),
+              MutedText(UseString(app::strings::settings_redis_view_mode_hint)),
           }.With(Spacing{6.0F}, CrossAlign{CrossAxisAlignment::Stretch});
         }(),
         Divider(),

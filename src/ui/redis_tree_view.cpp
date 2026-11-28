@@ -18,62 +18,6 @@ namespace {
 
 constexpr std::size_t kMaxVisibleTreeRows = 800;
 
-[[huxerui::composable]] View CustomDelimiterDialog(
-    DialogContext dialog, std::string initial_delim, std::function<void(std::string)> on_apply) {
-  auto value = UseState(TextEditingValue::FromText(std::move(initial_delim)));
-  const auto submit = [dialog, value, on_apply = std::move(on_apply)] {
-    const std::string next = value.Get().text;
-    dialog.Dismiss();
-    if (on_apply) {
-      on_apply(next);
-    }
-  };
-  return DialogCard(Column{
-      Row{
-          Text(app::strings::redis_tree_delim_dialog_title, TextRole::Title).With(Grow(1.0F)),
-          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button(app::strings::action_apply).OnClick(submit), ButtonTone::Primary),
-      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MonospaceField(
-          TextField(value)
-              .Placeholder(app::strings::redis_tree_delim_dialog_ph)
-              .Variant(TextFieldVariant::Outlined)
-              .LineLimits(TextFieldLineLimits::SingleLine())
-              .OnChanged([value](const TextEditingValue& next) { value = next; })
-              .OnSubmitted(submit)),
-  }.With(Frame{.width = 400.0F}, Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-}
-
-[[huxerui::composable]] View RenameKeyDialog(
-    DialogContext dialog, std::string old_key, std::function<void(std::string)> on_apply) {
-  auto value = UseState(TextEditingValue::FromText(std::move(old_key)));
-  const auto submit = [dialog, value, on_apply = std::move(on_apply)] {
-    const std::string next = value.Get().text;
-    if (next.empty()) {
-      return;
-    }
-    dialog.Dismiss();
-    if (on_apply) {
-      on_apply(next);
-    }
-  };
-  return DialogCard(Column{
-      Row{
-          Text(app::strings::redis_detail_rename_title, TextRole::Title).With(Grow(1.0F)),
-          ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
-          ActionButton(Button(app::strings::action_save).OnClick(submit), ButtonTone::Primary)
-              .With(Enabled{!value.Get().text.empty()}),
-      }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}),
-      MonospaceField(
-          TextField(value)
-              .Placeholder(app::strings::redis_detail_rename_ph)
-              .Variant(TextFieldVariant::Outlined)
-              .LineLimits(TextFieldLineLimits::SingleLine())
-              .OnChanged([value](const TextEditingValue& next) { value = next; })
-              .OnSubmitted(submit)),
-  }.With(Frame{.width = 440.0F}, Spacing{12.0F}, CrossAlign{CrossAxisAlignment::Stretch}));
-}
-
 std::vector<std::string> EntryColumnsForType(std::string_view type) {
   if (type == "hash") return {"field", "value"};
   if (type == "list") return {"index", "value"};
@@ -195,78 +139,6 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
             CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
             Background{VisualFill{spec.colors.surface}},
             Border{semantic.border_subtle, 1.0F});
-}
-
-[[huxerui::composable]] View RedisDelimiterFilterButton(
-    const MenuHandle& menu, const ViewHandle& anchor, const DialogHandle& dialogs,
-    const LocalizedCatalog& loc, const std::string& current_delim, bool enabled, float height,
-    AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark,
-    std::function<void(std::string)> on_select) {
-  const ThemeSpec& spec = UseTheme();
-  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
-  const bool active = !current_delim.empty();
-  const std::string label = active ? UseString(app::strings::redis_tree_delim_label, current_delim)
-                                   : UseString(app::strings::redis_tree_delim_flat);
-  const Color fg = active ? spec.colors.on_primary_container : spec.colors.on_surface;
-  const Color bg = active ? spec.colors.primary_container : spec.colors.surface;
-  const Color border = active ? WithAlpha(spec.colors.primary, 0.45F) : semantic.border_subtle;
-  const Color icon_color = active ? spec.colors.primary : spec.colors.on_surface_variant;
-
-  return Row{
-      TintedIcon(app::images::folder, icon_color, 13.0F),
-      Text(label)
-          .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium), fg})
-          .LineLimit(1),
-      TintedIcon(app::images::chevron_down, icon_color, 12.0F),
-  }
-      .With(Frame{.height = height, .min_height = height, .max_height = height},
-            Padding{EdgeInsets::Symmetric(8.0F, 0.0F)}, Spacing{5.0F},
-            CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
-            Background{VisualFill{bg}}, Border{border, 1.0F}, anchor, Enabled{enabled})
-      .OnClick([menu, anchor, dialogs, loc, current_delim, theme_config, language_mode,
-                system_dark, on_select = std::move(on_select)] {
-        std::vector<MenuEntry> entries;
-        static constexpr std::array<std::string_view, 5> kPresets = {":", "/", ".", "-", "_"};
-        for (const std::string_view d : kPresets) {
-          const std::string ds(d);
-          entries.emplace_back(
-              MenuItem(ds,
-                       [on_select, ds] {
-                         if (on_select) on_select(ds);
-                       })
-                  .Checked(current_delim == d));
-        }
-        entries.emplace_back(MenuSection{});
-        entries.emplace_back(
-            MenuItem(loc.Get(app::strings::redis_tree_delim_menu_flat),
-                     [on_select] {
-                       if (on_select) on_select({});
-                     })
-                .Checked(current_delim.empty()));
-        entries.emplace_back(
-            MenuItem(loc.Get(app::strings::redis_tree_delim_custom),
-                     [dialogs, current_delim, theme_config, language_mode, system_dark,
-                      on_select] {
-                       dialogs.Show([current_delim, theme_config, language_mode, system_dark,
-                                     on_select](DialogContext dialog) {
-                         return WithDialogTheme(
-                             theme_config, language_mode, system_dark,
-                             CustomDelimiterDialog(dialog, current_delim, on_select));
-                       });
-                     }));
-        menu.Show(anchor, std::move(entries),
-                  MenuOptions{
-                      .placement = {.side = AnchorSide::Below,
-                                    .alignment = AnchorAlignment::Start},
-                      .gap = 4.0F,
-                      .viewport_margin = 8.0F,
-                      .offset = {},
-                      .width = std::nullopt,
-                      .dismiss_on_outside_press = true,
-                      .dismiss_on_cancel = true,
-                      .on_dismiss_request = {},
-                  });
-      });
 }
 
 [[huxerui::composable]] View RedisTreeWorkspace(
@@ -450,36 +322,6 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
                       .With(Padding{EdgeInsets::Symmetric(8.0F, 6.0F)}));
   }
 
-  View left_body =
-      flat_rows.empty() && !scan_loading.Get()
-          ? TableEmptyState(app::strings::redis_tree_empty)
-          : ScrollView(Column{std::move(tree_rows)}.With(Spacing{1.0F},
-                                                         CrossAlign{CrossAxisAlignment::Stretch}))
-                .With(Grow(1.0F));
-  View left_pane = Column{
-      Row{
-          Text(UseString(app::strings::redis_tree_keys_count, scanned.keys.size()))
-              .Style(TextStyle{Font::System(font_size::kCaption).WithWeight(FontWeight::Medium),
-                               spec.colors.on_surface_variant})
-              .With(Grow(1.0F)),
-          CompactActionButton(
-              Button(app::strings::redis_tree_expand_all)
-                  .OnClick([expanded_folders, all_folder_ids] { expanded_folders = all_folder_ids; }),
-              ButtonTone::Subtle, 24.0F, 7.0F)
-              .With(Enabled{!all_folder_ids.empty()}),
-          CompactActionButton(
-              Button(app::strings::redis_tree_collapse_all)
-                  .OnClick([expanded_folders] { expanded_folders = std::unordered_set<std::string>{}; }),
-              ButtonTone::Subtle, 24.0F, 7.0F)
-              .With(Enabled{!expanded_folders.Get().empty()}),
-      }.With(Padding{EdgeInsets::Symmetric(8.0F, 4.0F)}, Spacing{4.0F},
-             CrossAlign{CrossAxisAlignment::Center},
-             Background{VisualFill{spec.colors.surface_container_low}},
-             Border{semantic.border_subtle, 1.0F}),
-      LoadingOverlay(std::move(left_body), scan_loading.Get(), app::strings::table_loading)
-          .With(Grow(1.0F)),
-  }.With(Border{semantic.border_subtle, 1.0F}, CrossAlign{CrossAxisAlignment::Stretch});
-
   const auto run_guarded_write = [read_only, is_production, prod_conn_name, dialogs, notify, loc,
                                   theme_config, language_mode, system_dark](
                                      std::string summary, std::function<void()> fn) {
@@ -497,6 +339,137 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
         },
         std::move(summary), std::move(fn));
   };
+
+  const auto expand_ancestors_for_key = [expanded_folders, delimiter](std::string_view full_key) {
+    if (delimiter.empty()) {
+      return;
+    }
+    expanded_folders.Update([&full_key, &delimiter](std::unordered_set<std::string>& set) {
+      std::size_t cursor = 0;
+      for (int depth = 0; depth < 16; ++depth) {
+        const std::size_t pos = full_key.find(delimiter, cursor);
+        if (pos == std::string_view::npos) {
+          break;
+        }
+        const std::size_t next_cursor = pos + delimiter.size();
+        if (pos == cursor || next_cursor >= full_key.size()) {
+          break;
+        }
+        set.insert(std::string(full_key.substr(0, next_cursor)));
+        cursor = next_cursor;
+      }
+    });
+  };
+
+  const bool can_add_key = !read_only && !busy_write.Get();
+  const auto open_add_key = [can_add_key, dialogs, theme_config, language_mode, system_dark,
+                             run_guarded_write, busy_write, tasks, adbc, redis_db_obj, app,
+                             workspace, session_id, notify, scan_state, loc, fetch_detail,
+                             expand_ancestors_for_key] {
+    if (!can_add_key) {
+      return;
+    }
+    dialogs.Show([theme_config, language_mode, system_dark, run_guarded_write, busy_write, tasks,
+                  adbc, redis_db_obj, app, workspace, session_id, notify, scan_state, loc,
+                  fetch_detail, expand_ancestors_for_key](DialogContext dlg) {
+      return WithDialogTheme(
+          theme_config, language_mode, system_dark,
+          AddRedisKeyDialog(
+              dlg,
+              [run_guarded_write, busy_write, tasks, adbc, redis_db_obj, app, workspace, session_id,
+               notify, scan_state, loc, fetch_detail,
+               expand_ancestors_for_key](NewRedisKeyInput input) mutable {
+                const std::string created_key = input.key;
+                run_guarded_write(
+                    "ADD " + created_key,
+                    [input = std::move(input), created_key, busy_write, tasks, adbc, redis_db_obj,
+                     app, workspace, session_id, notify, scan_state, loc, fetch_detail,
+                     expand_ancestors_for_key]() mutable {
+                      busy_write = true;
+                      tasks.Launch([input = std::move(input), created_key, busy_write, adbc,
+                                    redis_db_obj, app, workspace, tasks, session_id, notify,
+                                    scan_state, loc, fetch_detail,
+                                    expand_ancestors_for_key]() mutable -> Task<void> {
+                        PendingInsertRow row;
+                        row.draft_id = 1;
+                        row.values = {input.key, input.value, input.type, input.ttl, ""};
+                        TableModel insert_model;
+                        insert_model.object = redis_db_obj.name;
+                        BatchInsertResult r = co_await adbc->sequence.Run(
+                            [adbc, insert_model = std::move(insert_model),
+                             row = std::move(row)](std::stop_token) {
+                              return InsertRedisRowsBlocking(*adbc->redis, insert_model, {row});
+                            });
+                        busy_write = false;
+                        if (r.connection_lost) {
+                          HandleSessionDisconnected(app, workspace, tasks, session_id, r.error,
+                                                    notify);
+                          co_return;
+                        }
+                        if (!r.error.empty()) {
+                          if (notify) {
+                            notify(r.error);
+                          }
+                          co_return;
+                        }
+                        scan_state.Update([&created_key](RedisKeyListResult& s) {
+                          if (std::ranges::find(s.keys, created_key) == s.keys.end()) {
+                            s.keys.push_back(created_key);
+                            std::ranges::sort(s.keys);
+                          }
+                        });
+                        expand_ancestors_for_key(created_key);
+                        if (notify) {
+                          notify(loc.Get(app::strings::redis_detail_created));
+                        }
+                        fetch_detail(created_key, false);
+                      });
+                    });
+              }));
+    });
+  };
+
+  View add_key_btn =
+      Row{TintedIcon(app::images::add,
+                     can_add_key ? spec.colors.primary : spec.colors.on_surface_variant, 15.0F)}
+          .With(Frame{.width = 24.0F, .height = 24.0F, .min_width = 24.0F, .max_width = 24.0F,
+                      .min_height = 24.0F, .max_height = 24.0F},
+                MainAlign{MainAxisAlignment::Center}, CrossAlign{CrossAxisAlignment::Center},
+                CornerRadius{4.0F},
+                Tooltip(StringVariant(app::strings::redis_add_key_tooltip)),
+                Enabled{can_add_key})
+          .OnClick(open_add_key);
+
+  View left_body =
+      flat_rows.empty() && !scan_loading.Get()
+          ? TableEmptyState(app::strings::redis_tree_empty)
+          : ScrollView(Column{std::move(tree_rows)}.With(Spacing{1.0F},
+                                                         CrossAlign{CrossAxisAlignment::Stretch}))
+                .With(Grow(1.0F));
+  View left_pane = Column{
+      Row{
+          Text(UseString(app::strings::redis_tree_keys_count, scanned.keys.size()))
+              .Style(TextStyle{Font::System(font_size::kCaption).WithWeight(FontWeight::Medium),
+                               spec.colors.on_surface_variant})
+              .With(Grow(1.0F)),
+          std::move(add_key_btn),
+          CompactActionButton(
+              Button(app::strings::redis_tree_expand_all)
+                  .OnClick([expanded_folders, all_folder_ids] { expanded_folders = all_folder_ids; }),
+              ButtonTone::Subtle, 24.0F, 7.0F)
+              .With(Enabled{!all_folder_ids.empty()}),
+          CompactActionButton(
+              Button(app::strings::redis_tree_collapse_all)
+                  .OnClick([expanded_folders] { expanded_folders = std::unordered_set<std::string>{}; }),
+              ButtonTone::Subtle, 24.0F, 7.0F)
+              .With(Enabled{!expanded_folders.Get().empty()}),
+      }.With(Padding{EdgeInsets::Symmetric(8.0F, 4.0F)}, Spacing{4.0F},
+             CrossAlign{CrossAxisAlignment::Center},
+             Background{VisualFill{spec.colors.surface_container_low}},
+             Border{semantic.border_subtle, 1.0F}),
+      LoadingOverlay(std::move(left_body), scan_loading.Get(), app::strings::table_loading)
+          .With(Grow(1.0F)),
+  }.With(Border{semantic.border_subtle, 1.0F}, CrossAlign{CrossAxisAlignment::Stretch});
 
   View right_content;
   const RedisKeyDetail detail = detail_state.Get();
@@ -921,7 +894,7 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
   }
   Views status_items;
   status_items.Add(AuditDurationBadge(scanned.elapsed_us));
-  status_items.Add(AuditSqlBadge(scanned.executed_sql, notify));
+  status_items.Add(AuditCommandBadge(scanned.executed_sql, notify));
   if (!active_filter.empty()) {
     status_items.Add(
         StatusBadge(UseString(app::strings::table_active_filter, active_filter),

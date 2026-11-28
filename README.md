@@ -25,6 +25,32 @@ UI 使用本地 [HuxerUI](../HuxerUI-fork)（`farna/main`）和
 - 多预设主题、双语界面与图标：默认采用「Gemini 星光」分层配色（蓝-紫-珊瑚星光渐变与四色语义高亮），支持切换翡翠青 / 暖沙琥珀 / 暮光紫 / 极简黑白及跟随系统/深/浅模式；内置简体中文 / English 双语界面（默认跟随系统语言，可在设置页即时切换）并统一持久化至 `dbpp.sqlite3`；附带应用图标（Windows .ico / macOS .icns / Linux hicolor + desktop 文件）与托盘图标
 - 启动参数：无参或 `dbpp /path/to/file.sqlite`（以及 `dbpp gui` / `dbpp open`）启动 GUI；`dbpp <command>` 走无头 CLI；也可用 `DBPP_OPEN=uri DBPP_DRIVER=/path/to/driver.so dbpp`
 
+## 安装
+
+### 一键安装（推荐，免管理员权限）
+
+**Linux (`x86_64` / `aarch64`) & macOS (`Apple Silicon`)：**
+
+```sh
+curl -fsSL https://github.com/FarnaHerry/dbpp/releases/latest/download/install.sh | bash
+```
+
+**Windows (`x86_64` PowerShell)：**
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex"
+```
+
+常用环境变量 / 参数：
+- 指定版本：`DBPP_VERSION=0.4.8`（或传 `--version 0.4.8` / `-Version 0.4.8`）
+- 镜像/代理前缀：`DBPP_DOWNLOAD_BASE=https://mirror.example.com/dbpp/v0.4.8`
+- Windows 拉起图形安装器：`DBPP_USE_INSTALLER=1`（或 `-UseInstaller`）
+- 卸载（保留用户数据 `dbpp.sqlite3` 与已安装的 ADBC 驱动）：
+  - Linux / macOS：`curl -fsSL https://github.com/FarnaHerry/dbpp/releases/latest/download/install.sh | bash -s -- --uninstall`
+  - Windows：`powershell -ExecutionPolicy ByPass -c "$env:DBPP_UNINSTALL='1'; irm https://github.com/FarnaHerry/dbpp/releases/latest/download/install.ps1 | iex"`
+
+也可直接在 [GitHub Releases](https://github.com/FarnaHerry/dbpp/releases) 手动下载各平台安装包：Windows `.exe` 安装器 / `.zip`、Linux `.deb` / `.rpm` / `.tar.gz`、macOS `.dmg`（均附带 `SHA256SUMS.txt`）。
+
 ## 构建与测试
 
 依赖：CMake ≥ 4.4、Ninja、支持 C++23 模块与 `import std` 的现代编译器（GCC ≥ 16 / Clang ≥ 21 + libc++ / MSVC）；Linux 源码构建需要 GTK4 ≥ 4.14、
@@ -153,6 +179,7 @@ assets/                平台二进制图标（Linux icon.png、Windows icon.ico
 cmake/                 构建模块（CxxImportStdGate.cmake 与 vendored SQLite3 探测 FindSQLite3.cmake）
 third_party/           ADBC、Lib-DataTable 与 vendor 依赖
 platform/              平台入口与打包/安装器配置（desktop、WiX、plist、icns）
+scripts/               跨平台一键安装与卸载脚本（install.sh / install.ps1）
 tests/                 无窗口核心单元测试（CTest）
 .github/workflows/     多平台桌面 CI 与 Release 构建流水线（Linux/Windows/macOS）
 docs/releases/         各版本 Release 说明

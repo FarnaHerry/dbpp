@@ -348,10 +348,15 @@ using namespace dbpp::ui;
   if (is_redis) {
     toolbar_items.Add(RedisViewModeSwitch(
         tab->redis_view_mode, !model.HasPendingChanges(), kToolbarHeight,
-        [app, workspace, tasks, tab_id, notify, block_if_dirty](RedisBrowserViewMode next_mode) {
+        [app, workspace, tasks, tab_id, notify, block_if_dirty,
+         settings](RedisBrowserViewMode next_mode) {
           if (block_if_dirty()) {
             return;
           }
+          if (settings && settings->redis_view_mode.Get() != next_mode) {
+            (void)settings->SetRedisViewMode(next_mode);
+          }
+          app.Update([next_mode](AppModel& m) { m.default_redis_view_mode = next_mode; });
           workspace.Update([tab_id, next_mode](WorkspaceModel& ws) {
             if (WorkspaceTab* target = ws.FindTab(tab_id)) {
               target->redis_view_mode = next_mode;
@@ -413,17 +418,11 @@ using namespace dbpp::ui;
                           target_table_name, target_catalog, target_schema, is_production,
                           prod_conn_name, refresh, theme_config, language_mode, system_dark] {
                   if (!picker || !picker->CanOpenFiles()) return;
-                  const auto launch_import = [=](bool is_jsonl) {
-                    LaunchTableFileImport(is_jsonl, picker, adbc_ptr, target_table_name,
-                                          target_catalog, target_schema, is_production,
-                                          prod_conn_name, dialogs, tasks, notify, loc, refresh,
-                                          theme_config, language_mode, system_dark);
-                  };
                   std::vector<MenuEntry> entries;
-                  entries.emplace_back(MenuItem(app::images::add, loc.Get(app::strings::table_import_csv),
-                                                [launch_import] { launch_import(false); }));
-                  entries.emplace_back(MenuItem(app::images::add, loc.Get(app::strings::table_import_jsonl),
-                                                [launch_import] { launch_import(true); }));
+                  AppendDataImportMenuEntries(entries, picker, adbc_ptr, target_table_name,
+                                              target_catalog, target_schema, is_production,
+                                              prod_conn_name, dialogs, tasks, notify, loc, refresh,
+                                              theme_config, language_mode, system_dark);
                   menu.Show(import_anchor, std::move(entries),
                             MenuOptions{.placement = {.side = AnchorSide::Below,
                                                       .alignment = AnchorAlignment::End},
@@ -454,21 +453,11 @@ using namespace dbpp::ui;
     toolbar_items.Add(
         CompactActionButton(
             Button(app::strings::sql_export)
-                .OnClick([menu, export_anchor, adbc_ptr, export_sql, base_name, picker, tasks,
-                          notify, loc] {
+                .OnClick([menu, export_anchor, adbc_ptr, export_sql, base_name,
+                          qualified_name = model.qualified_name, picker, tasks, notify, loc] {
                   std::vector<MenuEntry> entries;
-                  entries.emplace_back(MenuItem(
-                      app::images::external_link, loc.Get(app::strings::sql_export_csv),
-                      [adbc_ptr, export_sql, base_name, picker, tasks, notify, loc] {
-                        ExportSqlWithPicker(adbc_ptr, export_sql, ExportFormat::Csv,
-                                            base_name + ".csv", picker, tasks, notify, loc);
-                      }));
-                  entries.emplace_back(MenuItem(
-                      app::images::external_link, loc.Get(app::strings::sql_export_jsonl),
-                      [adbc_ptr, export_sql, base_name, picker, tasks, notify, loc] {
-                        ExportSqlWithPicker(adbc_ptr, export_sql, ExportFormat::Jsonl,
-                                            base_name + ".jsonl", picker, tasks, notify, loc);
-                      }));
+                  AppendDataExportMenuEntries(entries, adbc_ptr, export_sql, base_name,
+                                              qualified_name, picker, tasks, notify, loc);
                   menu.Show(export_anchor, std::move(entries),
                             MenuOptions{.placement = {.side = AnchorSide::Below,
                                                       .alignment = AnchorAlignment::End},
@@ -589,7 +578,7 @@ using namespace dbpp::ui;
           : (model.message.empty() ? UseString(app::strings::table_no_data) : model.message);
   Views status_items;
   status_items.Add(AuditDurationBadge(model.elapsed_us));
-  status_items.Add(AuditSqlBadge(model.executed_sql, notify));
+  status_items.Add(AuditCommandBadge(model.executed_sql, notify));
   if (!model.filter.empty()) {
     status_items.Add(
         StatusBadge(UseString(app::strings::table_active_filter, model.filter),
