@@ -227,7 +227,9 @@ void TestRedisSessionCrudAndCli(const fs::path& dir) {
 
   const dbpp::AdbcSchemaResult schema = dbpp::LoadSchemaBlocking(*opened.session, objs.objects[0]);
   Expect(schema.error.empty() && schema.columns.size() == 5 &&
-             schema.columns[0].name == "key" && schema.columns[0].primary_key,
+             schema.columns[0].name == "key" && schema.columns[0].primary_key &&
+             schema.columns[1].name == "value" && schema.columns[2].name == "type" &&
+             schema.columns[3].name == "ttl" && schema.columns[4].name == "size",
          "LoadSchemaBlocking redis mismatch");
 
   // Browse db0 with FILTER + SORT.
@@ -254,29 +256,29 @@ void TestRedisSessionCrudAndCli(const fs::path& dir) {
   Expect(greeting_idx != static_cast<std::size_t>(-1), "greeting key must exist");
   if (greeting_idx != static_cast<std::size_t>(-1)) {
     const dbpp::AdbcQueryResult upd = dbpp::UpdateRedisCellBlocking(
-        *opened.session->redis, table, greeting_idx, 4, "updated greeting");
+        *opened.session->redis, table, greeting_idx, 1, "updated greeting");
     Expect(upd.error.empty(), "UpdateRedisCellBlocking string failed: " + upd.error);
 
     dbpp::TableModel after_upd = dbpp::LoadTableBlocking(
         *opened.session, 1, objs.objects[0], 0, 100, std::nullopt, "greeting");
     Expect(after_upd.snapshot && after_upd.snapshot->rows.size() == 1 &&
-               after_upd.snapshot->rows[0].values[2].text == "120" &&
-               after_upd.snapshot->rows[0].values[4].text == "updated greeting",
+               after_upd.snapshot->rows[0].values[3].text == "120" &&
+               after_upd.snapshot->rows[0].values[1].text == "updated greeting",
            "String edit must preserve TTL via KEEPTTL");
 
     // Change TTL then persist (-1).
     const dbpp::AdbcQueryResult set_ttl = dbpp::UpdateRedisCellBlocking(
-        *opened.session->redis, after_upd, 0, 2, "450");
+        *opened.session->redis, after_upd, 0, 3, "450");
     Expect(set_ttl.error.empty(), "UpdateRedisCellBlocking TTL failed: " + set_ttl.error);
     const dbpp::AdbcQueryResult persist_ttl = dbpp::UpdateRedisCellBlocking(
-        *opened.session->redis, after_upd, 0, 2, "-1");
+        *opened.session->redis, after_upd, 0, 3, "-1");
     Expect(persist_ttl.error.empty(), "UpdateRedisCellBlocking PERSIST failed: " + persist_ttl.error);
   }
 
-  // Insert batch of 2 new keys into db0.
-  dbpp::PendingInsertRow new_str{.draft_id = 1, .values = {"k:new", "string", "300", "", "val1"}};
+  // Insert batch of 2 new keys into db0 (column order: key, value, type, ttl, size).
+  dbpp::PendingInsertRow new_str{.draft_id = 1, .values = {"k:new", "val1", "string", "300", ""}};
   dbpp::PendingInsertRow new_hash{
-      .draft_id = 2, .values = {"h:new", "hash", "", "", "{\"a\":1,\"b\":\"two\"}"}};
+      .draft_id = 2, .values = {"h:new", "{\"a\":1,\"b\":\"two\"}", "hash", "", ""}};
   const dbpp::BatchInsertResult ins =
       dbpp::InsertRowsBlocking(*opened.session, table, {new_str, new_hash});
   Expect(ins.inserted == 2 && ins.error.empty(), "InsertRowsBlocking redis failed: " + ins.error);
@@ -461,6 +463,408 @@ void TestRedisDisconnectDetection() {
          "PingSessionBlocking after server shutdown must report connection_lost");
 }
 
+void TestRedisBigKeyAndScanCapOptimizations() {
+  dbpp_test::MockRedisServer server;
+  const std::string db1_uri = "redis://127.0.0.1:" + std::to_string(server.Port()) + "/1";
+  const dbpp::AdbcOpenResult opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = db1_uri,
+      .username = {},
+      .password = {},
+      .title = "bigkey-scan",
+  });
+  Expect(opened.error.empty() && opened.session != nullptr && opened.session->redis != nullptr,
+         "Connect to mock db1 failed: " + opened.error);
+  if (!opened.session || !opened.session->redis) {
+    return;
+  }
+  dbpp::RedisClient& client = *opened.session->redis;
+
+  // Start db1 cleanly without the seeded cache:token key.
+  {
+    dbpp::RedisValue reply;
+    std::string err;
+    Expect(client.Command({"DEL", "cache:token"}, reply, err) && err.empty(),
+           "DEL cache:token failed: " + err);
+  }
+
+  // Construct a large UTF-8 string (~80 KB) with '中' straddling the 65536-byte boundary.
+  constexpr std::size_t kTestMaxStringPreviewBytes = 65536;
+  constexpr std::size_t kTestMaxScanIterations = 200;
+  const std::string utf8_mid = "\xE4\xB8\xAD";
+  const std::string big_str =
+      std::string(kTestMaxStringPreviewBytes - 1, 'a') + utf8_mid + std::string(14460, 'b');
+  const std::int64_t big_str_len = static_cast<std::int64_t>(big_str.size());
+
+  auto exec_ok = [&](const std::vector<std::string>& args, std::string_view label) {
+    dbpp::RedisValue reply;
+    std::string err;
+    Expect(client.Command(args, reply, err) && err.empty() && !reply.IsError(),
+           std::string(label) + " failed: " + err + " / " + reply.str);
+  };
+
+  exec_ok({"SET", "big:str", big_str}, "SET big:str");
+  exec_ok({"SET", "small:str", "ok"}, "SET small:str");
+
+  std::vector<std::string> hset_big = {"HSET", "big:hash"};
+  for (int i = 0; i < 250; ++i) {
+    hset_big.push_back("f" + std::to_string(i));
+    hset_big.push_back("v" + std::to_string(i));
+  }
+  exec_ok(hset_big, "HSET big:hash");
+  exec_ok({"HSET", "small:hash", "a", "1", "b", "2"}, "HSET small:hash");
+
+  std::vector<std::string> sadd_big = {"SADD", "big:set"};
+  for (int i = 0; i < 250; ++i) {
+    sadd_big.push_back("m" + std::to_string(i));
+  }
+  exec_ok(sadd_big, "SADD big:set");
+  exec_ok({"SADD", "small:set", "x", "y"}, "SADD small:set");
+
+  const dbpp::DbObject db1_obj{.name = "db1", .table_type = "REDIS DB"};
+  server.ResetCommandCounts();
+  const dbpp::TableModel table =
+      dbpp::LoadRedisTableBlocking(client, 1, db1_obj, 0, 100, std::nullopt, {});
+  Expect(table.error.empty() && table.snapshot && table.snapshot->rows.size() == 6,
+         "LoadRedisTableBlocking bigkey mix failed: " + table.error);
+  Expect(server.CommandCount("GETRANGE") == 1, "Expected 1 GETRANGE for big:str");
+  Expect(server.CommandCount("GET") == 1, "Expected 1 GET for small:str only");
+  Expect(server.CommandCount("HSCAN") == 1, "Expected 1 HSCAN for big:hash");
+  Expect(server.CommandCount("HGETALL") == 1, "Expected 1 HGETALL for small:hash only");
+  Expect(server.CommandCount("SSCAN") == 1, "Expected 1 SSCAN for big:set");
+  Expect(server.CommandCount("SMEMBERS") == 1, "Expected 1 SMEMBERS for small:set only");
+
+  auto find_row = [&](std::string_view key) -> std::optional<std::size_t> {
+    if (!table.snapshot) return std::nullopt;
+    for (std::size_t i = 0; i < table.snapshot->rows.size(); ++i) {
+      if (table.snapshot->rows[i].values[0].text == key) return i;
+    }
+    return std::nullopt;
+  };
+
+  if (const auto idx = find_row("big:str")) {
+    const dbpp::GridRow& row = table.snapshot->rows[*idx];
+    Expect(row.values[4].text == std::to_string(big_str_len), "big:str size mismatch");
+    Expect(row.values[1].display_text.empty(), "Redis cell must keep display_text empty");
+    Expect(row.values[1].text.size() < big_str.size() &&
+               row.values[1].text.find("65535") != std::string::npos &&
+               row.values[1].text.find(std::to_string(big_str_len)) != std::string::npos &&
+               row.values[1].text.find(utf8_mid[0]) == std::string::npos,
+           "big:str preview must trim split UTF-8 byte and show truncation marker");
+
+    const dbpp::AdbcQueryResult bad_val =
+        dbpp::UpdateRedisCellBlocking(client, table, *idx, 1, "overwrite");
+    Expect(!bad_val.error.empty(), "Truncated big:str must reject in-place value overwrite");
+
+    dbpp::RedisValue strlen_reply;
+    std::string err;
+    Expect(client.Command({"STRLEN", "big:str"}, strlen_reply, err) &&
+               strlen_reply.integer == big_str_len,
+           "Rejected overwrite must leave big:str intact");
+
+    const dbpp::AdbcQueryResult ttl_ok =
+        dbpp::UpdateRedisCellBlocking(client, table, *idx, 3, "600");
+    Expect(ttl_ok.error.empty(), "Updating TTL on big:str must still succeed: " + ttl_ok.error);
+  } else {
+    Expect(false, "big:str row missing");
+  }
+
+  if (const auto idx = find_row("small:str")) {
+    Expect(table.snapshot->rows[*idx].values[1].text == "ok", "small:str value mismatch");
+  } else {
+    Expect(false, "small:str row missing");
+  }
+
+  if (const auto idx = find_row("big:hash")) {
+    const dbpp::GridRow& row = table.snapshot->rows[*idx];
+    Expect(row.values[4].text == "250", "big:hash size mismatch");
+    Expect(row.values[1].text.find("250") != std::string::npos,
+           "big:hash preview must show total field count truncation info");
+    const dbpp::AdbcQueryResult bad_val =
+        dbpp::UpdateRedisCellBlocking(client, table, *idx, 1, "{\"only\":1}");
+    Expect(!bad_val.error.empty(), "Truncated big:hash must reject in-place value overwrite");
+  } else {
+    Expect(false, "big:hash row missing");
+  }
+
+  if (const auto idx = find_row("small:hash")) {
+    const dbpp::AdbcQueryResult ok_val =
+        dbpp::UpdateRedisCellBlocking(client, table, *idx, 1, "{\"a\":10,\"b\":20}");
+    Expect(ok_val.error.empty(), "Small hash edit must still succeed: " + ok_val.error);
+  } else {
+    Expect(false, "small:hash row missing");
+  }
+
+  if (const auto idx = find_row("big:set")) {
+    const dbpp::GridRow& row = table.snapshot->rows[*idx];
+    Expect(row.values[4].text == "250", "big:set size mismatch");
+    Expect(row.values[1].text.find("250") != std::string::npos,
+           "big:set preview must show total member count truncation info");
+    const dbpp::AdbcQueryResult bad_val =
+        dbpp::UpdateRedisCellBlocking(client, table, *idx, 1, "[\"only\"]");
+    Expect(!bad_val.error.empty(), "Truncated big:set must reject in-place value overwrite");
+  } else {
+    Expect(false, "big:set row missing");
+  }
+
+  if (const auto idx = find_row("small:set")) {
+    const dbpp::AdbcQueryResult ok_val =
+        dbpp::UpdateRedisCellBlocking(client, table, *idx, 1, "[\"x\",\"z\"]");
+    Expect(ok_val.error.empty(), "Small set edit must still succeed: " + ok_val.error);
+  } else {
+    Expect(false, "small:set row missing");
+  }
+
+  // Stepped SCAN iteration cap and cancellation guard.
+  dbpp_test::MockRedisServer scan_server;
+  const std::string scan_uri = "redis://127.0.0.1:" + std::to_string(scan_server.Port()) + "/1";
+  const dbpp::AdbcOpenResult scan_open = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = scan_uri,
+      .username = {},
+      .password = {},
+      .title = "scan-cap",
+  });
+  Expect(scan_open.error.empty() && scan_open.session != nullptr && scan_open.session->redis,
+         "Connect to scan_server failed: " + scan_open.error);
+  if (!scan_open.session || !scan_open.session->redis) {
+    return;
+  }
+  dbpp::RedisClient& scan_client = *scan_open.session->redis;
+  std::vector<std::vector<std::string>> seed_cmds;
+  for (int i = 0; i < 250; ++i) {
+    seed_cmds.push_back({"SET", "k:" + std::to_string(i), "v"});
+  }
+  std::vector<dbpp::RedisValue> seed_replies;
+  std::string seed_err;
+  Expect(scan_client.Pipeline(seed_cmds, seed_replies, seed_err) && seed_err.empty(),
+         "Seed keys for SCAN cap test failed: " + seed_err);
+
+  scan_server.SetScanStepSize(1);
+  scan_server.ResetCommandCounts();
+  const dbpp::RedisPageResult capped = dbpp::LoadRedisKeysPageBlocking(
+      scan_client, db1_obj, 0, 100, std::nullopt, "nomatch:*");
+  Expect(capped.error.empty() && capped.scan_capped && capped.scan_iterations_capped &&
+             capped.total == 0 && scan_server.CommandCount("SCAN") == kTestMaxScanIterations,
+         "SCAN iteration cap must stop after kMaxScanIterations batches");
+
+  const dbpp::TableModel capped_tbl = dbpp::LoadRedisTableBlocking(
+      scan_client, 1, db1_obj, 0, 100, std::nullopt, "nomatch:*");
+  Expect(capped_tbl.error.empty() &&
+             capped_tbl.message.find(std::to_string(kTestMaxScanIterations)) != std::string::npos,
+         "LoadRedisTableBlocking message must report iteration cap: " + capped_tbl.message);
+
+  scan_server.ResetCommandCounts();
+  std::atomic<bool> cancel{true};
+  const dbpp::RedisPageResult cancelled = dbpp::LoadRedisKeysPageBlocking(
+      scan_client, db1_obj, 0, 100, std::nullopt, "*", &cancel);
+  Expect(cancelled.scan_cancelled && !cancelled.error.empty() &&
+             scan_server.CommandCount("SCAN") == 0,
+         "Cancelled SCAN must abort immediately without issuing SCAN");
+}
+
+void TestRedisTypeFilterScanning() {
+  dbpp_test::MockRedisServer server;
+  const std::string uri = "redis://127.0.0.1:" + std::to_string(server.Port()) + "/0";
+  const dbpp::AdbcOpenResult opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = uri,
+      .username = {},
+      .password = {},
+      .title = "type-filter",
+  });
+  Expect(opened.error.empty() && opened.session != nullptr && opened.session->redis != nullptr,
+         "Connect to mock db0 failed: " + opened.error);
+  if (!opened.session || !opened.session->redis) {
+    return;
+  }
+  dbpp::RedisClient& client = *opened.session->redis;
+  const dbpp::DbObject db0_obj{.name = "db0", .table_type = "REDIS DB"};
+
+  // 1. Native SCAN ... TYPE (Redis 6.0+): only touches keys of the selected type.
+  server.ResetCommandCounts();
+  const dbpp::TableModel hash_only = dbpp::LoadRedisTableBlocking(
+      client, 1, db0_obj, 0, 100, std::nullopt, {}, nullptr, "hash");
+  Expect(hash_only.error.empty() && hash_only.total == 1 && hash_only.snapshot &&
+             hash_only.snapshot->rows.size() == 1 &&
+             hash_only.snapshot->rows[0].values[0].text == "user:100" &&
+             hash_only.redis_type_filter == "hash" &&
+             hash_only.executed_sql.find("TYPE hash") != std::string::npos,
+         "LoadRedisTableBlocking TYPE hash mismatch: " + hash_only.error);
+  Expect(server.CommandCount("HLEN") == 1 && server.CommandCount("STRLEN") == 0 &&
+             server.CommandCount("LLEN") == 0 && server.CommandCount("SCARD") == 0 &&
+             server.CommandCount("ZCARD") == 0,
+         "SCAN ... TYPE hash must skip querying other key types");
+
+  // 2. Combined MATCH + TYPE filtering (user:* + hash excludes list key user:200).
+  const dbpp::TableModel matched_hash = dbpp::LoadRedisTableBlocking(
+      client, 1, db0_obj, 0, 100, std::nullopt, "user:*", nullptr, "HASH");
+  Expect(matched_hash.error.empty() && matched_hash.total == 1 && matched_hash.snapshot &&
+             matched_hash.snapshot->rows.size() == 1 &&
+             matched_hash.snapshot->rows[0].values[0].text == "user:100" &&
+             matched_hash.redis_type_filter == "hash",
+         "Combined MATCH + TYPE hash mismatch: " + matched_hash.error);
+
+  // 3. Redis < 6.0 fallback (server rejects SCAN ... TYPE with ERR syntax error).
+  server.SetDisableScanType(true);
+  const dbpp::TableModel fallback_set = dbpp::LoadRedisTableBlocking(
+      client, 1, db0_obj, 0, 100, std::nullopt, {}, nullptr, "set");
+  Expect(fallback_set.error.empty() && fallback_set.total == 1 && fallback_set.snapshot &&
+             fallback_set.snapshot->rows.size() == 1 &&
+             fallback_set.snapshot->rows[0].values[0].text == "tags",
+         "Redis < 6.0 TYPE fallback failed: " + fallback_set.error);
+  server.SetDisableScanType(false);
+
+  // 4. CLI rows --redis ... --type hash --json
+  const CliRunResult cli_hash =
+      InvokeCli({"rows", "--redis", uri, "db0", "--type", "hash", "--json"});
+  Expect(cli_hash.code == 0 && cli_hash.out.find("\"total\":1") != std::string::npos &&
+             cli_hash.out.find("user:100") != std::string::npos &&
+             cli_hash.out.find("greeting") == std::string::npos,
+         "CLI rows --redis --type hash failed: " + cli_hash.err + " / " + cli_hash.out);
+}
+
+void TestRedisTreeGroupingAndDetail() {
+  // 1. Nested tree grouping & delimiter switching (including edge keys).
+  const std::vector<std::string> sample_keys = {
+      "a::b", "greeting", "user", "user:", "user:100", "user:profile:1", "user:profile:2",
+  };
+  std::unordered_set<std::string> expanded;
+  std::unordered_set<std::string> all_folders;
+  const auto top_rows =
+      dbpp::BuildRedisTreeFlatRows(sample_keys, ":", expanded, &all_folders);
+  Expect(top_rows.size() == 5 && top_rows[0].is_folder && top_rows[0].id == "a:" &&
+             top_rows[0].key_count == 1 && top_rows[1].is_folder && top_rows[1].id == "user:" &&
+             top_rows[1].label == "user" && top_rows[1].key_count == 3 &&
+             !top_rows[2].is_folder && top_rows[2].full_key == "greeting" &&
+             !top_rows[3].is_folder && top_rows[3].full_key == "user" &&
+             !top_rows[4].is_folder && top_rows[4].full_key == "user:",
+         "Collapsed ':' tree layout mismatch");
+  Expect(all_folders.size() == 3 && all_folders.contains("user:profile:"),
+         "All-folders output mismatch");
+
+  expanded.insert("user:");
+  const auto mid_rows = dbpp::BuildRedisTreeFlatRows(sample_keys, ":", expanded);
+  Expect(mid_rows.size() == 7 && mid_rows[2].is_folder && mid_rows[2].id == "user:profile:" &&
+             mid_rows[2].depth == 1 && mid_rows[2].key_count == 2 &&
+             !mid_rows[3].is_folder && mid_rows[3].full_key == "user:100" &&
+             mid_rows[3].label == "100" && mid_rows[3].depth == 1,
+         "Expanded first level tree layout mismatch");
+
+  expanded.insert("user:profile:");
+  const auto leaf_rows = dbpp::BuildRedisTreeFlatRows(sample_keys, ":", expanded);
+  Expect(leaf_rows.size() == 9 && !leaf_rows[3].is_folder &&
+             leaf_rows[3].full_key == "user:profile:1" && leaf_rows[3].label == "1" &&
+             leaf_rows[3].depth == 2 && !leaf_rows[4].is_folder &&
+             leaf_rows[4].full_key == "user:profile:2" && leaf_rows[4].depth == 2,
+         "Expanded second level tree layout mismatch");
+
+  const auto flat_rows = dbpp::BuildRedisTreeFlatRows(sample_keys, "", expanded);
+  Expect(flat_rows.size() == sample_keys.size() && !flat_rows[0].is_folder &&
+             flat_rows[0].depth == 0,
+         "Flat mode tree layout mismatch");
+
+  const std::vector<std::string> slash_keys = {"app/v1/cfg", "app/v1/flag", "app/health"};
+  const auto slash_rows =
+      dbpp::BuildRedisTreeFlatRows(slash_keys, "/", std::unordered_set<std::string>{"app/", "app/v1/"});
+  Expect(slash_rows.size() == 5 && slash_rows[0].id == "app/" && slash_rows[1].id == "app/v1/" &&
+             slash_rows[2].full_key == "app/v1/cfg" && slash_rows[4].full_key == "app/health",
+         "Custom '/' delimiter grouping mismatch");
+
+  // 2. ScanRedisKeyNamesBlocking issues zero value/size/TTL commands.
+  dbpp_test::MockRedisServer server;
+  const std::string uri = "redis://127.0.0.1:" + std::to_string(server.Port()) + "/0";
+  const dbpp::AdbcOpenResult opened = dbpp::OpenAdbcBlocking(dbpp::ConnectionRequest{
+      .driver_path = "redis",
+      .uri = uri,
+      .username = {},
+      .password = {},
+      .title = "tree-scan",
+  });
+  Expect(opened.error.empty() && opened.session != nullptr && opened.session->redis != nullptr,
+         "Connect for tree test failed: " + opened.error);
+  if (!opened.session || !opened.session->redis) {
+    return;
+  }
+  dbpp::RedisClient& client = *opened.session->redis;
+  const dbpp::DbObject db0_obj{.name = "db0", .table_type = "REDIS DB"};
+
+  server.ResetCommandCounts();
+  const dbpp::RedisKeyListResult names =
+      dbpp::ScanRedisKeyNamesBlocking(client, db0_obj, {}, {});
+  Expect(names.error.empty() && names.keys.size() == 5 &&
+             std::ranges::is_sorted(names.keys),
+         "ScanRedisKeyNamesBlocking failed: " + names.error);
+  Expect(server.CommandCount("GET") == 0 && server.CommandCount("HGETALL") == 0 &&
+             server.CommandCount("STRLEN") == 0 && server.CommandCount("HLEN") == 0 &&
+             server.CommandCount("TTL") == 0,
+         "ScanRedisKeyNamesBlocking must not fetch values, sizes, or TTLs");
+
+  // 3. LoadRedisKeyDetailBlocking on structured types & oversized string.
+  const dbpp::RedisKeyDetail hash_det =
+      dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "user:100");
+  Expect(hash_det.error.empty() && hash_det.exists && hash_det.type == "hash" &&
+             hash_det.size == 2 && hash_det.entries.size() == 2 &&
+             hash_det.entries[0].first == "name" && hash_det.entries[0].second == "Alice",
+         "LoadRedisKeyDetailBlocking hash mismatch");
+
+  const dbpp::RedisKeyDetail zset_det =
+      dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "leaderboard");
+  Expect(zset_det.error.empty() && zset_det.exists && zset_det.type == "zset" &&
+             zset_det.entries.size() == 2 && zset_det.entries[0].first == "alice",
+         "LoadRedisKeyDetailBlocking zset mismatch");
+
+  const std::string big_val(70000, 'x');
+  {
+    dbpp::RedisValue r;
+    std::string e;
+    Expect(client.Command({"SET", "tree:big", big_val, "EX", "200"}, r, e) && e.empty(),
+           "SET tree:big failed: " + e);
+    // Mock server SET doesn't parse EX, so set EXPIRE explicitly for TTL test.
+    Expect(client.Command({"EXPIRE", "tree:big", "200"}, r, e) && e.empty(),
+           "EXPIRE tree:big failed: " + e);
+  }
+  const dbpp::RedisKeyDetail preview_det =
+      dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big", false);
+  Expect(preview_det.error.empty() && preview_det.exists && preview_det.truncated &&
+             preview_det.string_value.size() == 65536 && preview_det.size == 70000,
+         "Detail preview for big string mismatch");
+
+  const dbpp::RedisKeyDetail full_det =
+      dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big", true);
+  Expect(full_det.error.empty() && full_det.exists && !full_det.truncated &&
+             full_det.string_value == big_val,
+         "Detail load_full_string mismatch");
+
+  // 4. Detail write operations (string update keeping TTL, TTL update, rename, delete).
+  const dbpp::AdbcQueryResult save_res =
+      dbpp::UpdateRedisKeyStringBlocking(client, db0_obj, "tree:big", "updated");
+  Expect(save_res.error.empty(), "UpdateRedisKeyStringBlocking failed: " + save_res.error);
+  const dbpp::RedisKeyDetail after_save =
+      dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big");
+  Expect(after_save.string_value == "updated" && after_save.ttl == 200,
+         "UpdateRedisKeyStringBlocking must preserve TTL");
+
+  const dbpp::AdbcQueryResult ttl_res =
+      dbpp::UpdateRedisKeyTtlBlocking(client, db0_obj, "tree:big", "900");
+  Expect(ttl_res.error.empty(), "UpdateRedisKeyTtlBlocking failed: " + ttl_res.error);
+  Expect(dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big").ttl == 900,
+         "TTL update to 900 mismatch");
+
+  const dbpp::AdbcQueryResult ren_res =
+      dbpp::RenameRedisKeyBlocking(client, db0_obj, "tree:big", "tree:big:renamed");
+  Expect(ren_res.error.empty(), "RenameRedisKeyBlocking failed: " + ren_res.error);
+  Expect(!dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big").exists &&
+             dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big:renamed").exists,
+         "Rename key check failed");
+
+  const dbpp::AdbcQueryResult del_res =
+      dbpp::DeleteRedisKeyByNameBlocking(client, db0_obj, "tree:big:renamed");
+  Expect(del_res.error.empty() &&
+             !dbpp::LoadRedisKeyDetailBlocking(client, db0_obj, "tree:big:renamed").exists,
+         "DeleteRedisKeyByNameBlocking check failed");
+}
+
 } // namespace
 
 int main() {
@@ -469,6 +873,9 @@ int main() {
   TestRedisSessionCrudAndCli(temp.path);
   TestRedisAuditRegressions();
   TestRedisDisconnectDetection();
+  TestRedisBigKeyAndScanCapOptimizations();
+  TestRedisTypeFilterScanning();
+  TestRedisTreeGroupingAndDetail();
 
   if (g_failures != 0) {
     std::cerr << g_failures << " Redis test assertion(s) failed\n";

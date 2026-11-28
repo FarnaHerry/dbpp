@@ -333,6 +333,7 @@ struct TableModel {
   std::int64_t page = 0;
   std::int64_t page_size = kPageSize;
   std::string filter;
+  std::string redis_type_filter;
   std::optional<huxerui::DataTableSort> sort;
   bool loading = false;
   bool connection_lost = false;
@@ -425,6 +426,11 @@ enum class WorkspaceTabKind {
   TableDesign,
 };
 
+enum class RedisBrowserViewMode {
+  Table,
+  Tree,
+};
+
 struct WorkspaceTab {
   std::uint64_t id = 0;
   WorkspaceTabKind kind = WorkspaceTabKind::Table;
@@ -439,6 +445,8 @@ struct WorkspaceTab {
   TableModel table;
   std::optional<huxerui::DataTableCellId> selected_cell;
   huxerui::TextEditingValue filter_input;
+  RedisBrowserViewMode redis_view_mode = RedisBrowserViewMode::Table;
+  std::string redis_tree_delimiter = ":";
 
   DbObject design_object;
   std::string design_display_label;

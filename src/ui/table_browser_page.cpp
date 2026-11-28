@@ -28,6 +28,8 @@ using namespace dbpp::ui;
   const auto picker = UseService<FilePicker>();
   const auto clipboard = UseApplication().Clipboard();
   const auto sort_anchor = UseViewHandle();
+  const auto type_anchor = UseViewHandle();
+  const auto delim_anchor = UseViewHandle();
   const auto import_anchor = UseViewHandle();
   const auto export_anchor = UseViewHandle();
   const auto page_size_anchor = UseViewHandle();
@@ -35,6 +37,7 @@ using namespace dbpp::ui;
   const auto settings = UseService<SettingsModel>();
   auto live_drafts = UseState(std::make_shared<std::unordered_map<std::string, std::string>>());
   const auto inline_editor_focused = UseState(std::make_shared<std::atomic<bool>>(false));
+  auto tree_reload_token = UseState<std::uint64_t>(0);
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
@@ -52,6 +55,7 @@ using namespace dbpp::ui;
     return TableEmptyState(app::strings::table_conn_disconnected);
   }
   const bool is_redis = session->dialect == Dialect::Redis;
+  const bool is_redis_tree = is_redis && tab->redis_view_mode == RedisBrowserViewMode::Tree;
 
   const auto apply_draft_value = [workspace, tab_id](const std::string& row_id,
                                                      const std::string& col_id,
@@ -87,24 +91,78 @@ using namespace dbpp::ui;
                      false, notify);
   };
 
-  const auto apply_filter = [reload, workspace, tab_id] {
+  const auto apply_filter = [reload, workspace, tab_id, is_redis_tree, tree_reload_token] {
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
     if (cur == nullptr) {
+      return;
+    }
+    if (is_redis_tree) {
+      const std::string f = cur->filter_input.text;
+      workspace.Update([tab_id, &f](WorkspaceModel& ws) {
+        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+          target->table.filter = f;
+        }
+      });
+      tree_reload_token = tree_reload_token.Get() + 1;
       return;
     }
     reload(0, cur->filter_input.text);
   };
 
-  const auto clear_filter = [reload, workspace, tab_id] {
-    workspace.Update([tab_id](WorkspaceModel& ws) {
+  const auto clear_filter = [app, workspace, tasks, tab_id, notify, block_if_dirty,
+                             is_redis_tree, tree_reload_token] {
+    if (block_if_dirty()) {
+      return;
+    }
+    workspace.Update([tab_id, is_redis_tree](WorkspaceModel& ws) {
       if (WorkspaceTab* target = ws.FindTab(tab_id)) {
         target->filter_input = TextEditingValue{};
+        if (is_redis_tree) {
+          target->table.filter.clear();
+          target->table.redis_type_filter.clear();
+        }
       }
     });
-    reload(0, {});
+    if (is_redis_tree) {
+      tree_reload_token = tree_reload_token.Get() + 1;
+      return;
+    }
+    const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+    if (cur == nullptr) {
+      return;
+    }
+    RequestLoadTable(app, workspace, tasks, tab_id, 0, cur->table.sort, {}, false, notify, 0,
+                     std::string{});
   };
 
-  const auto refresh = [reload, workspace, tab_id] {
+  const auto apply_redis_type = [app, workspace, tasks, tab_id, notify, block_if_dirty,
+                                 is_redis_tree, tree_reload_token](std::string next_type) {
+    if (block_if_dirty()) {
+      return;
+    }
+    const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
+    if (cur == nullptr) {
+      return;
+    }
+    if (is_redis_tree) {
+      workspace.Update([tab_id, &next_type](WorkspaceModel& ws) {
+        if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+          target->table.redis_type_filter = next_type;
+          target->table.filter = target->filter_input.text;
+        }
+      });
+      tree_reload_token = tree_reload_token.Get() + 1;
+      return;
+    }
+    RequestLoadTable(app, workspace, tasks, tab_id, 0, cur->table.sort, cur->filter_input.text,
+                     false, notify, 0, std::move(next_type));
+  };
+
+  const auto refresh = [reload, workspace, tab_id, is_redis_tree, tree_reload_token] {
+    if (is_redis_tree) {
+      tree_reload_token = tree_reload_token.Get() + 1;
+      return;
+    }
     const WorkspaceTab* cur = workspace.Get().FindTab(tab_id);
     if (cur == nullptr) {
       return;
@@ -287,95 +345,54 @@ using namespace dbpp::ui;
   toolbar_items.Add(CompactTextField(std::move(filter_field), kToolbarHeight, 8.0F, font_size::kChip)
                         .With(Frame{.width = 240.0F, .height = kToolbarHeight,
                                     .min_height = kToolbarHeight, .max_height = kToolbarHeight}));
+  if (is_redis) {
+    toolbar_items.Add(RedisViewModeSwitch(
+        tab->redis_view_mode, !model.HasPendingChanges(), kToolbarHeight,
+        [app, workspace, tasks, tab_id, notify, block_if_dirty](RedisBrowserViewMode next_mode) {
+          if (block_if_dirty()) {
+            return;
+          }
+          workspace.Update([tab_id, next_mode](WorkspaceModel& ws) {
+            if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+              target->redis_view_mode = next_mode;
+            }
+          });
+          if (next_mode == RedisBrowserViewMode::Table) {
+            if (const WorkspaceTab* cur = workspace.Get().FindTab(tab_id)) {
+              RequestLoadTable(app, workspace, tasks, tab_id, cur->table.page, cur->table.sort,
+                               cur->filter_input.text, false, notify, 0,
+                               cur->table.redis_type_filter);
+            }
+          }
+        }));
+    toolbar_items.Add(RedisTypeFilterButton(menu, type_anchor, loc, model.redis_type_filter,
+                                            !model.HasPendingChanges(), kToolbarHeight,
+                                            apply_redis_type));
+    if (is_redis_tree) {
+      toolbar_items.Add(RedisDelimiterFilterButton(
+          menu, delim_anchor, dialogs, loc, tab->redis_tree_delimiter, true, kToolbarHeight,
+          theme_config, language_mode, system_dark, [workspace, tab_id](std::string next_delim) {
+            workspace.Update([tab_id, &next_delim](WorkspaceModel& ws) {
+              if (WorkspaceTab* target = ws.FindTab(tab_id)) {
+                target->redis_tree_delimiter = next_delim;
+              }
+            });
+          }));
+    }
+  }
   toolbar_items.Add(CompactActionButton(Button(app::strings::table_apply_filter).OnClick(apply_filter),
                                         ButtonTone::Default, kToolbarHeight, 10.0F));
-  if (!model.filter.empty() || !TrimmedSql(tab->filter_input.text).empty()) {
+  if (!model.filter.empty() || !TrimmedSql(tab->filter_input.text).empty() ||
+      (is_redis && !model.redis_type_filter.empty())) {
     toolbar_items.Add(
         CompactActionButton(Button(app::strings::table_clear_filter).OnClick(clear_filter),
                             ButtonTone::Default, kToolbarHeight, 10.0F));
   }
-  const bool sort_active = model.sort.has_value();
-  const std::string sort_label =
-      sort_active ? UseString(model.sort->direction == DataTableSortDirection::Descending
-                                  ? app::strings::table_sort_active_desc
-                                  : app::strings::table_sort_active_asc,
-                              model.sort->column_id)
-                  : UseString(app::strings::table_sort);
-  const Color sort_fg = sort_active ? spec.colors.on_primary_container : spec.colors.on_surface;
-  const Color sort_bg = sort_active ? spec.colors.primary_container : spec.colors.surface;
-  const Color sort_border =
-      sort_active ? WithAlpha(spec.colors.primary, 0.45F) : semantic.border_subtle;
-  const Color sort_icon_color =
-      sort_active ? spec.colors.primary : spec.colors.on_surface_variant;
-  const std::vector<ColumnMeta> sort_cols = model.columns;
-  const std::optional<DataTableSort> current_sort = model.sort;
-  toolbar_items.Add(
-      Row{
-          TintedIcon(app::images::sort, sort_icon_color, 13.0F),
-          Text(sort_label)
-              .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium),
-                               sort_fg})
-              .LineLimit(1),
-          TintedIcon(app::images::chevron_down, sort_icon_color, 12.0F),
-      }
-          .With(Frame{.height = kToolbarHeight, .min_height = kToolbarHeight,
-                      .max_height = kToolbarHeight},
-                Padding{EdgeInsets::Symmetric(8.0F, 0.0F)}, Spacing{5.0F},
-                CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
-                Background{VisualFill{sort_bg}}, Border{sort_border, 1.0F}, sort_anchor,
-                Enabled{!model.columns.empty() && !model.HasPendingChanges()})
-          .OnClick([menu, sort_anchor, loc, apply_sort, sort_cols, current_sort] {
-            std::vector<MenuEntry> entries;
-            if (current_sort.has_value()) {
-              const bool is_desc = current_sort->direction == DataTableSortDirection::Descending;
-              entries.emplace_back(
-                  MenuItem(loc.Get(is_desc ? app::strings::table_sort_toggle_asc
-                                           : app::strings::table_sort_toggle_desc),
-                           [apply_sort, col_id = current_sort->column_id, is_desc] {
-                             apply_sort(DataTableSort{
-                                 .column_id = col_id,
-                                 .direction = is_desc ? DataTableSortDirection::Ascending
-                                                      : DataTableSortDirection::Descending,
-                             });
-                           }));
-              entries.emplace_back(
-                  MenuItem(loc.Get(app::strings::table_sort_clear), [apply_sort] {
-                    apply_sort(std::nullopt);
-                  }));
-              entries.emplace_back(MenuSection{});
-            }
-            for (const ColumnMeta& col : sort_cols) {
-              const bool active_col =
-                  current_sort.has_value() && current_sort->column_id == col.name;
-              const bool active_desc =
-                  active_col && current_sort->direction == DataTableSortDirection::Descending;
-              std::string item_label = col.name;
-              if (active_col) {
-                item_label += active_desc ? " ↓" : " ↑";
-              }
-              entries.emplace_back(
-                  MenuItem(std::move(item_label),
-                           [apply_sort, col_name = col.name, active_col, active_desc] {
-                             DataTableSortDirection next_dir =
-                                 (active_col && !active_desc) ? DataTableSortDirection::Descending
-                                                              : DataTableSortDirection::Ascending;
-                             apply_sort(DataTableSort{.column_id = col_name, .direction = next_dir});
-                           })
-                      .Checked(active_col));
-            }
-            menu.Show(sort_anchor, std::move(entries),
-                      MenuOptions{
-                          .placement = {.side = AnchorSide::Below,
-                                        .alignment = AnchorAlignment::Start},
-                          .gap = 4.0F,
-                          .viewport_margin = 8.0F,
-                          .offset = {},
-                          .width = std::nullopt,
-                          .dismiss_on_outside_press = true,
-                          .dismiss_on_cancel = true,
-                          .on_dismiss_request = {},
-                      });
-          }));
+  if (!is_redis_tree) {
+    toolbar_items.Add(TableSortButton(menu, sort_anchor, loc, model.columns, model.sort,
+                                      !model.columns.empty() && !model.HasPendingChanges(),
+                                      kToolbarHeight, apply_sort));
+  }
   toolbar_items.Add(Spacer());
   if (!is_redis && model.editable && !model.read_only && session->session) {
     const std::shared_ptr<AdbcSession> adbc_ptr = session->session;
@@ -469,39 +486,41 @@ using namespace dbpp::ui;
   }
   toolbar_items.Add(CompactActionButton(Button(app::strings::action_refresh).OnClick(refresh),
                                         ButtonTone::Default, kToolbarHeight, 10.0F));
-  toolbar_items.Add(
-      CompactActionButton(Button(is_redis ? app::strings::table_add_key : app::strings::table_add_row)
-                              .OnClick(add_draft_row),
-                          ButtonTone::Default, kToolbarHeight, 10.0F)
-          .With(Enabled{model.editable && !model.read_only && !model.committing}));
-  if (model.HasPendingChanges()) {
-    const std::string commit_label =
-        model.committing ? UseString(app::strings::table_committing)
-                         : UseString(app::strings::table_commit_n, model.PendingChangeCount());
+  if (!is_redis_tree) {
     toolbar_items.Add(
-        CompactActionButton(Button(commit_label).OnClick(commit_inserts), ButtonTone::Primary,
-                            kToolbarHeight, 10.0F)
-            .With(Enabled{!model.committing}));
-    toolbar_items.Add(
-        CompactActionButton(Button(app::strings::table_rollback).OnClick(rollback_inserts),
+        CompactActionButton(Button(is_redis ? app::strings::table_add_key : app::strings::table_add_row)
+                                .OnClick(add_draft_row),
                             ButtonTone::Default, kToolbarHeight, 10.0F)
-            .With(Enabled{!model.committing}));
+            .With(Enabled{model.editable && !model.read_only && !model.committing}));
+    if (model.HasPendingChanges()) {
+      const std::string commit_label =
+          model.committing ? UseString(app::strings::table_committing)
+                           : UseString(app::strings::table_commit_n, model.PendingChangeCount());
+      toolbar_items.Add(
+          CompactActionButton(Button(commit_label).OnClick(commit_inserts), ButtonTone::Primary,
+                              kToolbarHeight, 10.0F)
+              .With(Enabled{!model.committing}));
+      toolbar_items.Add(
+          CompactActionButton(Button(app::strings::table_rollback).OnClick(rollback_inserts),
+                              ButtonTone::Default, kToolbarHeight, 10.0F)
+              .With(Enabled{!model.committing}));
+    }
+    bool selected_pending_delete = false;
+    if (tab->selected_cell.has_value() && !IsDraftRowId(tab->selected_cell->row_id)) {
+      selected_pending_delete =
+          model.IsRowPendingDelete(RowIndexFromId(tab->selected_cell->row_id));
+    }
+    toolbar_items.Add(
+        CompactActionButton(
+            Button(selected_pending_delete
+                       ? app::strings::table_undo_delete_row
+                       : (is_redis ? app::strings::table_delete_key : app::strings::table_delete_row))
+                .OnClick(delete_selected_action),
+            selected_pending_delete ? ButtonTone::Default : ButtonTone::Danger, kToolbarHeight,
+            10.0F)
+            .With(Enabled{model.editable && !model.read_only && !model.committing &&
+                          tab->selected_cell.has_value()}));
   }
-  bool selected_pending_delete = false;
-  if (tab->selected_cell.has_value() && !IsDraftRowId(tab->selected_cell->row_id)) {
-    selected_pending_delete =
-        model.IsRowPendingDelete(RowIndexFromId(tab->selected_cell->row_id));
-  }
-  toolbar_items.Add(
-      CompactActionButton(
-          Button(selected_pending_delete
-                     ? app::strings::table_undo_delete_row
-                     : (is_redis ? app::strings::table_delete_key : app::strings::table_delete_row))
-              .OnClick(delete_selected_action),
-          selected_pending_delete ? ButtonTone::Default : ButtonTone::Danger, kToolbarHeight,
-          10.0F)
-          .With(Enabled{model.editable && !model.read_only && !model.committing &&
-                        tab->selected_cell.has_value()}));
 
   View toolbar = Row{std::move(toolbar_items)}.With(
       CrossAlign{CrossAxisAlignment::Center}, Spacing{4.0F},
@@ -574,6 +593,12 @@ using namespace dbpp::ui;
   if (!model.filter.empty()) {
     status_items.Add(
         StatusBadge(UseString(app::strings::table_active_filter, model.filter),
+                    spec.colors.primary, spec.colors.primary_container, Color::Transparent())
+            .With(LayoutPriority(1.0F)));
+  }
+  if (is_redis && !model.redis_type_filter.empty()) {
+    status_items.Add(
+        StatusBadge(UseString(app::strings::table_active_type_filter, model.redis_type_filter),
                     spec.colors.primary, spec.colors.primary_container, Color::Transparent())
             .With(LayoutPriority(1.0F)));
   }
@@ -941,11 +966,17 @@ using namespace dbpp::ui;
 
   Views page_items;
   page_items.Add(std::move(toolbar).Key("table-toolbar-" + std::to_string(tab_id)));
-  if (!model.error.empty() && model.snapshot != nullptr) {
-    page_items.Add(ErrorText(model.error).Key("table-error-" + std::to_string(tab_id)));
+  if (is_redis_tree) {
+    page_items.Add(RedisTreeWorkspace(app, workspace, tab_id, tree_reload_token.Get(), tasks,
+                                      notify, theme_config, language_mode, system_dark)
+                       .Key("redis-tree-workspace-" + std::to_string(tab_id)));
+  } else {
+    if (!model.error.empty() && model.snapshot != nullptr) {
+      page_items.Add(ErrorText(model.error).Key("table-error-" + std::to_string(tab_id)));
+    }
+    page_items.Add(std::move(table_view).Key("table-view-" + std::to_string(tab_id)));
+    page_items.Add(std::move(pager).Key("table-pager-" + std::to_string(tab_id)));
   }
-  page_items.Add(std::move(table_view).Key("table-view-" + std::to_string(tab_id)));
-  page_items.Add(std::move(pager).Key("table-pager-" + std::to_string(tab_id)));
 
   return Column{std::move(page_items)}.With(Grow(1.0F), Padding{EdgeInsets{.top = 4.0F}},
                                             Spacing{4.0F},

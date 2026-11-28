@@ -3,7 +3,7 @@ module;
 #include <huxerui/datatable.h>
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.5"
+#define DBPP_VERSION "0.4.6"
 #endif
 
 module dbpp.cli;
@@ -311,6 +311,7 @@ int CliHandleRows(const std::vector<std::string>& args, std::ostream& out, std::
   std::int64_t limit = kCliDefaultRowsLimit;
   std::int64_t offset = 0;
   std::string where_expr;
+  std::string redis_type_filter;
   std::string order_spec;
   std::optional<std::string> table_arg;
   std::string error;
@@ -371,6 +372,12 @@ int CliHandleRows(const std::vector<std::string>& args, std::ostream& out, std::
       }
       continue;
     }
+    if (flag == "--type") {
+      if (!CliConsumeFlagValue(args, i, inline_val, flag, redis_type_filter, error)) {
+        return CliEmitError(err, early_json, error, kCliExitUsage);
+      }
+      continue;
+    }
     if (flag == "--order") {
       if (!CliConsumeFlagValue(args, i, inline_val, flag, order_spec, error)) {
         return CliEmitError(err, early_json, error, kCliExitUsage);
@@ -419,6 +426,9 @@ int CliHandleRows(const std::vector<std::string>& args, std::ostream& out, std::
   }
 
   const Dialect dialect = opened.session->dialect;
+  if (!redis_type_filter.empty() && dialect != Dialect::Redis) {
+    return CliEmitError(err, json_mode, "--type 仅支持 Redis 数据库", kCliExitUsage);
+  }
   const std::string qname =
       dialect == Dialect::Redis ? matched->name : QualifiedName(dialect, *matched);
   const std::vector<ColumnMeta> cols = ResolveColumnsForObject(*opened.session, *matched, error);
@@ -471,7 +481,8 @@ int CliHandleRows(const std::vector<std::string>& args, std::ostream& out, std::
   if (dialect == Dialect::Redis && opened.session->redis) {
     const RedisPageResult page_res = LoadRedisKeysPageBlocking(
         *opened.session->redis, *matched, offset, limit, redis_sort,
-        std::string(CliTrimAscii(where_expr)));
+        std::string(CliTrimAscii(where_expr)), nullptr,
+        std::string(CliTrimAscii(redis_type_filter)));
     if (!page_res.error.empty()) {
       return CliEmitError(err, json_mode, page_res.error, kCliExitError);
     }

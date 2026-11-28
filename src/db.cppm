@@ -138,7 +138,8 @@ AdbcQueryResult DeleteRowBlocking(AdbcSession& session, const TableModel& model,
                                   std::size_t row_index);
 TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
                              DbObject object, std::int64_t page, std::int64_t page_size,
-                             std::optional<huxerui::DataTableSort> sort, std::string filter);
+                             std::optional<huxerui::DataTableSort> sort, std::string filter,
+                             std::string type_filter = {});
 
 huxerui::Task<AdbcQueryResult> ExecuteQueryAsync(std::shared_ptr<AdbcSession> session,
                                                  std::string sql, bool want_rows,
@@ -154,7 +155,8 @@ void RequestLoadTable(const huxerui::State<AppModel>& app,
                       const huxerui::TaskScope& tasks, std::uint64_t tab_id,
                       std::int64_t page, std::optional<huxerui::DataTableSort> sort,
                       std::string filter, bool keep_selection, NotifyFn notify,
-                      std::int64_t page_size = 0);
+                      std::int64_t page_size = 0,
+                      std::optional<std::string> type_filter = std::nullopt);
 void StageTableCellEdit(const huxerui::State<AppModel>& app,
                         const huxerui::State<WorkspaceModel>& workspace, std::uint64_t tab_id,
                         const huxerui::DataTableEditRequest& edit);

@@ -68,6 +68,46 @@ CellValue ReplyToCell(const RedisValue& val) {
   return TextCell(val.ToDisplayString());
 }
 
+void TrimIncompleteUtf8Tail(std::string& s) {
+  if (s.empty()) {
+    return;
+  }
+  std::size_t idx = s.size();
+  std::size_t cont = 0;
+  while (idx > 0 && cont < 3 && (static_cast<unsigned char>(s[idx - 1]) & 0xC0u) == 0x80u) {
+    --idx;
+    ++cont;
+  }
+  if (idx == 0) {
+    return;
+  }
+  const unsigned char lead = static_cast<unsigned char>(s[idx - 1]);
+  std::size_t expected_len = 0;
+  if ((lead & 0x80u) == 0u) {
+    return;
+  } else if ((lead & 0xE0u) == 0xC0u) {
+    expected_len = 2;
+  } else if ((lead & 0xF0u) == 0xE0u) {
+    expected_len = 3;
+  } else if ((lead & 0xF8u) == 0xF0u) {
+    expected_len = 4;
+  } else {
+    return;
+  }
+  const std::size_t actual_len = s.size() - (idx - 1);
+  if (actual_len < expected_len) {
+    s.erase(idx - 1);
+  }
+}
+
+std::string NormalizeRedisTypeFilter(std::string_view raw) {
+  std::string lowered = detail::RedisLowerAscii(detail::RedisTrimAscii(raw));
+  if (lowered == "all") {
+    lowered.clear();
+  }
+  return lowered;
+}
+
 } // namespace
 
 // ---- db++ Domain Adapters --------------------------------------------------
@@ -79,10 +119,10 @@ std::vector<ColumnMeta> RedisKeySchema() {
                  .nullable = false,
                  .primary_key = true,
                  .primary_key_order = 1},
+      ColumnMeta{.name = "value", .type = "TEXT", .nullable = true},
       ColumnMeta{.name = "type", .type = "TEXT", .nullable = false},
       ColumnMeta{.name = "ttl", .type = "INTEGER", .nullable = false},
       ColumnMeta{.name = "size", .type = "INTEGER", .nullable = false},
-      ColumnMeta{.name = "value", .type = "TEXT", .nullable = true},
   };
 }
 
@@ -167,7 +207,9 @@ AdbcObjectsResult LoadRedisObjectsBlocking(RedisClient& client) {
 RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& object,
                                           std::int64_t offset, std::int64_t limit,
                                           std::optional<huxerui::DataTableSort> sort,
-                                          std::string filter) {
+                                          std::string filter,
+                                          const std::atomic<bool>* cancel_flag,
+                                          std::string type_filter) {
   RedisPageResult result;
   result.columns = RedisKeySchema();
 
@@ -181,22 +223,46 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
     return result;
   }
 
+  const auto is_cancelled = [&]() -> bool {
+    return cancel_flag != nullptr && cancel_flag->load(std::memory_order_acquire);
+  };
+
   const std::string_view trimmed_filter = detail::RedisTrimAscii(filter);
   const std::string pattern = trimmed_filter.empty() ? "*" : std::string(trimmed_filter);
+  const std::string normalized_type = NormalizeRedisTypeFilter(type_filter);
 
   std::vector<std::string> keys;
   std::unordered_set<std::string> seen;
   std::string cursor = "0";
+  std::size_t scan_iterations = 0;
+  bool client_side_type_filter = false;
   for (;;) {
+    if (is_cancelled()) {
+      result.scan_cancelled = true;
+      result.error = Tr("Operation cancelled", "操作已取消");
+      return result;
+    }
+    std::vector<std::string> scan_cmd = {"SCAN", cursor, "MATCH", pattern, "COUNT", "500"};
+    if (!normalized_type.empty() && !client_side_type_filter) {
+      scan_cmd.emplace_back("TYPE");
+      scan_cmd.push_back(normalized_type);
+    }
     RedisValue scan_reply;
-    if (!client.Command({"SCAN", cursor, "MATCH", pattern, "COUNT", "500"}, scan_reply,
-                        result.error)) {
+    if (!client.Command(scan_cmd, scan_reply, result.error)) {
       return result;
     }
     if (scan_reply.IsError()) {
+      // Redis < 6.0 does not support SCAN ... TYPE; fall back to client-side TYPE pipeline.
+      if (!normalized_type.empty() && !client_side_type_filter && scan_iterations == 0 &&
+          detail::RedisLowerAscii(scan_reply.str).find("syntax") != std::string::npos) {
+        client_side_type_filter = true;
+        cursor = "0";
+        continue;
+      }
       result.error = scan_reply.str;
       return result;
     }
+    ++scan_iterations;
     if (scan_reply.kind != RedisValueKind::Array || scan_reply.elements.size() < 2) {
       result.error = Tr("Invalid SCAN response format", "SCAN 返回格式无效");
       return result;
@@ -204,13 +270,45 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
     cursor = scan_reply.elements[0].ToDisplayString();
     const RedisValue& batch = scan_reply.elements[1];
     if (batch.kind == RedisValueKind::Array) {
-      for (const RedisValue& item : batch.elements) {
-        std::string k = item.ToDisplayString();
-        if (seen.insert(k).second) {
-          keys.push_back(std::move(k));
-          if (keys.size() >= detail::kRedisMaxScanKeys) {
-            result.scan_capped = (cursor != "0");
-            break;
+      if (!client_side_type_filter) {
+        for (const RedisValue& item : batch.elements) {
+          std::string k = item.ToDisplayString();
+          if (seen.insert(k).second) {
+            keys.push_back(std::move(k));
+            if (keys.size() >= detail::kRedisMaxScanKeys) {
+              result.scan_capped = (cursor != "0");
+              break;
+            }
+          }
+        }
+      } else {
+        std::vector<std::string> candidates;
+        candidates.reserve(batch.elements.size());
+        for (const RedisValue& item : batch.elements) {
+          std::string k = item.ToDisplayString();
+          if (seen.insert(k).second) {
+            candidates.push_back(std::move(k));
+          }
+        }
+        if (!candidates.empty()) {
+          std::vector<std::vector<std::string>> type_cmds;
+          type_cmds.reserve(candidates.size());
+          for (const std::string& cand : candidates) {
+            type_cmds.push_back({"TYPE", cand});
+          }
+          std::vector<RedisValue> type_replies;
+          if (!client.Pipeline(type_cmds, type_replies, result.error)) {
+            return result;
+          }
+          for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (i < type_replies.size() &&
+                detail::RedisLowerAscii(type_replies[i].ToDisplayString()) == normalized_type) {
+              keys.push_back(std::move(candidates[i]));
+              if (keys.size() >= detail::kRedisMaxScanKeys) {
+                result.scan_capped = (cursor != "0");
+                break;
+              }
+            }
           }
         }
       }
@@ -218,6 +316,17 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
     if (cursor == "0" || keys.size() >= detail::kRedisMaxScanKeys) {
       break;
     }
+    if (scan_iterations >= detail::kRedisMaxScanIterations) {
+      result.scan_capped = true;
+      result.scan_iterations_capped = true;
+      break;
+    }
+  }
+
+  if (is_cancelled()) {
+    result.scan_cancelled = true;
+    result.error = Tr("Operation cancelled", "操作已取消");
+    return result;
   }
 
   result.total = static_cast<std::int64_t>(keys.size());
@@ -232,6 +341,7 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
       return true;
     }
 
+    // Pipeline 1: fetch type and TTL in O(1) per key.
     std::vector<std::vector<std::string>> meta_cmds;
     meta_cmds.reserve(page_keys.size() * 2);
     for (const std::string& k : page_keys) {
@@ -249,95 +359,180 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
       if (i * 2 < meta_replies.size()) {
         types[i] = detail::RedisLowerAscii(meta_replies[i * 2].ToDisplayString());
       }
+      if (!normalized_type.empty() && types[i] != normalized_type) {
+        types[i] = "none";
+      }
       if (i * 2 + 1 < meta_replies.size() &&
           meta_replies[i * 2 + 1].kind == RedisValueKind::Integer) {
         ttls[i] = meta_replies[i * 2 + 1].integer;
       }
     }
 
-    // Batch fetch size and value preview for each key according to its type.
+    // Pipeline 2: fetch O(1) size per key before deciding bounded preview commands.
+    std::vector<std::vector<std::string>> size_cmds;
+    std::vector<std::size_t> size_cmd_indices(page_keys.size(), static_cast<std::size_t>(-1));
+    size_cmds.reserve(page_keys.size());
+    for (std::size_t i = 0; i < page_keys.size(); ++i) {
+      const std::string& k = page_keys[i];
+      const std::string& t = types[i];
+      if (t == "string") {
+        size_cmd_indices[i] = size_cmds.size();
+        size_cmds.push_back({"STRLEN", k});
+      } else if (t == "hash") {
+        size_cmd_indices[i] = size_cmds.size();
+        size_cmds.push_back({"HLEN", k});
+      } else if (t == "list") {
+        size_cmd_indices[i] = size_cmds.size();
+        size_cmds.push_back({"LLEN", k});
+      } else if (t == "set") {
+        size_cmd_indices[i] = size_cmds.size();
+        size_cmds.push_back({"SCARD", k});
+      } else if (t == "zset") {
+        size_cmd_indices[i] = size_cmds.size();
+        size_cmds.push_back({"ZCARD", k});
+      } else if (t == "stream") {
+        size_cmd_indices[i] = size_cmds.size();
+        size_cmds.push_back({"XLEN", k});
+      }
+    }
+    std::vector<RedisValue> size_replies;
+    if (!size_cmds.empty() && !client.Pipeline(size_cmds, size_replies, err_out)) {
+      return false;
+    }
+
+    std::vector<std::int64_t> sizes(page_keys.size(), 0);
+    for (std::size_t i = 0; i < page_keys.size(); ++i) {
+      const std::size_t idx = size_cmd_indices[i];
+      if (idx < size_replies.size() && size_replies[idx].kind == RedisValueKind::Integer) {
+        sizes[i] = size_replies[idx].integer;
+      }
+    }
+
+    // Pipeline 3: fetch full value for small keys and safe bounded preview for large keys.
     struct FetchMapping {
       std::size_t key_idx = 0;
-      std::size_t size_cmd_idx = static_cast<std::size_t>(-1);
       std::size_t val_cmd_idx = static_cast<std::size_t>(-1);
+      bool truncated = false;
+      bool is_scan_reply = false;
+      std::size_t preview_cap = 0;
     };
-    std::vector<std::vector<std::string>> data_cmds;
+    std::vector<std::vector<std::string>> val_cmds;
     std::vector<FetchMapping> mappings;
     mappings.reserve(page_keys.size());
 
     for (std::size_t i = 0; i < page_keys.size(); ++i) {
       const std::string& k = page_keys[i];
       const std::string& t = types[i];
-      FetchMapping map{.key_idx = i};
+      if (t == "none") {
+        continue;
+      }
+      const std::int64_t sz = sizes[i];
+      const bool truncated = detail::IsRedisValuePreviewTruncated(t, sz);
+      FetchMapping map{.key_idx = i, .truncated = truncated};
       if (t == "string") {
-        map.size_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"STRLEN", k});
-        map.val_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"GET", k});
+        map.val_cmd_idx = val_cmds.size();
+        map.preview_cap = detail::kRedisMaxStringPreviewBytes;
+        if (truncated) {
+          val_cmds.push_back(
+              {"GETRANGE", k, "0", std::to_string(detail::kRedisMaxStringPreviewBytes - 1)});
+        } else {
+          val_cmds.push_back({"GET", k});
+        }
       } else if (t == "hash") {
-        map.size_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"HLEN", k});
-        map.val_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"HGETALL", k});
+        map.val_cmd_idx = val_cmds.size();
+        map.preview_cap = detail::kRedisMaxCollectionPreview;
+        if (truncated) {
+          map.is_scan_reply = true;
+          val_cmds.push_back(
+              {"HSCAN", k, "0", "COUNT", std::to_string(detail::kRedisMaxCollectionPreview)});
+        } else {
+          val_cmds.push_back({"HGETALL", k});
+        }
       } else if (t == "list") {
-        map.size_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"LLEN", k});
-        map.val_cmd_idx = data_cmds.size();
-        data_cmds.push_back(
+        map.val_cmd_idx = val_cmds.size();
+        map.preview_cap = detail::kRedisMaxListZsetPreview;
+        val_cmds.push_back(
             {"LRANGE", k, "0", std::to_string(detail::kRedisMaxListZsetPreview - 1)});
       } else if (t == "set") {
-        map.size_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"SCARD", k});
-        map.val_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"SMEMBERS", k});
+        map.val_cmd_idx = val_cmds.size();
+        map.preview_cap = detail::kRedisMaxCollectionPreview;
+        if (truncated) {
+          map.is_scan_reply = true;
+          val_cmds.push_back(
+              {"SSCAN", k, "0", "COUNT", std::to_string(detail::kRedisMaxCollectionPreview)});
+        } else {
+          val_cmds.push_back({"SMEMBERS", k});
+        }
       } else if (t == "zset") {
-        map.size_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"ZCARD", k});
-        map.val_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"ZRANGE", k, "0", std::to_string(detail::kRedisMaxListZsetPreview - 1),
-                             "WITHSCORES"});
+        map.val_cmd_idx = val_cmds.size();
+        map.preview_cap = detail::kRedisMaxListZsetPreview;
+        val_cmds.push_back({"ZRANGE", k, "0", std::to_string(detail::kRedisMaxListZsetPreview - 1),
+                            "WITHSCORES"});
       } else if (t == "stream") {
-        map.size_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"XLEN", k});
-        map.val_cmd_idx = data_cmds.size();
-        data_cmds.push_back({"XRANGE", k, "-", "+", "COUNT",
-                             std::to_string(detail::kRedisMaxStreamPreview)});
+        map.val_cmd_idx = val_cmds.size();
+        map.preview_cap = detail::kRedisMaxStreamPreview;
+        val_cmds.push_back(
+            {"XRANGE", k, "-", "+", "COUNT", std::to_string(detail::kRedisMaxStreamPreview)});
       }
       mappings.push_back(map);
     }
 
-    std::vector<RedisValue> data_replies;
-    if (!data_cmds.empty() && !client.Pipeline(data_cmds, data_replies, err_out)) {
+    std::vector<RedisValue> val_replies;
+    if (!val_cmds.empty() && !client.Pipeline(val_cmds, val_replies, err_out)) {
       return false;
     }
 
-    rows_out.reserve(page_keys.size());
+    rows_out.reserve(mappings.size());
     for (const FetchMapping& m : mappings) {
       const std::string& k = page_keys[m.key_idx];
       const std::string& t = types[m.key_idx];
-      if (t == "none") {
-        continue;
-      }
-      std::string size_str = "0";
-      if (m.size_cmd_idx < data_replies.size() &&
-          data_replies[m.size_cmd_idx].kind == RedisValueKind::Integer) {
-        size_str = std::to_string(data_replies[m.size_cmd_idx].integer);
-      }
+      const std::int64_t sz = sizes[m.key_idx];
+      const std::string size_str = std::to_string(sz);
 
       CellValue val_cell = NullCell();
-      if (m.val_cmd_idx < data_replies.size()) {
-        const RedisValue& vr = data_replies[m.val_cmd_idx];
+      if (m.val_cmd_idx < val_replies.size()) {
+        const RedisValue& vr = val_replies[m.val_cmd_idx];
         if (!vr.IsNull() && !vr.IsError()) {
+          const std::vector<RedisValue>* elems = &vr.elements;
+          std::vector<RedisValue> empty_elems;
+          if (m.is_scan_reply) {
+            if (vr.kind == RedisValueKind::Array && vr.elements.size() >= 2 &&
+                vr.elements[1].kind == RedisValueKind::Array) {
+              elems = &vr.elements[1].elements;
+            } else {
+              elems = &empty_elems;
+            }
+          }
+
           if (t == "string") {
-            val_cell = TextCell(vr.ToDisplayString());
-          } else if (t == "hash") {
-            val_cell = TextCell(detail::RedisFormatJsonHashPairs(vr.elements, detail::kRedisMaxCollectionPreview));
-          } else if (t == "list" || t == "set") {
-            val_cell = TextCell(detail::RedisFormatJsonArrayOfStrings(vr.elements, detail::kRedisMaxCollectionPreview));
-          } else if (t == "zset") {
-            val_cell = TextCell(detail::RedisFormatJsonZsetPairs(vr.elements, detail::kRedisMaxListZsetPreview));
-          } else if (t == "stream") {
-            val_cell = TextCell(detail::RedisFormatJsonStreamEntries(vr.elements));
+            std::string s = vr.ToDisplayString();
+            if (m.truncated) {
+              detail::RedisTrimIncompleteUtf8Tail(s);
+              s += TrFmt(" … [truncated: {0} / {1} bytes]",
+                         " … [已截断：仅预览 {0} / {1} 字节]",
+                         {std::to_string(s.size()), size_str});
+            }
+            val_cell = TextCell(std::move(s));
+          } else {
+            std::string formatted;
+            if (t == "hash") {
+              formatted =
+                  detail::RedisFormatJsonHashPairs(*elems, detail::kRedisMaxCollectionPreview);
+            } else if (t == "list" || t == "set") {
+              formatted =
+                  detail::RedisFormatJsonArrayOfStrings(*elems, detail::kRedisMaxCollectionPreview);
+            } else if (t == "zset") {
+              formatted =
+                  detail::RedisFormatJsonZsetPairs(*elems, detail::kRedisMaxListZsetPreview);
+            } else if (t == "stream") {
+              formatted = detail::RedisFormatJsonStreamEntries(*elems);
+            }
+            if (m.truncated) {
+              formatted += TrFmt(" … [truncated: previewing up to {0} / {1}]",
+                                 " … [已截断：仅预览前 {0} / 共 {1} 项]",
+                                 {std::to_string(m.preview_cap), size_str});
+            }
+            val_cell = TextCell(std::move(formatted));
           }
         }
       } else {
@@ -347,12 +542,12 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
       GridRow row;
       row.values = {
           TextCell(k),
+          std::move(val_cell),
           TextCell(t),
           TextCell(std::to_string(ttls[m.key_idx])),
           TextCell(size_str),
-          std::move(val_cell),
       };
-      row.key_values = {row.values[0]};
+      row.key_values = {row.values[detail::kRedisColKey]};
       rows_out.push_back(std::move(row));
     }
     return true;
@@ -375,7 +570,8 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
         break;
       }
     }
-    const bool numeric_col = (sort_col == 2 || sort_col == 3);
+    const bool numeric_col =
+        (sort_col == detail::kRedisColTtl || sort_col == detail::kRedisColSize);
     std::ranges::sort(all_rows, [&](const GridRow& a, const GridRow& b) {
       const CellValue& ca = a.values[sort_col];
       const CellValue& cb = b.values[sort_col];
@@ -421,7 +617,10 @@ RedisPageResult LoadRedisKeysPageBlocking(RedisClient& client, const DbObject& o
 TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
                                   const DbObject& object, std::int64_t page,
                                   std::int64_t page_size,
-                                  std::optional<huxerui::DataTableSort> sort, std::string filter) {
+                                  std::optional<huxerui::DataTableSort> sort, std::string filter,
+                                  const std::atomic<bool>* cancel_flag,
+                                  std::string type_filter) {
+  const std::string normalized_type = NormalizeRedisTypeFilter(type_filter);
   TableModel model;
   model.session_id = session_id;
   model.object = object.name;
@@ -434,6 +633,7 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
   model.page_size = std::max<std::int64_t>(1, page_size);
   model.sort = sort;
   model.filter = filter;
+  model.redis_type_filter = normalized_type;
 
   const auto started = std::chrono::steady_clock::now();
   const std::int64_t req_page = std::max<std::int64_t>(0, page);
@@ -441,8 +641,8 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
       (req_page > 0 && model.page_size > std::numeric_limits<std::int64_t>::max() / req_page)
           ? std::numeric_limits<std::int64_t>::max()
           : req_page * model.page_size;
-  RedisPageResult page_res =
-      LoadRedisKeysPageBlocking(client, object, req_offset, model.page_size, sort, filter);
+  RedisPageResult page_res = LoadRedisKeysPageBlocking(client, object, req_offset, model.page_size,
+                                                       sort, filter, cancel_flag, normalized_type);
   std::int64_t effective_offset = req_offset;
   if (!page_res.error.empty()) {
     model.error = page_res.error;
@@ -461,8 +661,8 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
             ? std::numeric_limits<std::int64_t>::max()
             : clamped_page * model.page_size;
     effective_offset = clamped_offset;
-    page_res =
-        LoadRedisKeysPageBlocking(client, object, clamped_offset, model.page_size, sort, filter);
+    page_res = LoadRedisKeysPageBlocking(client, object, clamped_offset, model.page_size, sort,
+                                         filter, cancel_flag, normalized_type);
     if (!page_res.error.empty()) {
       model.error = page_res.error;
       model.connection_lost = !client.IsConnected();
@@ -476,13 +676,18 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
              .count());
   model.executed_sql = "SCAN " + object.name +
                        (filter.empty() ? std::string{} : " MATCH " + filter) +
+                       (normalized_type.empty() ? std::string{} : " TYPE " + normalized_type) +
                        " LIMIT " + std::to_string(model.page_size) +
                        " OFFSET " + std::to_string(effective_offset);
   model.page = clamped_page;
   model.snapshot = std::make_shared<const GridSnapshot>(GridSnapshot{.rows = std::move(page_res.rows)});
   model.message = TrFmt("{0} keys · {1} pages", "{0} 个键 · 共 {1} 页",
                         {std::to_string(model.total), std::to_string(page_count)});
-  if (page_res.scan_capped) {
+  if (page_res.scan_iterations_capped) {
+    model.message += TrFmt(" (scan paused after {0} batches — narrow MATCH pattern)",
+                           "（已达 {0} 批扫描上限，请缩小 MATCH 过滤范围）",
+                           {std::to_string(detail::kRedisMaxScanIterations)});
+  } else if (page_res.scan_capped) {
     model.message += TrFmt(" (scan limit {0} keys)", "（最多扫描 {0} 键）",
                            {std::to_string(detail::kRedisMaxScanKeys)});
   }
@@ -490,6 +695,31 @@ TableModel LoadRedisTableBlocking(RedisClient& client, std::uint64_t session_id,
 }
 
 namespace detail {
+
+bool IsRedisValuePreviewTruncated(std::string_view type, std::int64_t size) noexcept {
+  if (size <= 0) {
+    return false;
+  }
+  if (type == "string") {
+    return size > static_cast<std::int64_t>(kRedisMaxStringPreviewBytes);
+  }
+  if (type == "hash" || type == "set") {
+    return size > static_cast<std::int64_t>(kRedisMaxCollectionPreview);
+  }
+  if (type == "list" || type == "zset") {
+    return size > static_cast<std::int64_t>(kRedisMaxListZsetPreview);
+  }
+  if (type == "stream") {
+    return size > static_cast<std::int64_t>(kRedisMaxStreamPreview);
+  }
+  return false;
+}
+
+void RedisTrimIncompleteUtf8Tail(std::string& s) { TrimIncompleteUtf8Tail(s); }
+
+std::string RedisNormalizeTypeFilter(std::string_view raw) {
+  return NormalizeRedisTypeFilter(raw);
+}
 
 CellValue RedisTextCell(std::string text) { return TextCell(std::move(text)); }
 CellValue RedisNullCell() { return NullCell(); }

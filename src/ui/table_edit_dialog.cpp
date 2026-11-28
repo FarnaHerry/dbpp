@@ -856,4 +856,87 @@ void HandleTableEditSubmitted(
   StageTableCellEdit(app, workspace, tab_id, edit);
 }
 
+[[huxerui::composable]] View TableSortButton(
+    const MenuHandle& menu, const ViewHandle& anchor, const LocalizedCatalog& loc,
+    const std::vector<ColumnMeta>& sort_cols, const std::optional<DataTableSort>& current_sort,
+    bool enabled, float height, std::function<void(std::optional<DataTableSort>)> on_select) {
+  const ThemeSpec& spec = UseTheme();
+  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const bool sort_active = current_sort.has_value();
+  const std::string sort_label =
+      sort_active ? UseString(current_sort->direction == DataTableSortDirection::Descending
+                                  ? app::strings::table_sort_active_desc
+                                  : app::strings::table_sort_active_asc,
+                              current_sort->column_id)
+                  : UseString(app::strings::table_sort);
+  const Color sort_fg = sort_active ? spec.colors.on_primary_container : spec.colors.on_surface;
+  const Color sort_bg = sort_active ? spec.colors.primary_container : spec.colors.surface;
+  const Color sort_border =
+      sort_active ? WithAlpha(spec.colors.primary, 0.45F) : semantic.border_subtle;
+  const Color sort_icon_color =
+      sort_active ? spec.colors.primary : spec.colors.on_surface_variant;
+
+  return Row{
+      TintedIcon(app::images::sort, sort_icon_color, 13.0F),
+      Text(sort_label)
+          .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium), sort_fg})
+          .LineLimit(1),
+      TintedIcon(app::images::chevron_down, sort_icon_color, 12.0F),
+  }
+      .With(Frame{.height = height, .min_height = height, .max_height = height},
+            Padding{EdgeInsets::Symmetric(8.0F, 0.0F)}, Spacing{5.0F},
+            CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
+            Background{VisualFill{sort_bg}}, Border{sort_border, 1.0F}, anchor,
+            Enabled{enabled})
+      .OnClick([menu, anchor, loc, on_select = std::move(on_select), sort_cols, current_sort] {
+        std::vector<MenuEntry> entries;
+        if (current_sort.has_value()) {
+          const bool is_desc = current_sort->direction == DataTableSortDirection::Descending;
+          entries.emplace_back(
+              MenuItem(loc.Get(is_desc ? app::strings::table_sort_toggle_asc
+                                       : app::strings::table_sort_toggle_desc),
+                       [on_select, col_id = current_sort->column_id, is_desc] {
+                         on_select(DataTableSort{
+                             .column_id = col_id,
+                             .direction = is_desc ? DataTableSortDirection::Ascending
+                                                  : DataTableSortDirection::Descending,
+                         });
+                       }));
+          entries.emplace_back(MenuItem(loc.Get(app::strings::table_sort_clear),
+                                        [on_select] { on_select(std::nullopt); }));
+          entries.emplace_back(MenuSection{});
+        }
+        for (const ColumnMeta& col : sort_cols) {
+          const bool active_col = current_sort.has_value() && current_sort->column_id == col.name;
+          const bool active_desc =
+              active_col && current_sort->direction == DataTableSortDirection::Descending;
+          std::string item_label = col.name;
+          if (active_col) {
+            item_label += active_desc ? " ↓" : " ↑";
+          }
+          entries.emplace_back(
+              MenuItem(std::move(item_label),
+                       [on_select, col_name = col.name, active_col, active_desc] {
+                         DataTableSortDirection next_dir =
+                             (active_col && !active_desc) ? DataTableSortDirection::Descending
+                                                          : DataTableSortDirection::Ascending;
+                         on_select(DataTableSort{.column_id = col_name, .direction = next_dir});
+                       })
+                  .Checked(active_col));
+        }
+        menu.Show(anchor, std::move(entries),
+                  MenuOptions{
+                      .placement = {.side = AnchorSide::Below,
+                                    .alignment = AnchorAlignment::Start},
+                      .gap = 4.0F,
+                      .viewport_margin = 8.0F,
+                      .offset = {},
+                      .width = std::nullopt,
+                      .dismiss_on_outside_press = true,
+                      .dismiss_on_cancel = true,
+                      .on_dismiss_request = {},
+                  });
+      });
+}
+
 } // namespace dbpp

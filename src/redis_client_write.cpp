@@ -346,10 +346,10 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     result.error = Tr("Incomplete row data", "行数据不完整");
     return result;
   }
-  const std::string& key = row.values[0].text;
-  const std::string type = detail::RedisLowerAscii(row.values[1].text);
+  const std::string& key = row.values[detail::kRedisColKey].text;
+  const std::string type = detail::RedisLowerAscii(row.values[detail::kRedisColType].text);
 
-  if (column_index == 0) {
+  if (column_index == detail::kRedisColKey) {
     if (text.empty()) {
       result.error = Tr("Key name cannot be empty", "键名不能为空");
       return result;
@@ -375,13 +375,13 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     return result;
   }
 
-  if (column_index == 1) {
+  if (column_index == detail::kRedisColType) {
     result.error = Tr("Changing key type in place is not supported; delete and re-add instead",
                       "不支持直接修改已有键的类型，请删除后新增");
     return result;
   }
 
-  if (column_index == 2) {
+  if (column_index == detail::kRedisColTtl) {
     const std::string_view trimmed = detail::RedisTrimAscii(text);
     if (trimmed.empty() || trimmed == "-1" || detail::RedisEqualsIgnoreCase(trimmed, "NULL")) {
       RedisValue reply;
@@ -415,12 +415,23 @@ AdbcQueryResult UpdateRedisCellBlocking(RedisClient& client, const TableModel& m
     return result;
   }
 
-  if (column_index == 3) {
+  if (column_index == detail::kRedisColSize) {
     result.error = Tr("size is a read-only computed column", "size 为只读统计列");
     return result;
   }
 
-  // column_index == 4: update value.
+  // column_index == kRedisColValue: update value.
+  if (const auto size_val = detail::RedisParseStrictInt64(row.values[detail::kRedisColSize].text);
+      size_val.has_value() && detail::IsRedisValuePreviewTruncated(type, *size_val)) {
+    result.error = TrFmt(
+        "Value for {0} ({1}, size {2}) is a truncated preview and cannot be overwritten "
+        "in-place; edit it in the Redis console instead",
+        "{0}（{1}，大小 {2}）的值为截断预览，禁止在表格中直接覆盖以免丢失数据；"
+        "请改用 Redis 命令台修改",
+        {key, type, row.values[detail::kRedisColSize].text});
+    return result;
+  }
+
   std::vector<std::string> write_args;
   if (!detail::RedisBuildWriteCommandArgs(type, text, write_args, result.error)) {
     return result;
@@ -500,7 +511,7 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
     };
     const std::string row_num = std::to_string(i + 1);
     const std::string prefix = TrFmt("Row {0}", "第 {0} 行", {row_num});
-    const std::string key(cell_at(0));
+    const std::string key(cell_at(detail::kRedisColKey));
     if (key.empty()) {
       return BatchInsertResult{.inserted = 0, .rolled_back = true,
                                .error = TrFmt("Row {0}: key name cannot be empty",
@@ -514,12 +525,12 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
 
     std::string norm_type;
     std::string err;
-    if (!ValidateWritableKeyType(cell_at(1), norm_type, err)) {
+    if (!ValidateWritableKeyType(cell_at(detail::kRedisColType), norm_type, err)) {
       return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = prefix + ": " + err};
     }
 
     std::optional<std::int64_t> ttl;
-    const std::string_view ttl_sv = detail::RedisTrimAscii(cell_at(2));
+    const std::string_view ttl_sv = detail::RedisTrimAscii(cell_at(detail::kRedisColTtl));
     if (!ttl_sv.empty() && ttl_sv != "-1" && !detail::RedisEqualsIgnoreCase(ttl_sv, "NULL")) {
       const auto parsed = detail::RedisParseStrictInt64(ttl_sv);
       if (!parsed.has_value() || *parsed <= 0) {
@@ -532,7 +543,8 @@ BatchInsertResult InsertRedisRowsBlocking(RedisClient& client, const TableModel&
     }
 
     std::vector<std::string> args;
-    if (!detail::RedisBuildWriteCommandArgs(norm_type, cell_at(4), args, err)) {
+    if (!detail::RedisBuildWriteCommandArgs(norm_type, cell_at(detail::kRedisColValue), args,
+                                            err)) {
       return BatchInsertResult{.inserted = 0, .rolled_back = true, .error = prefix + ": " + err};
     }
 

@@ -114,7 +114,8 @@ Task<AdbcQueryResult> ExecutePreparedQueryAsync(std::shared_ptr<AdbcSession> ses
 void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& workspace,
                       const TaskScope& tasks, std::uint64_t tab_id, std::int64_t page,
                       std::optional<DataTableSort> sort, std::string filter,
-                      bool keep_selection, NotifyFn notify, std::int64_t page_size) {
+                      bool keep_selection, NotifyFn notify, std::int64_t page_size,
+                      std::optional<std::string> type_filter) {
   const WorkspaceModel& ws_snapshot = workspace.Get();
   const WorkspaceTab* tab = ws_snapshot.FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table) {
@@ -127,6 +128,8 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
   const std::int64_t effective_page_size =
       page_size > 0 ? page_size
                     : (tab->table.page_size > 0 ? tab->table.page_size : kPageSize);
+  const std::string effective_type_filter =
+      type_filter.has_value() ? *type_filter : tab->table.redis_type_filter;
 
   const AppModel& model = app.Get();
   const DbSession* session = detail::DbFindSession(model, session_id);
@@ -164,6 +167,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
     target->table.loading = true;
     target->table.error.clear();
     target->table.page_size = effective_page_size;
+    target->table.redis_type_filter = effective_type_filter;
     if (!keep_selection) {
       target->selected_cell = std::nullopt;
     }
@@ -174,12 +178,13 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
 
   tasks.Launch([app, workspace, tasks, notify = std::move(notify), adbc_session, tab_id, session_id,
                 object_copy = std::move(object_copy), object_name, object_schema, page,
-                effective_page_size, sort, filter, keep_selection]() mutable -> Task<void> {
+                effective_page_size, sort, filter, effective_type_filter,
+                keep_selection]() mutable -> Task<void> {
     TableModel result = co_await adbc_session->sequence.Run(
         [adbc_session, session_id, object_copy = std::move(object_copy), page,
-         effective_page_size, sort, filter](std::stop_token) mutable {
+         effective_page_size, sort, filter, effective_type_filter](std::stop_token) mutable {
           return LoadTableBlocking(*adbc_session, session_id, std::move(object_copy), page,
-                                   effective_page_size, sort, filter);
+                                   effective_page_size, sort, filter, effective_type_filter);
         });
 
     const bool load_lost = result.connection_lost;
@@ -244,7 +249,7 @@ void RequestLoadTable(const State<AppModel>& app, const State<WorkspaceModel>& w
       co_return;
     }
     if (!load_error.empty() && !has_snapshot) {
-      if (IsSchemaStaleError(load_error) || filter.empty()) {
+      if (IsSchemaStaleError(load_error) || (filter.empty() && effective_type_filter.empty())) {
         ScheduleMaintenanceRefresh(app, workspace, tasks, session_id, notify);
       }
       if (notify) {
@@ -507,7 +512,7 @@ void RequestCommitTableChanges(const State<AppModel>& app,
       reload_sort = target->table.sort;
       reload_filter = target->table.filter;
       if (res.inserted_rows > 0 && !target->table.sort.has_value() &&
-          target->table.filter.empty()) {
+          target->table.filter.empty() && target->table.redis_type_filter.empty()) {
         const std::int64_t next_total =
             std::max<std::int64_t>(0, target->table.total +
                                           static_cast<std::int64_t>(res.inserted_rows) -

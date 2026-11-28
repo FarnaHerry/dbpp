@@ -3,7 +3,7 @@ module;
 #include <huxerui/datatable.h>
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.5"
+#define DBPP_VERSION "0.4.6"
 #endif
 
 module dbpp.cli;
@@ -122,7 +122,8 @@ bool CliPrintCommandHelp(std::string_view cmd, std::ostream& out) {
   }
   if (cmd == "rows") {
     out << "Usage: dbpp rows <conn> <table> [--schema <name>] [--limit N] [--offset N]\n"
-        << "                 [--where <expr>] [--order <col[:asc|desc]>] [--format ...] [--json]\n"
+        << "                 [--where <expr>] [--type <redis-type>] [--order <col[:asc|desc]>]\n"
+        << "                 [--format ...] [--json]\n"
         << "Defaults: --limit 50, --offset 0.\n";
     return true;
   }

@@ -95,6 +95,17 @@ struct MockRedisServer::Impl {
   void SetLegacyAuthOnly(bool value) { legacy_auth_only_.store(value); }
   void SetDisableInfo(bool value) { disable_info_.store(value); }
   void SetDropOnConfig(bool value) { drop_on_config_.store(value); }
+  void SetScanStepSize(std::size_t step) { scan_step_size_.store(step); }
+  void SetDisableScanType(bool value) { disable_scan_type_.store(value); }
+  [[nodiscard]] std::size_t CommandCount(std::string_view cmd) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = cmd_counts_.find(UpperAscii(cmd));
+    return it == cmd_counts_.end() ? 0 : it->second;
+  }
+  void ResetCommandCounts() {
+    std::lock_guard<std::mutex> lock(mu_);
+    cmd_counts_.clear();
+  }
 
   static void CloseSock(Sock s) {
     if (s != kBadSock) {
@@ -352,7 +363,48 @@ struct MockRedisServer::Impl {
     }
 
     std::lock_guard<std::mutex> lock(mu_);
+    ++cmd_counts_[cmd];
     auto& store = dbs_[cur_db];
+
+    const auto parse_slice_bounds = [](std::int64_t len, const std::string& s_arg,
+                                       const std::string& e_arg, std::size_t& out_begin,
+                                       std::size_t& out_end_exclusive) -> bool {
+      if (len <= 0) {
+        return false;
+      }
+      std::int64_t s = 0;
+      std::int64_t e = len - 1;
+      (void)std::from_chars(s_arg.data(), s_arg.data() + s_arg.size(), s);
+      (void)std::from_chars(e_arg.data(), e_arg.data() + e_arg.size(), e);
+      if (s < 0) s += len;
+      if (e < 0) e += len;
+      s = std::max<std::int64_t>(0, s);
+      e = std::min<std::int64_t>(len - 1, e);
+      if (s > e || s >= len) {
+        return false;
+      }
+      out_begin = static_cast<std::size_t>(s);
+      out_end_exclusive = static_cast<std::size_t>(e + 1);
+      return true;
+    };
+
+    const auto parse_scan_opts = [](const std::vector<std::string>& cmd_args, std::size_t opt_idx,
+                                    std::string& pattern, std::size_t& count) {
+      for (std::size_t i = opt_idx; i + 1 < cmd_args.size(); i += 2) {
+        const std::string key = UpperAscii(cmd_args[i]);
+        if (key == "MATCH") {
+          pattern = cmd_args[i + 1];
+        } else if (key == "COUNT") {
+          std::size_t parsed = 0;
+          const auto [ptr, ec] = std::from_chars(
+              cmd_args[i + 1].data(), cmd_args[i + 1].data() + cmd_args[i + 1].size(), parsed);
+          if (ec == std::errc{} && ptr == cmd_args[i + 1].data() + cmd_args[i + 1].size() &&
+              parsed > 0) {
+            count = parsed;
+          }
+        }
+      }
+    };
 
     if (cmd == "CONFIG" && args.size() == 3 && UpperAscii(args[1]) == "GET" &&
         args[2] == "databases") {
@@ -382,23 +434,71 @@ struct MockRedisServer::Impl {
     }
     if (cmd == "SCAN" && args.size() >= 2) {
       std::string pattern = "*";
+      std::size_t count = 500;
+      std::string type_filter;
       for (std::size_t i = 2; i + 1 < args.size(); i += 2) {
-        if (UpperAscii(args[i]) == "MATCH") {
+        const std::string opt = UpperAscii(args[i]);
+        if (opt == "MATCH") {
           pattern = args[i + 1];
+        } else if (opt == "TYPE") {
+          type_filter = UpperAscii(args[i + 1]);
+        } else if (opt == "COUNT") {
+          std::size_t parsed = 0;
+          const auto [ptr, ec] = std::from_chars(
+              args[i + 1].data(), args[i + 1].data() + args[i + 1].size(), parsed);
+          if (ec == std::errc{} && ptr == args[i + 1].data() + args[i + 1].size() &&
+              parsed > 0) {
+            count = parsed;
+          }
         }
       }
-      std::vector<std::string> matched;
+      if (!type_filter.empty() && disable_scan_type_.load()) {
+        return Error("ERR syntax error");
+      }
+      const auto matches_entry = [&](const std::string& k, const Entry& e) {
+        if (!GlobMatch(pattern, k)) {
+          return false;
+        }
+        return type_filter.empty() || UpperAscii(e.type) == type_filter;
+      };
+      const std::size_t step = scan_step_size_.load();
+      if (step == 0) {
+        std::vector<std::string> matched;
+        for (const auto& [k, e] : store) {
+          if (matches_entry(k, e)) {
+            matched.push_back(k);
+          }
+        }
+        std::string arr = "*" + std::to_string(matched.size()) + "\r\n";
+        for (const std::string& k : matched) {
+          arr += Bulk(k);
+        }
+        return "*2\r\n" + Bulk("0") + arr;
+      }
+
+      std::size_t cursor_idx = 0;
+      (void)std::from_chars(args[1].data(), args[1].data() + args[1].size(), cursor_idx);
+      std::vector<std::string> all_keys;
+      all_keys.reserve(store.size());
       for (const auto& [k, e] : store) {
         (void)e;
-        if (GlobMatch(pattern, k)) {
-          matched.push_back(k);
+        all_keys.push_back(k);
+      }
+      const std::size_t start = std::min(cursor_idx, all_keys.size());
+      const std::size_t end = std::min(start + step, all_keys.size());
+      std::vector<std::string> matched;
+      for (std::size_t i = start; i < end; ++i) {
+        const auto it = store.find(all_keys[i]);
+        if (it != store.end() && matches_entry(all_keys[i], it->second)) {
+          matched.push_back(all_keys[i]);
         }
       }
+      const std::string next_cursor = end < all_keys.size() ? std::to_string(end) : std::string("0");
       std::string arr = "*" + std::to_string(matched.size()) + "\r\n";
       for (const std::string& k : matched) {
         arr += Bulk(k);
       }
-      return "*2\r\n" + Bulk("0") + arr;
+      return "*2\r\n" + Bulk(next_cursor) + arr;
     }
     if (cmd == "TYPE" && args.size() == 2) {
       const auto it = store.find(args[1]);
@@ -455,6 +555,19 @@ struct MockRedisServer::Impl {
       const auto it = store.find(args[1]);
       return it == store.end() ? NullBulk() : Bulk(it->second.str_val);
     }
+    if (cmd == "GETRANGE" && args.size() == 4) {
+      const auto it = store.find(args[1]);
+      if (it == store.end() || it->second.str_val.empty()) {
+        return Bulk("");
+      }
+      std::size_t begin = 0;
+      std::size_t end_excl = 0;
+      if (!parse_slice_bounds(static_cast<std::int64_t>(it->second.str_val.size()), args[2],
+                              args[3], begin, end_excl)) {
+        return Bulk("");
+      }
+      return Bulk(std::string_view(it->second.str_val).substr(begin, end_excl - begin));
+    }
     if (cmd == "SET" && args.size() >= 3) {
       bool keepttl = false;
       for (std::size_t i = 3; i < args.size(); ++i) {
@@ -484,6 +597,31 @@ struct MockRedisServer::Impl {
       }
       return out;
     }
+    if (cmd == "HSCAN" && args.size() >= 3) {
+      const auto it = store.find(args[1]);
+      if (it == store.end()) return "*2\r\n" + Bulk("0") + "*0\r\n";
+      std::size_t cursor_idx = 0;
+      (void)std::from_chars(args[2].data(), args[2].data() + args[2].size(), cursor_idx);
+      std::string pattern = "*";
+      std::size_t count = 10;
+      parse_scan_opts(args, 3, pattern, count);
+      const auto& h = it->second.hash_val;
+      const std::size_t start = std::min(cursor_idx, h.size());
+      const std::size_t end = std::min(start + count, h.size());
+      std::vector<std::pair<std::string, std::string>> pairs;
+      auto hit = std::next(h.begin(), static_cast<std::ptrdiff_t>(start));
+      for (std::size_t i = start; i < end && hit != h.end(); ++i, ++hit) {
+        if (GlobMatch(pattern, hit->first)) {
+          pairs.emplace_back(hit->first, hit->second);
+        }
+      }
+      const std::string next_cursor = end < h.size() ? std::to_string(end) : std::string("0");
+      std::string arr = "*" + std::to_string(pairs.size() * 2) + "\r\n";
+      for (const auto& [f, v] : pairs) {
+        arr += Bulk(f) + Bulk(v);
+      }
+      return "*2\r\n" + Bulk(next_cursor) + arr;
+    }
     if (cmd == "HSET" && args.size() >= 4 && (args.size() % 2) == 0) {
       Entry& e = store[args[1]];
       e.type = "hash";
@@ -502,8 +640,14 @@ struct MockRedisServer::Impl {
       const auto it = store.find(args[1]);
       if (it == store.end()) return "*0\r\n";
       const auto& v = it->second.list_val;
-      std::string out = "*" + std::to_string(v.size()) + "\r\n";
-      for (const auto& item : v) out += Bulk(item);
+      std::size_t begin = 0;
+      std::size_t end_excl = 0;
+      if (!parse_slice_bounds(static_cast<std::int64_t>(v.size()), args[2], args[3], begin,
+                              end_excl)) {
+        return "*0\r\n";
+      }
+      std::string out = "*" + std::to_string(end_excl - begin) + "\r\n";
+      for (std::size_t i = begin; i < end_excl; ++i) out += Bulk(v[i]);
       return out;
     }
     if (cmd == "RPUSH" && args.size() >= 3) {
@@ -524,6 +668,31 @@ struct MockRedisServer::Impl {
       for (const auto& item : s) out += Bulk(item);
       return out;
     }
+    if (cmd == "SSCAN" && args.size() >= 3) {
+      const auto it = store.find(args[1]);
+      if (it == store.end()) return "*2\r\n" + Bulk("0") + "*0\r\n";
+      std::size_t cursor_idx = 0;
+      (void)std::from_chars(args[2].data(), args[2].data() + args[2].size(), cursor_idx);
+      std::string pattern = "*";
+      std::size_t count = 10;
+      parse_scan_opts(args, 3, pattern, count);
+      const auto& s = it->second.set_val;
+      const std::size_t start = std::min(cursor_idx, s.size());
+      const std::size_t end = std::min(start + count, s.size());
+      std::vector<std::string> items;
+      auto sit = std::next(s.begin(), static_cast<std::ptrdiff_t>(start));
+      for (std::size_t i = start; i < end && sit != s.end(); ++i, ++sit) {
+        if (GlobMatch(pattern, *sit)) {
+          items.push_back(*sit);
+        }
+      }
+      const std::string next_cursor = end < s.size() ? std::to_string(end) : std::string("0");
+      std::string arr = "*" + std::to_string(items.size()) + "\r\n";
+      for (const std::string& item : items) {
+        arr += Bulk(item);
+      }
+      return "*2\r\n" + Bulk(next_cursor) + arr;
+    }
     if (cmd == "SADD" && args.size() >= 3) {
       Entry& e = store[args[1]];
       e.type = "set";
@@ -542,12 +711,19 @@ struct MockRedisServer::Impl {
       if (it == store.end()) return "*0\r\n";
       const bool withscores = args.size() >= 5 && UpperAscii(args[4]) == "WITHSCORES";
       const auto& z = it->second.zset_val;
-      std::string out = "*" + std::to_string(withscores ? z.size() * 2 : z.size()) + "\r\n";
-      for (const auto& [m, score] : z) {
-        out += Bulk(m);
+      std::size_t begin = 0;
+      std::size_t end_excl = 0;
+      if (!parse_slice_bounds(static_cast<std::int64_t>(z.size()), args[2], args[3], begin,
+                              end_excl)) {
+        return "*0\r\n";
+      }
+      const std::size_t count = end_excl - begin;
+      std::string out = "*" + std::to_string(withscores ? count * 2 : count) + "\r\n";
+      for (std::size_t i = begin; i < end_excl; ++i) {
+        out += Bulk(z[i].first);
         if (withscores) {
           std::ostringstream oss;
-          oss << score;
+          oss << z[i].second;
           out += Bulk(oss.str());
         }
       }
@@ -575,11 +751,14 @@ struct MockRedisServer::Impl {
   std::atomic<bool> legacy_auth_only_{false};
   std::atomic<bool> disable_info_{false};
   std::atomic<bool> drop_on_config_{false};
+  std::atomic<std::size_t> scan_step_size_{0};
+  std::atomic<bool> disable_scan_type_{false};
   Sock listen_sock_ = kBadSock;
   std::uint16_t port_ = 0;
   std::atomic<bool> stop_{false};
   std::thread worker_;
-  std::mutex mu_;
+  mutable std::mutex mu_;
+  std::map<std::string, std::size_t> cmd_counts_;
   std::map<int, std::map<std::string, Entry>> dbs_;
 };
 
@@ -590,5 +769,11 @@ std::uint16_t MockRedisServer::Port() const { return impl_->Port(); }
 void MockRedisServer::SetLegacyAuthOnly(bool value) { impl_->SetLegacyAuthOnly(value); }
 void MockRedisServer::SetDisableInfo(bool value) { impl_->SetDisableInfo(value); }
 void MockRedisServer::SetDropOnConfig(bool value) { impl_->SetDropOnConfig(value); }
+void MockRedisServer::SetScanStepSize(std::size_t step) { impl_->SetScanStepSize(step); }
+void MockRedisServer::SetDisableScanType(bool value) { impl_->SetDisableScanType(value); }
+std::size_t MockRedisServer::CommandCount(std::string_view cmd) const {
+  return impl_->CommandCount(cmd);
+}
+void MockRedisServer::ResetCommandCounts() { impl_->ResetCommandCounts(); }
 
 } // namespace dbpp_test

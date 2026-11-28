@@ -16,7 +16,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.5"
+#define DBPP_VERSION "0.4.6"
 #endif
 
 #include "ui/theme_palette.h"
@@ -300,6 +300,28 @@ huxerui::View EditCellDialog(huxerui::DialogContext dialog, huxerui::State<AppMo
                              huxerui::TaskScope tasks, NotifyFn notify);
 huxerui::View NullValueBadge(huxerui::Color null_color, bool strikethrough = false);
 huxerui::View CompactTableCellEditor(huxerui::View field);
+huxerui::View RedisTypeFilterButton(
+    const huxerui::MenuHandle& menu, const huxerui::ViewHandle& anchor,
+    const LocalizedCatalog& loc, const std::string& current_type, bool enabled,
+    float height, std::function<void(std::string)> on_select);
+huxerui::View TableSortButton(
+    const huxerui::MenuHandle& menu, const huxerui::ViewHandle& anchor,
+    const LocalizedCatalog& loc, const std::vector<ColumnMeta>& sort_cols,
+    const std::optional<huxerui::DataTableSort>& current_sort, bool enabled, float height,
+    std::function<void(std::optional<huxerui::DataTableSort>)> on_select);
+huxerui::View RedisViewModeSwitch(
+    RedisBrowserViewMode mode, bool enabled, float height,
+    std::function<void(RedisBrowserViewMode)> on_change);
+huxerui::View RedisDelimiterFilterButton(
+    const huxerui::MenuHandle& menu, const huxerui::ViewHandle& anchor,
+    const huxerui::DialogHandle& dialogs, const LocalizedCatalog& loc,
+    const std::string& current_delim, bool enabled, float height,
+    AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark,
+    std::function<void(std::string)> on_select);
+huxerui::View RedisTreeWorkspace(
+    huxerui::State<AppModel> app, huxerui::State<WorkspaceModel> workspace, std::uint64_t tab_id,
+    std::uint64_t reload_token, huxerui::TaskScope tasks, NotifyFn notify,
+    AppThemeConfig theme_config, LanguageMode language_mode, bool system_dark);
 void ShowReadOnlyCellContextMenu(
     huxerui::Point position, const huxerui::MenuHandle& menu,
     const std::shared_ptr<huxerui::Clipboard>& clipboard, const std::string& cell_display,

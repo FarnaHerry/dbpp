@@ -287,7 +287,8 @@ void CloseSessionAsync(std::shared_ptr<AdbcSession> adbc, const TaskScope& tasks
 
 TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
                              DbObject object, std::int64_t page, std::int64_t page_size,
-                             std::optional<DataTableSort> sort, std::string filter) {
+                             std::optional<DataTableSort> sort, std::string filter,
+                             std::string type_filter) {
   if (session.IsClosed()) {
     TableModel model;
     model.session_id = session_id;
@@ -297,9 +298,10 @@ TableModel LoadTableBlocking(AdbcSession& session, std::uint64_t session_id,
     return model;
   }
   if (session.dialect == Dialect::Redis && session.redis) {
-    TableModel redis_model = LoadRedisTableBlocking(*session.redis, session_id, object, page,
-                                                    page_size, std::move(sort),
-                                                    TrimAsciiCopy(filter));
+    session.cancel_requested.store(false, std::memory_order_release);
+    TableModel redis_model = LoadRedisTableBlocking(
+        *session.redis, session_id, object, page, page_size, std::move(sort),
+        TrimAsciiCopy(filter), &session.cancel_requested, TrimAsciiCopy(type_filter));
     redis_model.read_only = session.read_only;
     return redis_model;
   }

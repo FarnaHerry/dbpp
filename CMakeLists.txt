@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.4.5 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.4.6 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -138,6 +138,7 @@ set(DBPP_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_browser_page.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_design_page.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_edit_dialog.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/redis_tree_view.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/theme.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/tray.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/ui_common.cpp"
@@ -207,6 +208,7 @@ add_library(dbpp_core STATIC
         src/redis_client_wire.cpp
         src/redis_client_json.cpp
         src/redis_client_domain.cpp
+        src/redis_client_tree.cpp
         src/redis_client_write.cpp
         src/adbc_session.cpp
         src/adbc_session_exec.cpp
