@@ -176,12 +176,12 @@ if [[ "${#deb_inputs[@]}" -gt 0 ]]; then
     ARCH_LIST=""
     for deb_arch in $(printf '%s\n' "${!deb_arches[@]}" | sort); do
       ARCH_LIST="${ARCH_LIST:+${ARCH_LIST} }${deb_arch}"
-      BIN_DIR="${APT_ROOT}/dists/stable/main/binary-${deb_arch}"
-      mkdir -p "$BIN_DIR"
+      rel_bin_dir="dists/stable/main/binary-${deb_arch}"
+      mkdir -p "${APT_ROOT}/${rel_bin_dir}"
       (
         cd "$APT_ROOT"
-        dpkg-scanpackages --multiversion --arch "$deb_arch" pool/main > "${BIN_DIR}/Packages"
-        gzip -9nc "${BIN_DIR}/Packages" > "${BIN_DIR}/Packages.gz"
+        dpkg-scanpackages --multiversion --arch "$deb_arch" pool/main > "${rel_bin_dir}/Packages"
+        gzip -9nc "${rel_bin_dir}/Packages" > "${rel_bin_dir}/Packages.gz"
       )
     done
 
