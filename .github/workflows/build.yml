@@ -200,7 +200,7 @@ jobs:
           grep -Eq '^-rwx[^ ]* .* dbpp/dbpp$' <<<"$tar_list"
           for soname in libc++.so.1 libc++abi.so.1 libadbc_driver_manager.so.113; do
             if [ -L "dist-src/lib/$soname" ]; then
-              grep -Eq "^l.* dbpp/lib/${soname//./\\.} -> " <<<"$tar_list"
+              awk -v target="dbpp/lib/${soname}" '$1 ~ /^l/ && $(NF-2) == target && $(NF-1) == "->" { found=1 } END { exit !found }' <<<"$tar_list"
             fi
           done
 
