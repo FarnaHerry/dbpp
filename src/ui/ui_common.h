@@ -6,6 +6,7 @@
 
 import dbpp.settings;
 import dbpp.i18n;
+import dbpp.decoder;
 import dbpp.types;
 import dbpp.adbc;
 import dbpp.redis;
@@ -16,7 +17,7 @@ import dbpp.config_db;
 import dbpp.instance;
 
 #ifndef DBPP_VERSION
-#define DBPP_VERSION "0.4.6"
+#define DBPP_VERSION "0.4.7"
 #endif
 
 #include "ui/theme_palette.h"
@@ -325,7 +326,17 @@ huxerui::View RedisTreeWorkspace(
 void ShowReadOnlyCellContextMenu(
     huxerui::Point position, const huxerui::MenuHandle& menu,
     const std::shared_ptr<huxerui::Clipboard>& clipboard, const std::string& cell_display,
-    const std::string& row_tsv, const NotifyFn& notify, const LocalizedCatalog& loc);
+    const std::string& row_tsv, const NotifyFn& notify, const LocalizedCatalog& loc,
+    std::function<void()> on_inspect_value = {});
+huxerui::View DecoderSelectorButton(
+    const huxerui::MenuHandle& menu, const huxerui::ViewHandle& anchor,
+    const LocalizedCatalog& loc, ValueDecoderKind current, ValueDecoderKind suggested,
+    bool enabled, float height, std::function<void(ValueDecoderKind)> on_select);
+huxerui::View DecodedValuePreviewBox(const DecodedValueResult& decoded, int min_lines,
+                                     int max_lines);
+huxerui::View ValueDecodeDialog(huxerui::DialogContext dialog, std::string title,
+                                std::string raw_value,
+                                std::shared_ptr<huxerui::Clipboard> clipboard, NotifyFn notify);
 void ShowTableCellContextMenu(
     huxerui::Point position, const huxerui::MenuHandle& menu,
     const huxerui::DialogHandle& dialogs,

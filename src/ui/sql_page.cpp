@@ -182,8 +182,9 @@ using namespace dbpp::ui;
                                                                      : kDefaultPageSize))
                                     : 0,
                 spec.colors.on_surface_variant,
-                [snapshot, menu, clipboard, notify, loc](Point pos, std::size_t row_idx,
-                                                         std::size_t col_idx) {
+                [snapshot, menu, dialogs, clipboard, notify, loc, theme_config, language_mode,
+                 system_dark, cols = sql_model.result->columns](Point pos, std::size_t row_idx,
+                                                               std::size_t col_idx) {
                   const GridRow* gr = RowAt(snapshot, row_idx);
                   if (gr == nullptr || col_idx >= gr->values.size()) {
                     return;
@@ -197,8 +198,22 @@ using namespace dbpp::ui;
                     row_tsv +=
                         gr->values[ci].is_null ? std::string{"NULL"} : gr->values[ci].DisplayText();
                   }
+                  const std::string col_name =
+                      col_idx < cols.size() ? cols[col_idx] : std::string("value");
+                  std::function<void()> inspect_cb;
+                  if (!cv.is_null) {
+                    inspect_cb = [dialogs, col_name, raw = cv.text, clipboard, notify, theme_config,
+                                  language_mode, system_dark] {
+                      dialogs.Show([col_name, raw, clipboard, notify, theme_config, language_mode,
+                                    system_dark](DialogContext dialog) {
+                        return WithDialogTheme(
+                            theme_config, language_mode, system_dark,
+                            ValueDecodeDialog(dialog, col_name, raw, clipboard, notify));
+                      });
+                    };
+                  }
                   ShowReadOnlyCellContextMenu(pos, menu, clipboard, cell_display, row_tsv, notify,
-                                              loc);
+                                              loc, std::move(inspect_cb));
                 }),
             .row_height = 26.0F,
             .header_height = 28.0F,

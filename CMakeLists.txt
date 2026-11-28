@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.4)
 
-project(dbpp VERSION 0.4.6 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
+project(dbpp VERSION 0.4.7 DESCRIPTION "ADBC data manager built with HuxerUI" LANGUAGES NONE)
 
 # `import std` 的 experimental 门控与工具链语言必须在任何子项目前初始化。
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -139,6 +139,7 @@ set(DBPP_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_design_page.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/table_edit_dialog.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/redis_tree_view.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/value_decoder_view.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/theme.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/tray.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/ui/ui_common.cpp"
@@ -204,6 +205,9 @@ huxerui_use_library(dbpp
 add_library(dbpp_core STATIC
         src/settings.cpp
         src/i18n.cpp
+        src/value_decoder.cpp
+        src/value_decoder_json.cpp
+        src/value_decoder_inflate.cpp
         src/redis_client.cpp
         src/redis_client_wire.cpp
         src/redis_client_json.cpp
@@ -248,6 +252,7 @@ target_sources(dbpp_core PUBLIC
         FILES
             src/settings.cppm
             src/i18n.cppm
+            src/value_decoder.cppm
             src/types.cppm
             src/redis_client.cppm
             src/adbc_session.cppm
@@ -473,6 +478,7 @@ if (DBPP_BUILD_TESTS)
     dbpp_add_module_test(test_instance instance tests/test_instance.cpp)
     dbpp_add_module_test(test_redis redis tests/test_redis.cpp tests/test_redis_mock.cpp)
     dbpp_add_module_test(test_mcp mcp tests/test_mcp.cpp)
+    dbpp_add_module_test(test_decoder decoder tests/test_decoder.cpp)
 endif ()
 
 add_custom_target(dbpp-run

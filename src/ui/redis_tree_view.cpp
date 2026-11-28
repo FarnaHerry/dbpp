@@ -277,6 +277,8 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const auto dialogs = UseDialog();
+  const auto menu = UseMenu();
+  const auto decoder_anchor = UseViewHandle();
   const auto clipboard = UseApplication().Clipboard();
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
@@ -303,6 +305,7 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
   const auto detail_loading = UseState(false);
   const auto string_editor = UseState(TextEditingValue{});
   const auto ttl_editor = UseState(TextEditingValue{});
+  const auto active_decoder = UseState(ValueDecoderKind::Raw);
   const auto busy_write = UseState(false);
   const auto split_frames = UseState(std::array<Frame, 2>{
       Frame{.width = 280.0F, .min_width = 180.0F, .max_width = 520.0F},
@@ -322,7 +325,10 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
 
   const auto fetch_detail = [app, workspace, tasks, notify, adbc, session_id, redis_db_obj,
                              selected_key, detail_state, detail_loading, string_editor,
-                             ttl_editor](std::string key, bool full_string) {
+                             ttl_editor, active_decoder](std::string key, bool full_string) {
+    if (selected_key.Get() != key) {
+      active_decoder = ValueDecoderKind::Raw;
+    }
     selected_key = key;
     detail_loading = true;
     tasks.Launch([app, workspace, tasks, notify, adbc, session_id, redis_db_obj, key, full_string,
@@ -706,14 +712,68 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
             }.With(Padding{EdgeInsets::Symmetric(10.0F, 4.0F)}, Spacing{8.0F},
                    CrossAlign{CrossAxisAlignment::Center}));
       }
-      str_views.Add(
-          MonospaceField(
-              TextField(string_editor)
-                  .Variant(TextFieldVariant::Outlined)
-                  .LineLimits(TextFieldLineLimits::MultiLine(8, 28))
-                  .OnChanged([string_editor](const TextEditingValue& v) { string_editor = v; }))
-              .With(Grow(1.0F), Padding{EdgeInsets::Symmetric(10.0F, 4.0F)},
-                    Enabled{write_enabled && !detail.truncated}));
+      const ValueDecoderKind cur_dec = active_decoder.Get();
+      const std::string cur_raw_str = string_editor.Get().text;
+      const ValueDecoderKind suggested_dec = DetectSuggestedDecoder(cur_raw_str);
+      Views dec_bar;
+      dec_bar.Add(DecoderSelectorButton(
+          menu, decoder_anchor, loc, cur_dec, suggested_dec, true, 26.0F,
+          [active_decoder](ValueDecoderKind next) { active_decoder = next; }));
+      if (cur_dec == ValueDecoderKind::Raw) {
+        if (suggested_dec == ValueDecoderKind::Json) {
+          dec_bar.Add(
+              CompactActionButton(
+                  Button(app::strings::decoder_apply_json)
+                      .OnClick([string_editor, cur_raw_str] {
+                        const DecodedValueResult r = DecodeValue(cur_raw_str, ValueDecoderKind::Json);
+                        if (r.ok) string_editor = TextEditingValue::FromText(r.text);
+                      }),
+                  ButtonTone::Default, 26.0F, 8.0F)
+                  .With(Enabled{write_enabled && !detail.truncated}));
+          dec_bar.Add(
+              CompactActionButton(
+                  Button(app::strings::decoder_minify_json)
+                      .OnClick([string_editor, cur_raw_str] {
+                        const DecodedValueResult r = MinifyJsonValue(cur_raw_str);
+                        if (r.ok) string_editor = TextEditingValue::FromText(r.text);
+                      }),
+                  ButtonTone::Default, 26.0F, 8.0F)
+                  .With(Enabled{write_enabled && !detail.truncated}));
+        }
+        dec_bar.Add(Spacer());
+      } else {
+        const DecodedValueResult decoded = DecodeValue(cur_raw_str, cur_dec);
+        dec_bar.Add(MutedText(loc.Get(app::strings::decoder_readonly_notice)).With(Grow(1.0F)));
+        dec_bar.Add(
+            CompactActionButton(
+                Button(app::strings::decoder_copy_decoded).OnClick([clipboard, decoded, notify, loc] {
+                  if (clipboard && clipboard->SupportsSynchronousText() &&
+                      clipboard->WriteText(decoded.ok ? decoded.text : decoded.error)) {
+                    if (notify) {
+                      notify(loc.Fmt(app::strings::toast_copied,
+                                     loc.Get(app::strings::table_copy_value_label)));
+                    }
+                  }
+                }),
+                ButtonTone::Default, 26.0F, 8.0F));
+      }
+      str_views.Add(Row{std::move(dec_bar)}.With(Padding{EdgeInsets::Symmetric(10.0F, 2.0F)},
+                                                 Spacing{6.0F},
+                                                 CrossAlign{CrossAxisAlignment::Center}));
+
+      if (cur_dec == ValueDecoderKind::Raw) {
+        str_views.Add(
+            MonospaceField(
+                TextField(string_editor)
+                    .Variant(TextFieldVariant::Outlined)
+                    .LineLimits(TextFieldLineLimits::MultiLine(8, 28))
+                    .OnChanged([string_editor](const TextEditingValue& v) { string_editor = v; }))
+                .With(Grow(1.0F), Padding{EdgeInsets::Symmetric(10.0F, 4.0F)},
+                      Enabled{write_enabled && !detail.truncated}));
+      } else {
+        str_views.Add(DecodedValuePreviewBox(DecodeValue(cur_raw_str, cur_dec), 8, 28)
+                          .With(Grow(1.0F), Padding{EdgeInsets::Symmetric(10.0F, 4.0F)}));
+      }
       str_views.Add(
           Row{
               Spacer(),
@@ -754,7 +814,8 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
                             });
                       }),
                   ButtonTone::Primary, 28.0F, 12.0F)
-                  .With(Enabled{write_enabled && !detail.truncated}),
+                  .With(Enabled{write_enabled && !detail.truncated &&
+                                cur_dec == ValueDecoderKind::Raw}),
           }.With(Padding{EdgeInsets::Symmetric(10.0F, 6.0F)}));
       body_area = Column{std::move(str_views)}.With(Grow(1.0F), Spacing{2.0F},
                                                     CrossAlign{CrossAxisAlignment::Stretch});
@@ -770,15 +831,27 @@ std::shared_ptr<const GridSnapshot> SnapshotFromEntries(
           .columns = BuildReadOnlyColumns(
               col_names, snap, widths, spec.colors.on_surface, semantic.null_text, 0,
               spec.colors.on_surface_variant,
-              [snap, menu = UseMenu(), clipboard, notify, loc](Point pos, std::size_t row_idx,
-                                                               std::size_t col_idx) {
+              [snap, menu, dialogs, clipboard, notify, loc, theme_config, language_mode,
+               system_dark, col_names](Point pos, std::size_t row_idx, std::size_t col_idx) {
                 const GridRow* gr = RowAt(snap, row_idx);
                 if (gr == nullptr || col_idx >= gr->values.size()) return;
                 const std::string cell_disp = gr->values[col_idx].DisplayText();
                 const std::string row_tsv = gr->values[0].DisplayText() + "\t" +
                                             (gr->values.size() > 1 ? gr->values[1].DisplayText()
                                                                    : std::string{});
-                ShowReadOnlyCellContextMenu(pos, menu, clipboard, cell_disp, row_tsv, notify, loc);
+                const std::string title =
+                    col_idx < col_names.size() ? col_names[col_idx] : std::string("value");
+                auto inspect_cb = [dialogs, title, raw = gr->values[col_idx].text, clipboard, notify,
+                                   theme_config, language_mode, system_dark] {
+                  dialogs.Show([title, raw, clipboard, notify, theme_config, language_mode,
+                                system_dark](DialogContext dialog) {
+                    return WithDialogTheme(
+                        theme_config, language_mode, system_dark,
+                        ValueDecodeDialog(dialog, title, raw, clipboard, notify));
+                  });
+                };
+                ShowReadOnlyCellContextMenu(pos, menu, clipboard, cell_disp, row_tsv, notify, loc,
+                                            std::move(inspect_cb));
               }),
           .row_height = 26.0F,
           .header_height = 28.0F,

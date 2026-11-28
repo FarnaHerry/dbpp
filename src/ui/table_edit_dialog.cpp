@@ -34,9 +34,12 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
 [[huxerui::composable]] View EditCellDialog(DialogContext dialog, State<AppModel> app,
                                              State<WorkspaceModel> workspace, std::uint64_t tab_id,
                                              std::size_t row_index, std::size_t column_index,
-                                             TaskScope /*tasks*/, NotifyFn /*notify*/) {
+                                             TaskScope /*tasks*/, NotifyFn notify) {
   const LocalizedCatalog loc{UseService<Resources>(), UseService<SettingsModel>()};
   const SemanticColors& semantic = UseEnvironment<SemanticColors>();
+  const auto menu = UseMenu();
+  const auto clipboard = UseApplication().Clipboard();
+  const auto decoder_anchor = UseViewHandle();
 
   const WorkspaceTab* tab = workspace.Get().FindTab(tab_id);
   if (tab == nullptr || tab->kind != WorkspaceTabKind::Table || !tab->table.snapshot ||
@@ -68,6 +71,9 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
 
   auto text_state = UseState(TextEditingValue::FromText(eff_display));
   auto set_null = UseState(eff_null);
+  auto active_decoder = UseState(ValueDecoderKind::Raw);
+  const ValueDecoderKind suggested_decoder =
+      eff_null ? ValueDecoderKind::Raw : DetectSuggestedDecoder(text_state.Get().text);
 
   const auto save = [dialog, app, workspace, tab_id, row_index, col_name = col.name,
                      text_state, set_null] {
@@ -100,6 +106,9 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
   Views body;
   body.Add(Row{
       Text(UseString(app::strings::edit_cell_title, col.name), TextRole::Title).With(Grow(1.0F)),
+      DecoderSelectorButton(
+          menu, decoder_anchor, loc, active_decoder.Get(), suggested_decoder, !set_null.Get(),
+          28.0F, [active_decoder](ValueDecoderKind next) { active_decoder = next; }),
       ActionButton(Button(app::strings::action_cancel).OnClick([dialog] { dialog.Dismiss(); })),
       ActionButton(Button(app::strings::action_save).OnClick(save), ButtonTone::Primary),
   }.With(CrossAlign{CrossAxisAlignment::Center}, Spacing{8.0F}));
@@ -109,7 +118,38 @@ bool ShouldMultilineEdit(const ColumnMeta& col, std::string_view initial_val) {
                  ? MutedText(UseString(app::strings::edit_cell_raw_hint, eff_raw))
                  : MutedText(UseString(app::strings::edit_cell_ts_hint)));
   }
-  body.Add(MonospaceField(std::move(editor).With(Enabled{!set_null.Get()})));
+  const ValueDecoderKind cur_dec = active_decoder.Get();
+  if (cur_dec == ValueDecoderKind::Raw || set_null.Get()) {
+    body.Add(MonospaceField(std::move(editor).With(Enabled{!set_null.Get()})));
+  } else {
+    const DecodedValueResult decoded = DecodeValue(text_state.Get().text, cur_dec);
+    body.Add(DecodedValuePreviewBox(decoded, 4, 12));
+    Views preview_actions;
+    preview_actions.Add(MutedText(loc.Get(app::strings::decoder_readonly_notice)).With(Grow(1.0F)));
+    if (cur_dec == ValueDecoderKind::Json && decoded.ok) {
+      preview_actions.Add(
+          CompactActionButton(Button(app::strings::decoder_apply_json)
+                                  .OnClick([text_state, active_decoder, pretty = decoded.text] {
+                                    text_state = TextEditingValue::FromText(pretty);
+                                    active_decoder = ValueDecoderKind::Raw;
+                                  }),
+                              ButtonTone::Default, 26.0F, 8.0F));
+    }
+    preview_actions.Add(
+        CompactActionButton(
+            Button(app::strings::decoder_copy_decoded).OnClick([clipboard, decoded, notify, loc] {
+              if (clipboard && clipboard->SupportsSynchronousText() &&
+                  clipboard->WriteText(decoded.ok ? decoded.text : decoded.error)) {
+                if (notify) {
+                  notify(loc.Fmt(app::strings::toast_copied,
+                                 loc.Get(app::strings::table_copy_value_label)));
+                }
+              }
+            }),
+            ButtonTone::Default, 26.0F, 8.0F));
+    body.Add(Row{std::move(preview_actions)}.With(CrossAlign{CrossAxisAlignment::Center},
+                                                   Spacing{6.0F}));
+  }
   body.Add(
       Row{
           Text(app::strings::edit_cell_set_null).With(Grow(1.0F)),
@@ -239,8 +279,14 @@ DataTableColumn MakeRowNumberColumn(std::int64_t base_offset, std::size_t row_co
 void ShowReadOnlyCellContextMenu(
     Point position, const MenuHandle& menu, const std::shared_ptr<Clipboard>& clipboard,
     const std::string& cell_display, const std::string& row_tsv, const NotifyFn& notify,
-    const LocalizedCatalog& loc) {
+    const LocalizedCatalog& loc, std::function<void()> on_inspect_value) {
   std::vector<MenuEntry> entries;
+  if (on_inspect_value) {
+    entries.emplace_back(MenuItem(
+        app::images::visibility, loc.Get(app::strings::decoder_ctx_inspect),
+        std::move(on_inspect_value)));
+    entries.emplace_back(MenuSection{});
+  }
   entries.emplace_back(MenuItem(
       app::images::copy, loc.Get(app::strings::table_ctx_copy_value),
       [clipboard, notify, loc, cell_display] {
@@ -312,6 +358,20 @@ void ShowTableCellContextMenu(
   }
   if (can_edit_cell || show_set_null) {
     entries.emplace_back(MenuSection{});
+  }
+
+  if (!raw_cell.is_null) {
+    entries.emplace_back(MenuItem(
+        app::images::visibility, loc.Get(app::strings::decoder_ctx_inspect),
+        [dialogs, title = col_meta.name, raw = raw_cell.text, clipboard, notify, theme_config,
+         language_mode, system_dark] {
+          dialogs.Show([title, raw, clipboard, notify, theme_config, language_mode,
+                        system_dark](DialogContext dialog) {
+            return WithDialogTheme(
+                theme_config, language_mode, system_dark,
+                ValueDecodeDialog(dialog, title, raw, clipboard, notify));
+          });
+        }));
   }
 
   entries.emplace_back(MenuItem(
@@ -854,89 +914,6 @@ void HandleTableEditSubmitted(
     AppThemeConfig /*theme_config*/, LanguageMode /*language_mode*/, bool /*system_dark*/,
     const NotifyFn& /*notify*/) {
   StageTableCellEdit(app, workspace, tab_id, edit);
-}
-
-[[huxerui::composable]] View TableSortButton(
-    const MenuHandle& menu, const ViewHandle& anchor, const LocalizedCatalog& loc,
-    const std::vector<ColumnMeta>& sort_cols, const std::optional<DataTableSort>& current_sort,
-    bool enabled, float height, std::function<void(std::optional<DataTableSort>)> on_select) {
-  const ThemeSpec& spec = UseTheme();
-  const SemanticColors& semantic = UseEnvironment<SemanticColors>();
-  const bool sort_active = current_sort.has_value();
-  const std::string sort_label =
-      sort_active ? UseString(current_sort->direction == DataTableSortDirection::Descending
-                                  ? app::strings::table_sort_active_desc
-                                  : app::strings::table_sort_active_asc,
-                              current_sort->column_id)
-                  : UseString(app::strings::table_sort);
-  const Color sort_fg = sort_active ? spec.colors.on_primary_container : spec.colors.on_surface;
-  const Color sort_bg = sort_active ? spec.colors.primary_container : spec.colors.surface;
-  const Color sort_border =
-      sort_active ? WithAlpha(spec.colors.primary, 0.45F) : semantic.border_subtle;
-  const Color sort_icon_color =
-      sort_active ? spec.colors.primary : spec.colors.on_surface_variant;
-
-  return Row{
-      TintedIcon(app::images::sort, sort_icon_color, 13.0F),
-      Text(sort_label)
-          .Style(TextStyle{Font::System(font_size::kChip).WithWeight(FontWeight::Medium), sort_fg})
-          .LineLimit(1),
-      TintedIcon(app::images::chevron_down, sort_icon_color, 12.0F),
-  }
-      .With(Frame{.height = height, .min_height = height, .max_height = height},
-            Padding{EdgeInsets::Symmetric(8.0F, 0.0F)}, Spacing{5.0F},
-            CrossAlign{CrossAxisAlignment::Center}, CornerRadius{6.0F},
-            Background{VisualFill{sort_bg}}, Border{sort_border, 1.0F}, anchor,
-            Enabled{enabled})
-      .OnClick([menu, anchor, loc, on_select = std::move(on_select), sort_cols, current_sort] {
-        std::vector<MenuEntry> entries;
-        if (current_sort.has_value()) {
-          const bool is_desc = current_sort->direction == DataTableSortDirection::Descending;
-          entries.emplace_back(
-              MenuItem(loc.Get(is_desc ? app::strings::table_sort_toggle_asc
-                                       : app::strings::table_sort_toggle_desc),
-                       [on_select, col_id = current_sort->column_id, is_desc] {
-                         on_select(DataTableSort{
-                             .column_id = col_id,
-                             .direction = is_desc ? DataTableSortDirection::Ascending
-                                                  : DataTableSortDirection::Descending,
-                         });
-                       }));
-          entries.emplace_back(MenuItem(loc.Get(app::strings::table_sort_clear),
-                                        [on_select] { on_select(std::nullopt); }));
-          entries.emplace_back(MenuSection{});
-        }
-        for (const ColumnMeta& col : sort_cols) {
-          const bool active_col = current_sort.has_value() && current_sort->column_id == col.name;
-          const bool active_desc =
-              active_col && current_sort->direction == DataTableSortDirection::Descending;
-          std::string item_label = col.name;
-          if (active_col) {
-            item_label += active_desc ? " ↓" : " ↑";
-          }
-          entries.emplace_back(
-              MenuItem(std::move(item_label),
-                       [on_select, col_name = col.name, active_col, active_desc] {
-                         DataTableSortDirection next_dir =
-                             (active_col && !active_desc) ? DataTableSortDirection::Descending
-                                                          : DataTableSortDirection::Ascending;
-                         on_select(DataTableSort{.column_id = col_name, .direction = next_dir});
-                       })
-                  .Checked(active_col));
-        }
-        menu.Show(anchor, std::move(entries),
-                  MenuOptions{
-                      .placement = {.side = AnchorSide::Below,
-                                    .alignment = AnchorAlignment::Start},
-                      .gap = 4.0F,
-                      .viewport_margin = 8.0F,
-                      .offset = {},
-                      .width = std::nullopt,
-                      .dismiss_on_outside_press = true,
-                      .dismiss_on_cancel = true,
-                      .on_dismiss_request = {},
-                  });
-      });
 }
 
 } // namespace dbpp
